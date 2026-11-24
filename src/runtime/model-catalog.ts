@@ -14,6 +14,39 @@ import { contentText, getSystemMessageText } from "@earendil-works/pi-ai";
 import { getCurrentSystemPrompt, getCurrentTools } from "@earendil-works/pi-ai/utils/transcript";
 import type { FastModelClient } from "../contracts/app-capabilities.js";
 import type { ModelSpec } from "../contracts/harness-port.js";
+import {
+	ModelResponseError,
+	ProviderCircuitBreakers,
+	runWithFallbacks,
+	type CircuitBreakerOptions,
+	type ModelCandidate,
+	type ResilienceDeps,
+	type ResilienceEvent,
+} from "./resilience.js";
+
+/** Default per-call timeout of the fast model (the main model's timeout is `HarnessSettings.stream.timeoutMs`). */
+export const DEFAULT_FAST_MODEL_TIMEOUT_MS = 30_000;
+export const DEFAULT_FAST_MODEL_MAX_RETRIES = 2;
+export const DEFAULT_FAST_MODEL_RETRY_BASE_DELAY_MS = 500;
+
+/** Resilience settings of {@link createFastModelClient}; every field has a default. */
+export interface FastModelClientOptions {
+	/** Ordered fallbacks tried after the primary fast model is exhausted, circuit-open, or failing permanently. */
+	readonly fallbacks?: readonly ModelSpec[];
+	/** Per-attempt timeout. Default 30 000; `0` disables. */
+	readonly timeoutMs?: number;
+	/** Retries per model after the first attempt (transient errors only). Default 2. */
+	readonly maxRetries?: number;
+	readonly retryBaseDelayMs?: number;
+	readonly retryMaxDelayMs?: number;
+	/** Shared per-provider breakers; created from `breaker` when omitted. */
+	readonly breakers?: ProviderCircuitBreakers;
+	readonly breaker?: Omit<CircuitBreakerOptions, "onStateChange">;
+	/** Injectable sleep/clock/random/timers (tests). */
+	readonly deps?: ResilienceDeps;
+	/** Retry / fallback / circuit diagnostics. */
+	readonly onEvent?: (event: ResilienceEvent) => void;
+}
 
 /**
  * Pi-free snapshot of a single model invocation captured by TestModel.
@@ -156,6 +189,8 @@ export interface ModelCatalogBundle {
 	readonly fastModel: ModelSpec;
 	readonly testModel: TestModelController;
 	readonly fastModelClient: FastModelClient;
+	/** Per-provider circuit breakers shared by the fast model client (inspect with `.snapshot()`). */
+	readonly circuitBreakers: ProviderCircuitBreakers;
 }
 
 export function createModelCatalog(options: {
@@ -163,6 +198,8 @@ export function createModelCatalog(options: {
 	readonly fastModel: ModelSpec;
 	readonly useMockModels: boolean;
 	readonly registerRealProviders?: boolean;
+	/** Fast-model timeout/retry/fallback/circuit-breaker settings (see {@link FastModelClientOptions}). */
+	readonly fastModelResilience?: FastModelClientOptions;
 }): ModelCatalogBundle {
 	const models = createModels();
 
@@ -294,7 +331,21 @@ export function createModelCatalog(options: {
 
 	const mainModel = options.useMockModels ? testModel.mainModel : options.mainModel;
 	const fastModel = options.useMockModels ? testModel.fastModel : options.fastModel;
-	const fastModelClient = createFastModelClient(models, fastModel);
+	const circuitBreakers = options.fastModelResilience?.breakers ?? new ProviderCircuitBreakers({
+		...options.fastModelResilience?.breaker,
+		...(options.fastModelResilience?.deps?.now ? { now: options.fastModelResilience.deps.now } : {}),
+		onStateChange: (change) =>
+			options.fastModelResilience?.onEvent?.({
+				type: "circuit_state",
+				provider: change.provider,
+				from: change.from,
+				to: change.to,
+			}),
+	});
+	const fastModelClient = createFastModelClient(models, fastModel, {
+		...options.fastModelResilience,
+		breakers: circuitBreakers,
+	});
 
 	return {
 		models,
@@ -302,6 +353,7 @@ export function createModelCatalog(options: {
 		fastModel,
 		testModel,
 		fastModelClient,
+		circuitBreakers,
 	};
 }
 
@@ -326,34 +378,73 @@ function tryParseJson<T>(raw: string): T | null {
 	}
 }
 
-export function createFastModelClient(models: Models, fastModelRef: ModelSpec): FastModelClient {
+/**
+ * Fast-model JSON completion client. Each call runs through a per-attempt timeout, bounded retry with
+ * exponential backoff + jitter (honoring Retry-After), a per-provider circuit breaker, and an ordered
+ * fallback chain. An error *response* (`stopReason: "error"`, which `completeSimple` returns instead of
+ * rejecting) is treated as a failure so it can be retried / fallen back; when every candidate fails the
+ * call rejects with `AllModelsFailedError`.
+ */
+export function createFastModelClient(
+	models: Models,
+	fastModelRef: ModelSpec,
+	options: FastModelClientOptions = {},
+): FastModelClient {
+	const chain: readonly ModelSpec[] = [fastModelRef, ...(options.fallbacks ?? [])];
+	const breakers =
+		options.breakers ??
+		new ProviderCircuitBreakers({
+			...options.breaker,
+			...(options.deps?.now ? { now: options.deps.now } : {}),
+			onStateChange: (change) =>
+				options.onEvent?.({ type: "circuit_state", provider: change.provider, from: change.from, to: change.to }),
+		});
+
 	return {
 		async completeJson<T = unknown>(
 			systemPrompt: string,
 			userPrompt: string,
-			options?: { readonly signal?: AbortSignal },
+			callOptions?: { readonly signal?: AbortSignal },
 		): Promise<{ readonly rawText: string; readonly parsed: T | null }> {
-			const model = models.getModel(fastModelRef.provider, fastModelRef.modelId);
-			if (!model) {
-				throw new Error(
-					`Fast model "${fastModelRef.provider}:${fastModelRef.modelId}" is not registered in model catalog`,
-				);
-			}
-			const response = await models.completeSimple(
-				model,
-				{
-					systemPrompt,
-					messages: [{ role: "user", content: userPrompt, timestamp: Date.now() }],
+			const candidates: ModelCandidate<{ readonly rawText: string; readonly parsed: T | null }>[] = chain.map((ref) => ({
+				key: `${ref.provider}:${ref.modelId}`,
+				provider: ref.provider,
+				run: async (signal) => {
+					const model = models.getModel(ref.provider, ref.modelId);
+					if (!model) {
+						throw new Error(`Fast model "${ref.provider}:${ref.modelId}" is not registered in model catalog`);
+					}
+					const response = await models.completeSimple(
+						model,
+						{
+							systemPrompt,
+							messages: [{ role: "user", content: userPrompt, timestamp: Date.now() }],
+						},
+						{ signal },
+					);
+					if (response.stopReason === "aborted") {
+						const error = new Error("Fast model call aborted");
+						error.name = "AbortError";
+						throw error;
+					}
+					if (response.stopReason === "error") {
+						throw new ModelResponseError(response.errorMessage ?? "Fast model returned an error response");
+					}
+					const rawText = contentText(response.content);
+					return { rawText, parsed: tryParseJson<T>(rawText) };
 				},
-				{
-					signal: options?.signal,
-				},
-			);
-			const rawText = contentText(response.content);
-			return {
-				rawText,
-				parsed: tryParseJson<T>(rawText),
-			};
+			}));
+
+			return runWithFallbacks(candidates, {
+				timeoutMs: options.timeoutMs ?? DEFAULT_FAST_MODEL_TIMEOUT_MS,
+				maxRetries: options.maxRetries ?? DEFAULT_FAST_MODEL_MAX_RETRIES,
+				baseDelayMs: options.retryBaseDelayMs ?? DEFAULT_FAST_MODEL_RETRY_BASE_DELAY_MS,
+				...(options.retryMaxDelayMs !== undefined ? { maxDelayMs: options.retryMaxDelayMs } : {}),
+				breakers,
+				...(callOptions?.signal ? { signal: callOptions.signal } : {}),
+				...options.deps,
+				...(options.onEvent ? { onEvent: options.onEvent } : {}),
+			});
 		},
 	};
 }

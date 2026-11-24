@@ -153,6 +153,34 @@ const MIGRATIONS: readonly Migration[] = [
 				ON sim_log (tenant_id, target_module, created_at);
 		`,
 	},
+	{
+		version: 2,
+		name: "memory_evidence_and_embeddings",
+		sql: `
+			-- Evidence ledger: which episodes contributed to which memory (idempotent evidence counting).
+			CREATE TABLE IF NOT EXISTS memory_evidence (
+				memory_id TEXT NOT NULL,
+				episode_id TEXT NOT NULL,
+				created_at INTEGER NOT NULL,
+				PRIMARY KEY (memory_id, episode_id)
+			);
+
+			-- Optional vector store for hybrid retrieval (filled lazily when an EmbeddingProvider is injected).
+			CREATE TABLE IF NOT EXISTS memory_embeddings (
+				memory_id TEXT PRIMARY KEY,
+				tenant_id TEXT NOT NULL,
+				user_id TEXT NOT NULL,
+				model TEXT NOT NULL,
+				dim INTEGER NOT NULL,
+				content_hash TEXT NOT NULL,
+				vector BLOB NOT NULL,
+				updated_at INTEGER NOT NULL
+			);
+
+			CREATE INDEX IF NOT EXISTS idx_memory_embeddings_scope
+				ON memory_embeddings (tenant_id, user_id, model);
+		`,
+	},
 ];
 
 /**
@@ -165,6 +193,7 @@ export class AppDatabase {
 	readonly db: DatabaseSync;
 	readonly dbPath: string;
 	private closed = false;
+	private txDepth = 0;
 
 	private constructor(db: DatabaseSync, dbPath: string) {
 		this.db = db;
@@ -177,16 +206,26 @@ export class AppDatabase {
 			fs.mkdirSync(path.dirname(dbPath), { recursive: true });
 		}
 		const db = new DatabaseSync(dbPath);
-		db.exec("PRAGMA foreign_keys = ON;");
-		db.exec("PRAGMA busy_timeout = 5000;");
-		if (dbPath !== ":memory:") {
-			db.exec("PRAGMA journal_mode = WAL;");
-			db.exec("PRAGMA synchronous = NORMAL;");
-		}
+		try {
+			db.exec("PRAGMA foreign_keys = ON;");
+			db.exec("PRAGMA busy_timeout = 5000;");
+			if (dbPath !== ":memory:") {
+				db.exec("PRAGMA journal_mode = WAL;");
+				db.exec("PRAGMA synchronous = NORMAL;");
+			}
 
-		const instance = new AppDatabase(db, dbPath);
-		instance.migrate();
-		return instance;
+			const instance = new AppDatabase(db, dbPath);
+			instance.migrate();
+			return instance;
+		} catch (error) {
+			// Do not leak the file handle (and its WAL lock) when setup or a migration fails.
+			try {
+				db.close();
+			} catch {
+				// Already closed / never fully opened.
+			}
+			throw error;
+		}
 	}
 
 	private migrate(): void {
@@ -206,29 +245,69 @@ export class AppDatabase {
 		for (const migration of MIGRATIONS) {
 			if (applied.has(migration.version)) continue;
 			this.transaction(() => {
+				// Another process may have applied this version between the read above and acquiring the write
+				// lock (BEGIN IMMEDIATE): re-check inside the transaction, and make the insert itself idempotent.
+				const already = this.db
+					.prepare("SELECT 1 AS ok FROM app_migrations WHERE version = ?")
+					.get(migration.version);
+				if (already) return;
 				this.db.exec(migration.sql);
 				this.db
-					.prepare("INSERT INTO app_migrations (version, name, applied_at) VALUES (?, ?, ?)")
+					.prepare("INSERT OR IGNORE INTO app_migrations (version, name, applied_at) VALUES (?, ?, ?)")
 					.run(migration.version, migration.name, Date.now());
 			});
 		}
 	}
 
+	/**
+	 * Runs `fn` atomically. Re-entrant: the outermost call opens `BEGIN IMMEDIATE`, nested calls use
+	 * SAVEPOINTs so an inner failure rolls back only the inner work while the outer transaction can
+	 * still commit (or roll back everything if the error propagates).
+	 */
 	transaction<T>(fn: () => T): T {
 		this.assertOpen();
-		this.db.exec("BEGIN IMMEDIATE");
+		if (this.txDepth === 0) {
+			this.db.exec("BEGIN IMMEDIATE");
+			this.txDepth = 1;
+			try {
+				const result = fn();
+				this.db.exec("COMMIT");
+				return result;
+			} catch (error) {
+				try {
+					this.db.exec("ROLLBACK");
+				} catch {
+					// Ignore rollback errors after failed statement.
+				}
+				throw error;
+			} finally {
+				this.txDepth = 0;
+			}
+		}
+
+		const name = `sp_${this.txDepth}`;
+		this.db.exec(`SAVEPOINT ${name}`);
+		this.txDepth += 1;
 		try {
 			const result = fn();
-			this.db.exec("COMMIT");
+			this.db.exec(`RELEASE SAVEPOINT ${name}`);
 			return result;
 		} catch (error) {
 			try {
-				this.db.exec("ROLLBACK");
+				this.db.exec(`ROLLBACK TO SAVEPOINT ${name}`);
+				this.db.exec(`RELEASE SAVEPOINT ${name}`);
 			} catch {
 				// Ignore rollback errors after failed statement.
 			}
 			throw error;
+		} finally {
+			this.txDepth -= 1;
 		}
+	}
+
+	/** True while inside `transaction()`. */
+	get inTransaction(): boolean {
+		return this.txDepth > 0;
 	}
 
 	close(): void {

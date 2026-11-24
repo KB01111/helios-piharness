@@ -4,6 +4,7 @@ import {
 	AssistantEntry,
 	type Conversation,
 	type ConversationId,
+	type Cursor,
 	type EntryId,
 	type Harness,
 	type SignalToken,
@@ -28,14 +29,18 @@ import type {
 	ToolPackSummary,
 	TranscriptEntryView,
 	UsageSummaryView,
+	WatchConversationOptions,
 } from "../contracts/harness-port.js";
-import { validateTenantContext } from "../contracts/tenant-context.js";
+import { NotFoundError, ValidationError } from "../contracts/errors.js";
+import { canAccessConversation, validateTenantContext, type TenantContext } from "../contracts/tenant-context.js";
+import { createLogger, serializeError, type Logger } from "../logger.js";
 import { formatFrozenSkillsIndex, loadSkillCatalog } from "../extensions/skills-loader.ext.js";
 import type { SleepCycleCheckpoint, SleepCycleInput, SleepCycleResult } from "../extensions/sleep-cycle.ext.js";
 import type { HostRuntime } from "../runtime/host-runtime.js";
 import { entryToView, usageToView, watchConversationEvents } from "../runtime/stream-adapter.js";
 import {
 	ConversationMetaDoc,
+	type ConversationMetaState,
 	PendingApprovalsDoc,
 	deserializeTenantFromDoc,
 	formatFrozenCoreMemory,
@@ -47,12 +52,33 @@ import type { HarnessRegistryManager } from "./registry.js";
 function parseId<T extends number>(raw: string, label: string): T {
 	const parsed = Number.parseInt(raw, 10);
 	if (!Number.isSafeInteger(parsed) || parsed <= 0 || String(parsed) !== raw.trim()) {
-		throw new Error(`Invalid ${label} "${raw}"`);
+		throw new ValidationError(`Invalid ${label} "${raw}"`);
 	}
 	return parsed as T;
 }
 
+/** Reasons are stable snake_case codes; anything else (free text) is collapsed so it cannot leak internals. */
+const SAFE_REASON_PATTERN = /^[a-z][a-z0-9_.-]{0,63}$/;
+/** Budget vetoes are intentionally client-visible (they tell the caller which limit to raise). */
+const CLIENT_SAFE_DETAIL_PREFIX = "BUDGET_EXCEEDED ";
+const MAX_CLIENT_DETAIL_CHARS = 500;
+/** Cap on the unscoped (all-conversation) approvals listing. */
+const DEFAULT_APPROVALS_LIMIT = 500;
+
+function clientSafeReason(reason: string): string {
+	return SAFE_REASON_PATTERN.test(reason) ? reason : "unanswered";
+}
+
+function clientSafeDetail(detail: unknown): string | undefined {
+	if (typeof detail === "string" && detail.startsWith(CLIENT_SAFE_DETAIL_PREFIX)) {
+		return detail.slice(0, MAX_CLIENT_DETAIL_CHARS);
+	}
+	return undefined;
+}
+
 export interface ConversationServiceOptions {
+	/** Server-side diagnostics sink for error details that are deliberately withheld from clients. */
+	readonly logger?: Logger;
 	readonly hostRuntime: HostRuntime;
 	readonly registryManager: HarnessRegistryManager;
 	readonly capabilities: AppCapabilities;
@@ -80,8 +106,10 @@ export class ConversationService implements HarnessPort {
 	private readonly signalMap = new Map<string, SignalToken<unknown>>();
 	private readonly now: () => number;
 	private readonly onClose?: () => Promise<void> | void;
+	private readonly logger: Logger;
 
 	constructor(options: ConversationServiceOptions) {
+		this.logger = options.logger ?? createLogger({ level: "warn", base: { component: "conversation-service" } });
 		this.hostRuntime = options.hostRuntime;
 		this.harness = options.hostRuntime.harness;
 		this.registryManager = options.registryManager;
@@ -177,13 +205,21 @@ export class ConversationService implements HarnessPort {
 		atEntryId: string,
 		overrides?: Partial<CreateConversationInput>,
 	): Promise<ConversationInfo> {
+		// `overrides.tenant` is the authenticated CALLER. It must be allowed to access the parent (same tenant and
+		// same user, or admin:conversations) and becomes the child's identity. The parent's stored permissions are
+		// never copied to a different principal.
+		if (overrides?.tenant) {
+			validateTenantContext(overrides.tenant);
+			await this.assertConversationOwner(overrides.tenant, conversationId);
+		}
 		const parent = await this.requireConversation(conversationId);
 		const entryId = parseId<EntryId>(atEntryId, "atEntryId");
 		const parentMeta = await this.harness.snapshot(ConversationMetaDoc, parent.id, BACKGROUND_CONTEXT);
-
-		if (overrides?.tenant) {
-			validateTenantContext(overrides.tenant);
+		if (!parentMeta) {
+			throw new NotFoundError(`Conversation "${conversationId}" not found`);
 		}
+		// No caller supplied (trusted embedders such as the eval replay runner): inherit the parent's identity.
+		const childTenant = serializeTenantForDoc(overrides?.tenant ?? deserializeTenantFromDoc(parentMeta));
 
 		const selectedExtensions = overrides?.enabledToolPacks
 			? this.registryManager.resolveConversationExtensionSelection(overrides.enabledToolPacks)
@@ -209,9 +245,7 @@ export class ConversationService implements HarnessPort {
 						conversationId,
 						entryId: atEntryId,
 					};
-					if (overrides?.tenant) {
-						doc.tenant = serializeTenantForDoc(overrides.tenant);
-					}
+					doc.tenant = childTenant;
 					if (overrides?.enabledToolPacks) {
 						doc.enabledToolPacks = [...overrides.enabledToolPacks];
 					}
@@ -263,7 +297,7 @@ export class ConversationService implements HarnessPort {
 		const id = parseId<SubmissionId>(submissionId, "submissionId");
 		const submission = await this.harness.submission(id, ctx);
 		if (!submission) {
-			throw new Error(`Submission "${submissionId}" not found`);
+			throw new NotFoundError(`Submission "${submissionId}" not found`);
 		}
 
 		const settled = await submission.wait(ctx);
@@ -285,12 +319,27 @@ export class ConversationService implements HarnessPort {
 			};
 		}
 
+		if (settled.status === "unanswered") {
+			// Free-text reason/detail can carry provider errors, paths or SQL: log them, return a stable code only.
+			this.logger.warn("submission_unanswered", {
+				submissionId: String(settled.id),
+				conversationId,
+				reason: settled.reason,
+				detail: settled.detail,
+			});
+			const detail = clientSafeDetail(settled.detail);
+			return {
+				submissionId: String(settled.id),
+				conversationId,
+				status: "unanswered",
+				reason: clientSafeReason(settled.reason),
+				...(detail !== undefined ? { detail } : {}),
+			};
+		}
 		return {
 			submissionId: String(settled.id),
 			conversationId,
 			status: settled.status,
-			...(settled.status === "unanswered" ? { reason: settled.reason } : {}),
-			...(settled.status === "unanswered" && settled.detail !== undefined ? { detail: settled.detail } : {}),
 		};
 	}
 
@@ -309,21 +358,29 @@ export class ConversationService implements HarnessPort {
 		await conv.reset(handoff, BACKGROUND_CONTEXT);
 	}
 
+	async startCompaction(conversationId: string, instructions?: string): Promise<{ readonly taskId: string }> {
+		const conv = await this.requireConversation(conversationId);
+		const taskId = await conv.compact(instructions, BACKGROUND_CONTEXT);
+		return { taskId: String(taskId) };
+	}
+
 	async compactConversation(
 		conversationId: string,
 		instructions?: string,
+		signal?: AbortSignal,
 	): Promise<{ readonly taskId: string; readonly compacted: boolean }> {
+		const ctx = signal ? withAbortSignal(signal, BACKGROUND_CONTEXT) : BACKGROUND_CONTEXT;
 		const conv = await this.requireConversation(conversationId);
-		const taskId = await conv.compact(instructions, BACKGROUND_CONTEXT);
-		const settled = await this.harness.waitForTask(taskId, BACKGROUND_CONTEXT);
+		const taskId = await conv.compact(instructions, ctx);
+		const settled = await this.harness.waitForTask(taskId, ctx);
 		if (settled.state.outcome.status !== "completed") {
 			return { taskId: String(taskId), compacted: false };
 		}
 		const result = settled.state.outcome.result;
 		if (result.submissionId !== undefined) {
-			const sub = await this.harness.submission(result.submissionId, BACKGROUND_CONTEXT);
+			const sub = await this.harness.submission(result.submissionId, ctx);
 			if (sub) {
-				const placed = await sub.wait(BACKGROUND_CONTEXT);
+				const placed = await sub.wait(ctx);
 				return { taskId: String(taskId), compacted: placed.status === "done" };
 			}
 		}
@@ -340,24 +397,90 @@ export class ConversationService implements HarnessPort {
 		return { status };
 	}
 
-	async listPendingApprovals(conversationId?: string): Promise<PendingApproval[]> {
+	async listPendingApprovals(
+		conversationId?: string,
+		options?: { readonly tenantId?: string; readonly tenant?: TenantContext; readonly limit?: number },
+	): Promise<PendingApproval[]> {
+		const caller = options?.tenant;
+		const tenantId = caller?.tenantId ?? options?.tenantId;
+		const limit = Math.max(1, options?.limit ?? DEFAULT_APPROVALS_LIMIT);
+		/** Tenant check always precedes loading the approvals doc, so other tenants' docs are never read. */
+		const mayAccess = (meta: Readonly<ConversationMetaState>): boolean => {
+			if (caller) return canAccessConversation(caller, meta.tenant);
+			return tenantId === undefined || meta.tenant.tenantId === tenantId;
+		};
+
 		if (conversationId !== undefined) {
+			if (caller) await this.assertConversationOwner(caller, conversationId);
+			else if (tenantId !== undefined) await this.assertTenantOwnsConversation(tenantId, conversationId);
 			const id = parseId<ConversationId>(conversationId, "conversationId");
 			const doc = await this.harness.snapshot(PendingApprovalsDoc, id, BACKGROUND_CONTEXT);
-			return listApprovalsFromDoc(doc);
+			return listApprovalsFromDoc(doc).slice(0, limit);
 		}
 
-		const page = await this.harness.commit(
-			(tx) => tx.scanConversations({ order: "ascending" }, 200),
-			BACKGROUND_CONTEXT,
-		);
 		const results: PendingApproval[] = [];
-		for (const conv of page.items) {
-			const doc = await this.harness.snapshot(PendingApprovalsDoc, conv.id, BACKGROUND_CONTEXT);
-			results.push(...listApprovalsFromDoc(doc));
-		}
+		let cursor: Cursor | undefined;
+		scan: do {
+			const after = cursor;
+			const page = await this.harness.commit(
+				(tx) => tx.scanConversations({ order: "ascending" }, 200, after),
+				BACKGROUND_CONTEXT,
+			);
+			for (const conv of page.items) {
+				if (tenantId !== undefined) {
+					const meta = await this.harness.snapshot(ConversationMetaDoc, conv.id, BACKGROUND_CONTEXT);
+					if (!meta || !mayAccess(meta)) continue;
+				}
+				const doc = await this.harness.snapshot(PendingApprovalsDoc, conv.id, BACKGROUND_CONTEXT);
+				results.push(...listApprovalsFromDoc(doc));
+				if (results.length >= limit) break scan;
+			}
+			cursor = page.next;
+		} while (cursor !== undefined);
 		results.sort((a, b) => a.createdAt - b.createdAt);
-		return results;
+		return results.slice(0, limit);
+	}
+
+	async assertConversationOwner(caller: TenantContext, conversationId: string): Promise<void> {
+		const meta = await this.loadMetaIfExists(conversationId);
+		if (!meta || !canAccessConversation(caller, meta.tenant)) {
+			throw new NotFoundError(`Conversation "${conversationId}" not found`);
+		}
+	}
+
+	/** Tenant-wide ownership check for trusted embedders that only know a tenant id (no user). */
+	private async assertTenantOwnsConversation(tenantId: string, conversationId: string): Promise<void> {
+		const meta = await this.loadMetaIfExists(conversationId);
+		if (!meta || meta.tenant.tenantId !== tenantId) {
+			throw new NotFoundError(`Conversation "${conversationId}" not found`);
+		}
+	}
+
+	private async loadMetaIfExists(conversationId: string): Promise<Readonly<ConversationMetaState> | undefined> {
+		let id: ConversationId;
+		try {
+			id = parseId<ConversationId>(conversationId, "conversationId");
+		} catch {
+			return undefined;
+		}
+		const meta = await this.harness.snapshot(ConversationMetaDoc, id, BACKGROUND_CONTEXT);
+		if (!meta) return undefined;
+		const conv = await this.harness.conversation(id, BACKGROUND_CONTEXT);
+		return conv ? meta : undefined;
+	}
+
+	async assertTaskOwner(caller: TenantContext, taskId: string): Promise<void> {
+		let id: TaskId;
+		try {
+			id = parseId<TaskId>(taskId, "taskId");
+		} catch {
+			throw new NotFoundError(`Task "${taskId}" not found`);
+		}
+		const task = await this.harness.getTask(id, BACKGROUND_CONTEXT);
+		if (!task) throw new NotFoundError(`Task "${taskId}" not found`);
+		await this.assertConversationOwner(caller, String(task.conversationId)).catch(() => {
+			throw new NotFoundError(`Task "${taskId}" not found`);
+		});
 	}
 
 	async triggerSleepCycle(
@@ -393,26 +516,45 @@ export class ConversationService implements HarnessPort {
 				result: outcome.result,
 			};
 		}
+		// Internal error text (provider errors, paths, SQL) is logged, never returned to clients.
 		if (outcome.status === "failed" || outcome.status === "faulted") {
+			this.logger.error("task_settled_with_error", {
+				taskId: String(settled.id),
+				status: outcome.status,
+				error: serializeError(outcome.error),
+			});
 			return {
 				taskId: String(settled.id),
 				status: outcome.status,
-				error: outcome.error.message,
+				error: outcome.status === "failed" ? "Task failed" : "Task faulted",
+				errorCode: `task_${outcome.status}`,
 			};
+		}
+		if (outcome.reason) {
+			this.logger.warn("task_settled_without_completion", {
+				taskId: String(settled.id),
+				status: outcome.status,
+				reason: outcome.reason,
+			});
 		}
 		return {
 			taskId: String(settled.id),
 			status: outcome.status,
-			...(outcome.reason ? { error: outcome.reason } : {}),
+			error: outcome.status === "aborted" ? "Task aborted" : "Task orphaned",
+			errorCode: `task_${outcome.status}`,
 		};
 	}
 
-	watchConversation(conversationId: string, signal?: AbortSignal): AsyncIterable<HarnessEvent> {
+	watchConversation(
+		conversationId: string,
+		signal?: AbortSignal,
+		options?: WatchConversationOptions,
+	): AsyncIterable<HarnessEvent> {
 		const self = this;
 		return {
 			async *[Symbol.asyncIterator](): AsyncGenerator<HarnessEvent> {
 				const conv = await self.requireConversation(conversationId);
-				for await (const event of watchConversationEvents(conv, signal)) {
+				for await (const event of watchConversationEvents(conv, signal, options)) {
 					yield event;
 				}
 			},
@@ -464,7 +606,7 @@ export class ConversationService implements HarnessPort {
 		const id = parseId<ConversationId>(conversationId, "conversationId");
 		const conv = await this.harness.conversation(id, BACKGROUND_CONTEXT);
 		if (!conv) {
-			throw new Error(`Conversation "${conversationId}" not found`);
+			throw new NotFoundError(`Conversation "${conversationId}" not found`);
 		}
 		return conv;
 	}

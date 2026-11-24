@@ -1,108 +1,350 @@
-import { Hono } from "hono";
+import { randomUUID } from "node:crypto";
+import { Hono, type Context } from "hono";
 import { streamSSE } from "hono/streaming";
+import {
+	ForbiddenError,
+	HarnessError,
+	NotFoundError,
+	PayloadTooLargeError,
+	RateLimitError,
+	TooManyStreamsError,
+	UnauthorizedError,
+	ValidationError,
+} from "../contracts/errors.js";
 import type { CreateConversationInput, HarnessPort, SubmitMessageInput } from "../contracts/harness-port.js";
-import { DEFAULT_PERMISSIONS, type TenantContext } from "../contracts/tenant-context.js";
+import { ADMIN_PERMISSIONS, hasPermission, type TenantContext } from "../contracts/tenant-context.js";
+import { createLogger, serializeError, type Logger } from "../logger.js";
+import { authFromEnv, type AuthResolver } from "./auth.js";
+import { RateLimiter } from "./rate-limit.js";
+import {
+	optionalBoolean,
+	optionalEnum,
+	optionalModelSpec,
+	optionalPositiveInt,
+	optionalString,
+	optionalStringArray,
+	parseJsonObject,
+	requiredString,
+	type JsonRecord,
+} from "./validation.js";
 
-function extractTenant(
-	headers: { get(name: string): string | undefined },
-	bodyTenant?: Partial<TenantContext>,
-): TenantContext {
-	const tenantId = bodyTenant?.tenantId ?? headers.get("x-tenant-id") ?? "default";
-	const userId = bodyTenant?.userId ?? headers.get("x-user-id") ?? "anonymous";
-	const headerPerms = headers.get("x-permissions");
-	const permissions =
-		bodyTenant?.permissions ??
-		(headerPerms
-			? headerPerms
-					.split(",")
-					.map((p) => p.trim())
-					.filter(Boolean)
-			: [...DEFAULT_PERMISSIONS]);
+export interface RateLimitOptions {
+	/** Max requests per tenant per window. */
+	readonly limit: number;
+	readonly windowMs: number;
+}
 
-	return {
-		tenantId,
-		userId,
-		permissions,
-		...(bodyTenant?.workspaceId ? { workspaceId: bodyTenant.workspaceId } : {}),
-		...(bodyTenant?.metadata ? { metadata: bodyTenant.metadata } : {}),
+export interface HttpServerOptions {
+	/**
+	 * Resolves the caller identity. Defaults to `authFromEnv()`: `HELIOS_API_KEYS` bearer tokens and/or the explicit
+	 * `HELIOS_AUTH_TRUSTED_HEADERS=true` dev opt-in. With neither configured every route except the public ones is 401.
+	 */
+	readonly auth?: AuthResolver;
+	/** Max request body size in bytes (default `HELIOS_MAX_BODY_BYTES` or 1 MiB). */
+	readonly maxBodyBytes?: number;
+	/** Per-tenant limiter (default `HELIOS_RATE_LIMIT_PER_MINUTE` or 600/min); `false` disables it. */
+	readonly rateLimit?: RateLimitOptions | false;
+	/**
+	 * Per-remote-address limiter applied only to failed authentications (default `HELIOS_AUTH_FAIL_LIMIT_PER_MINUTE`
+	 * or 60/min): once exceeded, further failures answer 429 instead of 401. Keyed by socket address; skipped when
+	 * the runtime exposes none. `false` disables it.
+	 */
+	readonly authFailureLimit?: RateLimitOptions | false;
+	/** Max concurrently open SSE streams per tenant (default `HELIOS_MAX_STREAMS_PER_TENANT` or 20). */
+	readonly maxStreamsPerTenant?: number;
+	/** Max concurrently open SSE streams process-wide (default `HELIOS_MAX_STREAMS` or 1000). */
+	readonly maxStreams?: number;
+	/** SSE keepalive comment interval in ms (default `HELIOS_SSE_KEEPALIVE_MS` or 15000; 0 disables). */
+	readonly keepAliveMs?: number;
+	readonly logger?: Logger;
+	/** Paths served without authentication (default `["/health"]`). */
+	readonly publicPaths?: readonly string[];
+	/** Hook to register extra unauthenticated routes (e.g. liveness/readiness probes). List their paths in `publicPaths`. */
+	readonly registerPublicRoutes?: (app: Hono<HttpEnv>) => void;
+}
+
+export interface HttpEnv {
+	Variables: {
+		requestId: string;
+		tenant: TenantContext;
 	};
+}
+
+const DEFAULT_MAX_BODY_BYTES = 1024 * 1024;
+const DEFAULT_RATE_LIMIT_PER_MINUTE = 600;
+const DEFAULT_KEEPALIVE_MS = 15_000;
+const DEFAULT_AUTH_FAIL_PER_MINUTE = 60;
+const DEFAULT_MAX_STREAMS_PER_TENANT = 20;
+const DEFAULT_MAX_STREAMS = 1000;
+/** Permission required to start a sleep cycle (it consolidates and rewrites memory). */
+const SLEEP_CYCLE_PERMISSION = "memory:write";
+const MAX_CONTENT_CHARS = 1_000_000;
+const REQUEST_ID_PATTERN = /^[A-Za-z0-9._:-]{1,128}$/;
+const NUMERIC_ID_PATTERN = /^\d{1,20}$/;
+
+function envInt(raw: string | undefined, fallback: number, allowZero = false): number {
+	if (raw === undefined || raw.trim() === "") return fallback;
+	const parsed = Number.parseInt(raw, 10);
+	if (!Number.isFinite(parsed) || parsed < 0 || (parsed === 0 && !allowZero)) return fallback;
+	return parsed;
+}
+
+/** Reads the raw body as text, enforcing `maxBytes` both via content-length and while streaming. */
+async function readBodyText(c: Context<HttpEnv>, maxBytes: number): Promise<string> {
+	const declared = c.req.header("content-length");
+	if (declared !== undefined) {
+		const length = Number.parseInt(declared, 10);
+		if (Number.isFinite(length) && length > maxBytes) throw new PayloadTooLargeError();
+	}
+	const body = c.req.raw.body;
+	if (!body) return "";
+	const reader = body.getReader();
+	const chunks: Uint8Array[] = [];
+	let total = 0;
+	try {
+		for (;;) {
+			const { done, value } = await reader.read();
+			if (done) break;
+			total += value.byteLength;
+			if (total > maxBytes) {
+				await reader.cancel().catch(() => undefined);
+				throw new PayloadTooLargeError();
+			}
+			chunks.push(value);
+		}
+	} finally {
+		reader.releaseLock();
+	}
+	return Buffer.concat(chunks).toString("utf8");
+}
+
+function legacyStatus(err: unknown): { status: number; code: string; message: string } | undefined {
+	// Defensive mapping for plain Errors thrown by collaborators that predate typed errors. The status is inferred
+	// from the message shape, but the message itself is never echoed: clients get a fixed string per code.
+	if (!(err instanceof Error)) return undefined;
+	if (/^Invalid [A-Za-z]+ "/.test(err.message)) return { status: 400, code: "invalid_request", message: "Invalid request" };
+	if (/^[A-Za-z ]+ "[^"]*" not found$/.test(err.message)) return { status: 404, code: "not_found", message: "Not found" };
+	return undefined;
+}
+
+function remoteAddress(c: Context<HttpEnv>): string | undefined {
+	const incoming = (c.env as { incoming?: { socket?: { remoteAddress?: unknown } } } | undefined)?.incoming;
+	const address = incoming?.socket?.remoteAddress;
+	return typeof address === "string" && address.length > 0 ? address : undefined;
 }
 
 /**
  * Thin Hono HTTP + native SSE transport wrapping ONLY `HarnessPort`.
  * Zero Pi Durable / Pi AI / Chord imports or leakage.
+ *
+ * Security model: every route except `publicPaths` requires an authenticated TenantContext produced by
+ * `options.auth`; client-supplied tenant/permissions in bodies or headers are never trusted (unless the dev-only
+ * trusted-headers resolver is explicitly enabled). Conversations, approvals and tasks are tenant-scoped and other
+ * tenants' resources surface as 404.
  */
-export function createHttpServer(harness: HarnessPort): Hono {
-	const app = new Hono();
+export function createHttpServer(harness: HarnessPort, options: HttpServerOptions = {}): Hono<HttpEnv> {
+	const app = new Hono<HttpEnv>();
+	const logger = options.logger ?? createLogger({ level: "warn", base: { component: "http" } });
+	const auth = options.auth ?? authFromEnv(process.env, logger);
+	const maxBodyBytes = options.maxBodyBytes ?? envInt(process.env.HELIOS_MAX_BODY_BYTES, DEFAULT_MAX_BODY_BYTES);
+	const keepAliveMs = options.keepAliveMs ?? envInt(process.env.HELIOS_SSE_KEEPALIVE_MS, DEFAULT_KEEPALIVE_MS, true);
+	const publicPaths = new Set(options.publicPaths ?? ["/health"]);
 
-	app.onError((err, c) => {
-		const message = err instanceof Error ? err.message : String(err);
-		const status = message.includes("not found") ? 404 : message.includes("Invalid") ? 400 : 500;
-		return c.json({ error: message }, status);
+	const rateLimitConfig: RateLimitOptions | false =
+		options.rateLimit ??
+		(envInt(process.env.HELIOS_RATE_LIMIT_PER_MINUTE, DEFAULT_RATE_LIMIT_PER_MINUTE, true) === 0
+			? false
+			: {
+					limit: envInt(process.env.HELIOS_RATE_LIMIT_PER_MINUTE, DEFAULT_RATE_LIMIT_PER_MINUTE),
+					windowMs: 60_000,
+				});
+	const limiter = rateLimitConfig ? new RateLimiter(rateLimitConfig) : undefined;
+
+	const authFailureConfig: RateLimitOptions | false =
+		options.authFailureLimit ??
+		(envInt(process.env.HELIOS_AUTH_FAIL_LIMIT_PER_MINUTE, DEFAULT_AUTH_FAIL_PER_MINUTE, true) === 0
+			? false
+			: {
+					limit: envInt(process.env.HELIOS_AUTH_FAIL_LIMIT_PER_MINUTE, DEFAULT_AUTH_FAIL_PER_MINUTE),
+					windowMs: 60_000,
+				});
+	const authFailureLimiter = authFailureConfig ? new RateLimiter(authFailureConfig) : undefined;
+
+	// --- SSE stream caps (per tenant + global) -------------------------------------------------------------------
+	const maxStreamsPerTenant =
+		options.maxStreamsPerTenant ?? envInt(process.env.HELIOS_MAX_STREAMS_PER_TENANT, DEFAULT_MAX_STREAMS_PER_TENANT);
+	const maxStreams = options.maxStreams ?? envInt(process.env.HELIOS_MAX_STREAMS, DEFAULT_MAX_STREAMS);
+	const streamsByTenant = new Map<string, number>();
+	let openStreams = 0;
+	/** Reserves a stream slot or throws 429. The returned release function is idempotent. */
+	const acquireStreamSlot = (tenantId: string): (() => void) => {
+		const perTenant = streamsByTenant.get(tenantId) ?? 0;
+		if (openStreams >= maxStreams || perTenant >= maxStreamsPerTenant) throw new TooManyStreamsError();
+		openStreams++;
+		streamsByTenant.set(tenantId, perTenant + 1);
+		let released = false;
+		return () => {
+			if (released) return;
+			released = true;
+			openStreams--;
+			const remaining = (streamsByTenant.get(tenantId) ?? 1) - 1;
+			if (remaining <= 0) streamsByTenant.delete(tenantId);
+			else streamsByTenant.set(tenantId, remaining);
+		};
+	};
+
+	// In-flight manual sleep cycles per conversation: a repeat request gets the running task, not a duplicate.
+	const sleepCyclesInFlight = new Map<string, Promise<string>>();
+	// --- request id -------------------------------------------------------------------------------------------
+	app.use("*", async (c, next) => {
+		const incoming = c.req.header("x-request-id");
+		const requestId = incoming && REQUEST_ID_PATTERN.test(incoming) ? incoming : randomUUID();
+		c.set("requestId", requestId);
+		c.header("x-request-id", requestId);
+		await next();
 	});
 
+	app.onError((err, c) => {
+		const requestId = c.get("requestId") ?? randomUUID();
+		const headers: Record<string, string> = { "x-request-id": requestId };
+		if (err instanceof RateLimitError) headers["retry-after"] = String(err.retryAfterSeconds);
+		if (err instanceof UnauthorizedError) headers["www-authenticate"] = "Bearer";
+
+		// Typed 4xx errors carry intentionally client-facing messages. 5xx and untyped errors never echo their text.
+		const typed =
+			err instanceof HarnessError
+				? err.status < 500
+					? { status: err.status, code: err.code, message: err.message }
+					: undefined
+				: legacyStatus(err);
+		if (typed) {
+			return c.json({ error: typed.message, code: typed.code, requestId }, typed.status as 400, headers);
+		}
+		if (c.req.raw.signal.aborted) {
+			// The client already went away (e.g. disconnected during wait=true); nothing to report loudly.
+			logger.debug("http_request_aborted", { requestId, method: c.req.method, path: c.req.path });
+			return c.body(null, 499 as 400, headers);
+		}
+		logger.error("http_unhandled_error", {
+			requestId,
+			method: c.req.method,
+			path: c.req.path,
+			error: serializeError(err),
+		});
+		return c.json({ error: "Internal server error", code: "internal_error", requestId }, 500, headers);
+	});
+
+	app.notFound((c) => c.json({ error: "Not found", code: "not_found", requestId: c.get("requestId") }, 404));
+
+	// --- public routes (before auth) ---------------------------------------------------------------------------
 	app.get("/health", (c) => {
 		return c.json({ status: "ok", timestamp: Date.now() });
 	});
+	options.registerPublicRoutes?.(app);
 
+	// --- authentication + rate limiting ------------------------------------------------------------------------
+	app.use("*", async (c, next) => {
+		if (publicPaths.has(c.req.path)) return next();
+		let tenant: TenantContext | null;
+		try {
+			tenant = await auth(c.req.raw);
+		} catch (error) {
+			logger.error("http_auth_resolver_failed", { requestId: c.get("requestId"), error: serializeError(error) });
+			tenant = null;
+		}
+		if (!tenant) {
+			const address = authFailureLimiter ? remoteAddress(c) : undefined;
+			if (authFailureLimiter && address !== undefined) {
+				const decision = authFailureLimiter.check(address);
+				if (!decision.allowed) throw new RateLimitError(decision.retryAfterSeconds);
+			}
+			throw new UnauthorizedError();
+		}
+		c.set("tenant", tenant);
+
+		if (limiter) {
+			const decision = limiter.check(tenant.tenantId);
+			if (!decision.allowed) throw new RateLimitError(decision.retryAfterSeconds);
+		}
+		return next();
+	});
+
+	// --- helpers -----------------------------------------------------------------------------------------------
+	const readJson = async (c: Context<HttpEnv>, opts: { required?: boolean } = {}): Promise<JsonRecord> =>
+		parseJsonObject(await readBodyText(c, maxBodyBytes), opts);
+
+	const requirePermission = (tenant: TenantContext, permission: string): void => {
+		if (!hasPermission(tenant, permission)) throw new ForbiddenError(`Missing permission "${permission}"`);
+	};
+
+	/** Throws NotFoundError unless the conversation exists and belongs to the caller's tenant. */
+	const ownedConversationId = async (c: Context<HttpEnv>): Promise<string> => {
+		const id = c.req.param("id") ?? "";
+		await harness.assertConversationOwner(c.get("tenant"), id);
+		return id;
+	};
+
+	// --- conversations -----------------------------------------------------------------------------------------
 	app.post("/conversations", async (c) => {
-		const body = (await c.req.json().catch(() => ({}))) as Partial<CreateConversationInput>;
-		const tenant = extractTenant({ get: (name) => c.req.header(name) }, body.tenant);
+		const body = await readJson(c);
+		const model = optionalModelSpec(body, "model");
+		const instructions = optionalString(body, "instructions", { maxLength: MAX_CONTENT_CHARS });
+		const enabledToolPacks = optionalStringArray(body, "enabledToolPacks");
+		const maxTurns = optionalPositiveInt(body, "maxTurns", 10_000);
+		// body.tenant is deliberately ignored: identity and permissions come only from the authenticated caller.
 		const created = await harness.createConversation({
-			tenant,
-			...(body.model ? { model: body.model } : {}),
-			...(body.instructions !== undefined ? { instructions: body.instructions } : {}),
-			...(body.enabledToolPacks ? { enabledToolPacks: body.enabledToolPacks } : {}),
-			...(body.maxTurns !== undefined ? { maxTurns: body.maxTurns } : {}),
+			tenant: c.get("tenant"),
+			...(model ? { model } : {}),
+			...(instructions !== undefined ? { instructions } : {}),
+			...(enabledToolPacks ? { enabledToolPacks } : {}),
+			...(maxTurns !== undefined ? { maxTurns } : {}),
 		});
 		return c.json(created, 201);
 	});
 
 	app.get("/conversations/:id", async (c) => {
-		const id = c.req.param("id");
+		const id = await ownedConversationId(c);
 		const info = await harness.getConversation(id);
-		if (!info) return c.json({ error: `Conversation "${id}" not found` }, 404);
+		if (!info) throw new NotFoundError(`Conversation "${id}" not found`);
 		const transcript = await harness.getTranscript(id);
 		return c.json({ conversation: info, transcript });
 	});
 
 	app.post("/conversations/:id/fork", async (c) => {
-		const id = c.req.param("id");
-		const body = (await c.req.json()) as {
-			atEntryId: string;
-			model?: CreateConversationInput["model"];
-			instructions?: string;
-		};
-		if (!body.atEntryId) {
-			return c.json({ error: "atEntryId is required" }, 400);
+		const id = await ownedConversationId(c);
+		const body = await readJson(c, { required: true });
+		if (body.tenant !== undefined) {
+			throw new ValidationError("tenant cannot be set when forking; the child belongs to the authenticated caller");
 		}
-		const forked = await harness.forkConversation(id, body.atEntryId, {
-			...(body.model ? { model: body.model } : {}),
-			...(body.instructions !== undefined ? { instructions: body.instructions } : {}),
+		const atEntryId = requiredString(body, "atEntryId", { maxLength: 40 });
+		if (!NUMERIC_ID_PATTERN.test(atEntryId)) throw new ValidationError("atEntryId must be a numeric entry id");
+		const model = optionalModelSpec(body, "model");
+		const instructions = optionalString(body, "instructions", { maxLength: MAX_CONTENT_CHARS });
+		// The child belongs to the authenticated caller (not the parent's stored identity/permissions).
+		const forked = await harness.forkConversation(id, atEntryId, {
+			tenant: c.get("tenant"),
+			...(model ? { model } : {}),
+			...(instructions !== undefined ? { instructions } : {}),
 		});
 		return c.json(forked, 201);
 	});
 
 	app.post("/conversations/:id/messages", async (c) => {
-		const conversationId = c.req.param("id");
-		const body = (await c.req.json()) as {
-			content: string;
-			requestId?: string;
-			whenBusy?: SubmitMessageInput["whenBusy"];
-			wait?: boolean;
-		};
-		if (typeof body.content !== "string" || body.content.length === 0) {
-			return c.json({ error: "content must be a non-empty string" }, 400);
-		}
+		const conversationId = await ownedConversationId(c);
+		const body = await readJson(c, { required: true });
+		const content = requiredString(body, "content", { maxLength: MAX_CONTENT_CHARS });
+		const requestId = optionalString(body, "requestId", { maxLength: 200 });
+		const whenBusy = optionalEnum(body, "whenBusy", ["steer", "followUp", "reject"] as const);
+		const wait = optionalBoolean(body, "wait");
 
 		const submitInput: SubmitMessageInput = {
 			conversationId,
-			content: body.content,
-			...(body.requestId ? { requestId: body.requestId } : {}),
-			...(body.whenBusy ? { whenBusy: body.whenBusy } : {}),
+			content,
+			...(requestId ? { requestId } : {}),
+			...(whenBusy ? { whenBusy } : {}),
 		};
 
-		if (body.wait === true) {
+		if (wait === true) {
 			const settled = await harness.submitAndWait(submitInput, c.req.raw.signal);
 			return c.json(settled);
 		}
@@ -111,87 +353,168 @@ export function createHttpServer(harness: HarnessPort): Hono {
 		return c.json(handle, 202);
 	});
 
-	app.get("/conversations/:id/stream", (c) => {
-		const conversationId = c.req.param("id");
-		return streamSSE(c, async (stream) => {
-			const abortController = new AbortController();
-			stream.onAbort(() => {
-				abortController.abort();
-			});
+	app.get("/conversations/:id/stream", async (c) => {
+		const conversationId = await ownedConversationId(c);
 
-			let eventSeq = 0;
-			for await (const event of harness.watchConversation(conversationId, abortController.signal)) {
-				await stream.writeSSE({
-					id: String(++eventSeq),
-					event: event.type,
-					data: JSON.stringify(event),
+		const queryAfter = c.req.query("afterEntryId");
+		if (queryAfter !== undefined && !NUMERIC_ID_PATTERN.test(queryAfter)) {
+			throw new ValidationError("afterEntryId must be a numeric entry id");
+		}
+		const headerAfter = c.req.header("last-event-id");
+		const afterEntryId = queryAfter ?? (headerAfter && NUMERIC_ID_PATTERN.test(headerAfter) ? headerAfter : undefined);
+		const requestId = c.get("requestId");
+		const releaseSlot = acquireStreamSlot(c.get("tenant").tenantId);
+
+		return streamSSE(
+			c,
+			async (stream) => {
+				const abortController = new AbortController();
+				let keepAlive: ReturnType<typeof setInterval> | undefined;
+				const cleanup = (): void => {
+					if (keepAlive) clearInterval(keepAlive);
+					keepAlive = undefined;
+				};
+				stream.onAbort(() => {
+					cleanup();
+					releaseSlot();
+					abortController.abort();
 				});
-			}
-		});
+				// Client disconnect also surfaces on the request signal.
+				c.req.raw.signal.addEventListener("abort", () => abortController.abort(), { once: true });
+
+				if (keepAliveMs > 0) {
+					keepAlive = setInterval(() => {
+						if (stream.aborted || stream.closed) return cleanup();
+						void stream.write(": ping\n\n").catch(cleanup);
+					}, keepAliveMs);
+					keepAlive.unref?.();
+				}
+
+				try {
+					for await (const event of harness.watchConversation(conversationId, abortController.signal, {
+						...(afterEntryId !== undefined ? { afterEntryId } : {}),
+					})) {
+						// SSE ids are always transcript entry ids so Last-Event-ID can be fed straight back as
+						// `afterEntryId`. Events without an entry omit `id`, which leaves the client's last id unchanged.
+						let id: string | undefined;
+						if (event.type === "entry_appended") {
+							id = event.entry.id;
+						} else if (event.type === "snapshot" && event.entries.length > 0) {
+							id = event.entries[event.entries.length - 1]?.id;
+						}
+						await stream.writeSSE({
+							...(id !== undefined ? { id } : {}),
+							event: event.type,
+							data: JSON.stringify(event),
+						});
+					}
+				} finally {
+					cleanup();
+					releaseSlot();
+				}
+			},
+			async (err, stream) => {
+				logger.error("http_stream_error", { requestId, conversationId, error: serializeError(err) });
+				await stream.writeSSE({
+					event: "error",
+					data: JSON.stringify({ error: "Stream failed", code: "internal_error", requestId }),
+				});
+			},
+		);
 	});
 
 	app.post("/conversations/:id/abort", async (c) => {
-		await harness.abortConversation(c.req.param("id"));
+		await harness.abortConversation(await ownedConversationId(c));
 		return c.json({ aborted: true });
 	});
 
 	app.post("/conversations/:id/reset", async (c) => {
-		const body = (await c.req.json().catch(() => ({}))) as { handoff?: string };
-		await harness.resetConversation(c.req.param("id"), body.handoff);
+		const id = await ownedConversationId(c);
+		const body = await readJson(c);
+		const handoff = optionalString(body, "handoff", { maxLength: MAX_CONTENT_CHARS });
+		await harness.resetConversation(id, handoff);
 		return c.json({ reset: true });
 	});
 
 	app.post("/conversations/:id/compact", async (c) => {
-		const body = (await c.req.json().catch(() => ({}))) as { instructions?: string };
-		const result = await harness.compactConversation(c.req.param("id"), body.instructions);
-		return c.json(result);
+		const id = await ownedConversationId(c);
+		const body = await readJson(c);
+		const instructions = optionalString(body, "instructions", { maxLength: MAX_CONTENT_CHARS });
+		const wait = optionalBoolean(body, "wait");
+		if (wait === true) {
+			// Forward the request signal so a client disconnect stops waiting on the compaction.
+			return c.json(await harness.compactConversation(id, instructions, c.req.raw.signal));
+		}
+		const { taskId } = await harness.startCompaction(id, instructions);
+		return c.json({ taskId }, 202);
 	});
 
 	app.post("/conversations/:id/sleep-cycle", async (c) => {
-		const body = (await c.req.json().catch(() => ({}))) as { reason?: string; wait?: boolean };
-		const { taskId } = await harness.triggerSleepCycle(c.req.param("id"), { reason: body.reason });
-		if (body.wait) {
+		const id = await ownedConversationId(c);
+		requirePermission(c.get("tenant"), SLEEP_CYCLE_PERMISSION);
+		const body = await readJson(c);
+		const reason = optionalString(body, "reason", { maxLength: 1000 });
+		const wait = optionalBoolean(body, "wait");
+
+		// Single-flight per conversation: reuse a running cycle instead of starting a duplicate. The promise is
+		// registered before awaiting so concurrent requests cannot both start one.
+		let pending = sleepCyclesInFlight.get(id);
+		if (!pending) {
+			const started = harness.triggerSleepCycle(id, { reason }).then((result) => result.taskId);
+			pending = started;
+			sleepCyclesInFlight.set(id, started);
+			const clear = (): void => {
+				if (sleepCyclesInFlight.get(id) === started) sleepCyclesInFlight.delete(id);
+			};
+			started.then((startedTaskId) => harness.waitTask(startedTaskId).then(clear, clear), clear);
+		}
+		const taskId = await pending;
+		if (wait === true) {
 			const settled = await harness.waitTask(taskId, c.req.raw.signal);
+			if (sleepCyclesInFlight.get(id) === pending) sleepCyclesInFlight.delete(id);
 			return c.json(settled);
 		}
 		return c.json({ taskId }, 202);
 	});
 
+	// --- approvals / signals -----------------------------------------------------------------------------------
 	app.get("/approvals", async (c) => {
 		const conversationId = c.req.query("conversationId");
-		const approvals = await harness.listPendingApprovals(conversationId);
+		const approvals = await harness.listPendingApprovals(conversationId, { tenant: c.get("tenant") });
 		return c.json({ approvals });
 	});
 
 	app.post("/signals", async (c) => {
-		const body = (await c.req.json()) as {
-			taskId: string;
-			signalName: string;
-			key: string;
-			payload: unknown;
-		};
-		if (!body.taskId || !body.signalName || !body.key) {
-			return c.json({ error: "taskId, signalName, and key are required" }, 400);
-		}
-		const result = await harness.deliverSignal(body);
+		const body = await readJson(c, { required: true });
+		const taskId = requiredString(body, "taskId", { maxLength: 40 });
+		const signalName = requiredString(body, "signalName", { maxLength: 200 });
+		const key = requiredString(body, "key", { maxLength: 500 });
+		await harness.assertTaskOwner(c.get("tenant"), taskId);
+		const result = await harness.deliverSignal({ taskId, signalName, key, payload: body.payload ?? null });
 		return c.json(result);
 	});
 
+	// --- tool packs / usage (process-global => admin permissions) ---------------------------------------------
 	app.get("/tool-packs", (c) => {
 		return c.json({ toolPacks: harness.listToolPacks() });
 	});
 
 	app.post("/tool-packs/:name", async (c) => {
+		requirePermission(c.get("tenant"), ADMIN_PERMISSIONS.toolPacks);
 		const name = c.req.param("name");
-		const body = (await c.req.json()) as { enabled: boolean };
-		if (typeof body.enabled !== "boolean") {
-			return c.json({ error: "enabled boolean is required" }, 400);
+		const body = await readJson(c, { required: true });
+		const enabled = optionalBoolean(body, "enabled");
+		if (enabled === undefined) throw new ValidationError("enabled boolean is required");
+		if (!harness.listToolPacks().some((pack) => pack.name === name)) {
+			throw new NotFoundError(`Tool pack "${name}" not found`);
 		}
-		harness.setToolPackEnabled(name, body.enabled);
+		harness.setToolPackEnabled(name, enabled);
 		return c.json({ toolPacks: harness.listToolPacks() });
 	});
 
 	app.get("/usage", async (c) => {
+		// Usage is aggregated process-wide (all tenants), so it is admin-only.
+		requirePermission(c.get("tenant"), ADMIN_PERMISSIONS.usage);
 		return c.json(await harness.getUsage());
 	});
 

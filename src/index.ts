@@ -14,6 +14,7 @@ import type {
 	MemoryService,
 	MemoryStatus,
 	MidTermEpisode,
+	PendingEpisodeScope,
 	RunTelemetryRecord,
 	SkillHealthMetric,
 	TelemetryStore,
@@ -56,13 +57,27 @@ import { createCaptureTelemetryExtension } from "./extensions/capture-telemetry.
 import { createCorePromptExtension, DEFAULT_STATIC_SYSTEM_PROMPT } from "./extensions/core-prompt.ext.js";
 import { createGuardShapingExtension, DEFAULT_TOOL_PERMISSIONS } from "./extensions/guard-shaping.ext.js";
 import {
+	createBudgetExtension,
+	createDefaultMaxTurnsInitializer,
+	type BudgetDiagnostic,
+} from "./extensions/budget.ext.js";
+import {
+	BudgetGate,
+	BudgetStore,
+	budgetLimitsFromConfig,
+	createBudgetGatedModels,
+	type BudgetLimits,
+	type UsageRecord,
+} from "./runtime/budget.js";
+import { buildHarnessSettings, type ProviderCircuitBreakers } from "./runtime/resilience.js";
+import {
 	createSkillsLoaderExtension,
 	formatFrozenSkillsIndex,
 	loadSkillCatalog,
 	readSkillBody,
 	type SkillFrontmatter,
 } from "./extensions/skills-loader.ext.js";
-import { createSleepCycleExtension } from "./extensions/sleep-cycle.ext.js";
+import { createSleepCycleExtension, type SleepCycleRetryOptions } from "./extensions/sleep-cycle.ext.js";
 import { ConversationService } from "./harness/conversation-svc.js";
 import { HarnessRegistryManager } from "./harness/registry.js";
 import { SimLog, type SimLogEntry, type SimLogEntryInput, type SimLogOutcome, type SimLogSummary } from "./learning/sim-log.js";
@@ -80,9 +95,24 @@ import {
 import { AppDatabase, type AppDatabaseOptions } from "./memory/db.js";
 import { detectFrictionSignals, type FrictionAnalysisInput, type FrictionAnalysisResult } from "./memory/friction-signals.js";
 import { SqliteArtifactStore, SqliteMemoryService, SqliteTelemetryStore } from "./memory/sqlite-memory.js";
+export type { EmbeddingProvider } from "./contracts/app-capabilities.js";
+export {
+	DEFAULT_SEVERITY_WEIGHTS,
+	type FrictionOptions,
+	type SeverityWeights,
+} from "./memory/friction-signals.js";
+export { DEFAULT_RANKING_WEIGHTS, type RankingOptions, type RankingWeights } from "./memory/retrieval.js";
+export {
+	MEMORY_LIMITS,
+	renderUntrustedMemoryBlock,
+	sanitizeMemoryKey,
+	sanitizeMemoryText,
+	type SanitizeResult,
+} from "./memory/sanitize.js";
 import { HostRuntime, SingleWriterLockError } from "./runtime/host-runtime.js";
 import {
 	createModelCatalog,
+	type FastModelClientOptions,
 	type RecordedModelRequest,
 	type ScriptedTurnOutput,
 	type TestModelController,
@@ -94,6 +124,20 @@ import {
 	type WakeScheduler,
 	type WakeState,
 } from "./runtime/wake-scheduler.js";
+import {
+	SleepCycleScheduler,
+	type SleepCycleSchedulerOptions,
+	type SleepSchedulerTimer,
+	type SleepTickReport,
+} from "./runtime/sleep-scheduler.js";
+import {
+	listProposedSkills,
+	promoteProposedSkill,
+	PROPOSED_SKILLS_DIRNAME,
+	proposeSkillDrafts,
+	rejectProposedSkill,
+	sanitizeSkillName,
+} from "./learning/skill-promotion.js";
 import { createArtifactToolPack } from "./tools/artifact.tools.js";
 import {
 	ApprovalDecisionSignal,
@@ -117,6 +161,24 @@ export interface BootstrapHarnessOptions {
 	readonly consolidationGates?: Partial<ConsolidationGateConfig>;
 	readonly autoResume?: boolean;
 	readonly registerRealProviders?: boolean;
+	/** Budget enforcement extras; the limits themselves come from `config` (MAX_CONVERSATION_TOKENS etc.). */
+	readonly budget?: {
+		/** Dollar cost of one usage record; default is Pi AI's catalog-derived `usage.cost.total`. */
+		readonly estimateCostUsd?: (usage: UsageRecord) => number;
+		/** Called whenever a generation is blocked by a budget; default writes a JSON warning line to stderr. */
+		readonly onDiagnostic?: (diagnostic: BudgetDiagnostic) => void;
+	};
+	/** Fast-model resilience overrides (injectable sleep/clock/random for tests, event sink). */
+	readonly fastModelResilience?: Pick<FastModelClientOptions, "deps" | "onEvent" | "breaker">;
+	/** Retry/backoff for the sleep-cycle fast-model consolidate phase (defaults: 3 attempts, 250ms base). */
+	readonly consolidationRetry?: SleepCycleRetryOptions;
+	/**
+	 * Periodic sleep-cycle scheduler overrides. `false` disables it. Defaults come from
+	 * `config.sleepCycleIntervalMs` / `config.sleepCycleSchedulerEnabled`.
+	 */
+	readonly sleepCycleScheduler?:
+		| false
+		| Partial<Omit<SleepCycleSchedulerOptions, "harness" | "memory" | "appDb">>;
 }
 
 export interface BootstrappedHarness {
@@ -130,6 +192,14 @@ export interface BootstrappedHarness {
 	readonly skillForge: SkillForge;
 	readonly skillDojo: SkillDojo;
 	readonly wakeScheduler: WakeScheduler;
+	/** Per-tenant daily spend ledger and budget-block event log (tables created lazily in the app DB). */
+	readonly budgetStore: BudgetStore;
+	/** Effective budget limits (0 = unlimited). */
+	readonly budgetLimits: BudgetLimits;
+	/** Fast-model per-provider circuit breakers (`.snapshot()` for health reporting). */
+	readonly circuitBreakers: ProviderCircuitBreakers;
+	/** Periodic sleep-cycle scheduler (inactive when disabled via config or `sleepCycleScheduler: false`). */
+	readonly sleepCycleScheduler: SleepCycleScheduler;
 	close(): Promise<void>;
 }
 
@@ -153,9 +223,20 @@ export async function bootstrapHarness(options: BootstrapHarnessOptions = {}): P
 		fastModel: config.fastModel,
 		useMockModels: config.useMockModels,
 		registerRealProviders: options.registerRealProviders,
+		fastModelResilience: {
+			fallbacks: config.fastModelFallbacks,
+			timeoutMs: config.fastModelTimeoutMs,
+			maxRetries: config.fastModelMaxRetries,
+			...options.fastModelResilience,
+			breaker: {
+				failureThreshold: config.circuitBreakerFailureThreshold,
+				cooldownMs: config.circuitBreakerCooldownMs,
+				...options.fastModelResilience?.breaker,
+			},
+		},
 	});
 
-	const memory = options.capabilities?.memory ?? new SqliteMemoryService(appDb, { now });
+	const memory =options.capabilities?.memory ?? new SqliteMemoryService(appDb, { now });
 	const artifacts =
 		options.capabilities?.artifacts ??
 		new SqliteArtifactStore(appDb, {
@@ -194,12 +275,38 @@ export async function bootstrapHarness(options: BootstrapHarnessOptions = {}): P
 			maxToolOutputBytes: capabilities.maxToolOutputBytes,
 		}),
 	);
+	// Budget enforcement runs right after the guard: it vetoes a generation (via the gated Models below)
+	// before any provider call, and meters per-tenant daily spend.
+	const budgetLimits = budgetLimitsFromConfig(config);
+	const budgetGate = new BudgetGate();
+	const budgetStore = new BudgetStore(appDb.db, { now });
+	registryManager.installCoreExtension(
+		createBudgetExtension({
+			store: budgetStore,
+			gate: budgetGate,
+			limits: budgetLimits,
+			now,
+			estimateCostUsd: options.budget?.estimateCostUsd,
+			onDiagnostic:
+				options.budget?.onDiagnostic ??
+				((diagnostic) => {
+					process.stderr.write(`${JSON.stringify({ level: "warn", event: "budget_blocked", ...diagnostic })}\n`);
+				}),
+			onError: (error) => {
+				process.stderr.write(
+					`${JSON.stringify({ level: "error", event: "budget_check_failed", message: error instanceof Error ? error.message : String(error) })}\n`,
+				);
+			},
+		}),
+	);
 	registryManager.installCoreExtension(createCaptureTelemetryExtension(capabilities));
 	const sleepCycle = createSleepCycleExtension({
 		capabilities,
 		consolidationGates: options.consolidationGates,
 		skillForge,
 		skillDojo,
+		simLog,
+		consolidationRetry: options.consolidationRetry,
 	});
 	registryManager.installCoreExtension(sleepCycle.extension);
 	registryManager.installCoreExtension(createSkillsLoaderExtension(capabilities));
@@ -220,8 +327,12 @@ export async function bootstrapHarness(options: BootstrapHarnessOptions = {}): P
 		hostRuntime = await HostRuntime.open({
 			piDbPath: config.piDbPath,
 			tablePrefix: "pi_",
-			models: catalog.models,
+			models: createBudgetGatedModels(catalog.models, budgetGate),
 			registry: registryManager.getRegistry(),
+			// Main-model timeout + durable retry/backoff live in Pi Durable's settings (no extra wrapper = no double retry).
+			settings: buildHarnessSettings(config),
+			// Default maxTurns for conversations/forks that don't set one.
+			conversationCreated: createDefaultMaxTurnsInitializer(config.defaultMaxTurns),
 			wakeScheduler,
 			now,
 			autoResume: options.autoResume ?? true,
@@ -244,6 +355,18 @@ export async function bootstrapHarness(options: BootstrapHarnessOptions = {}): P
 		},
 	});
 
+	const schedulerOverrides = options.sleepCycleScheduler === false ? undefined : options.sleepCycleScheduler;
+	const sleepCycleScheduler = new SleepCycleScheduler({
+		intervalMs: config.sleepCycleIntervalMs,
+		enabled: config.sleepCycleSchedulerEnabled && options.sleepCycleScheduler !== false,
+		now,
+		...schedulerOverrides,
+		harness: conversationSvc,
+		memory: capabilities.memory,
+		appDb,
+	});
+	sleepCycleScheduler.start();
+
 	return {
 		config,
 		harness: conversationSvc,
@@ -255,9 +378,62 @@ export async function bootstrapHarness(options: BootstrapHarnessOptions = {}): P
 		skillForge,
 		skillDojo,
 		wakeScheduler,
-		close: () => conversationSvc.close(),
+		budgetStore,
+		budgetLimits,
+		circuitBreakers: catalog.circuitBreakers,
+		sleepCycleScheduler,
+		close: () => {
+			sleepCycleScheduler.dispose();
+			return conversationSvc.close();
+		},
 	};
 }
+
+// Operations: health probes and structured logging
+export {
+	createHealthChecker,
+	readPackageVersion,
+	type HealthChecker,
+	type HealthCheckerOptions,
+	type HealthCheckResult,
+	type LivenessReport,
+	type ReadinessReport,
+} from "./health.js";
+export { createLogger, resolveLogLevel, type LogLevel, type LogFields, type Logger, type LoggerOptions } from "./logger.js";
+
+// Budgets & model resilience
+export {
+	BudgetGate,
+	BudgetStore,
+	budgetLimitsFromConfig,
+	evaluateBudget,
+	UNLIMITED_BUDGET,
+	type BudgetEventRecord,
+	type BudgetLimits,
+	type BudgetViolation,
+	type SpendTotals,
+	type UsageRecord,
+} from "./runtime/budget.js";
+export { type BudgetDiagnostic } from "./extensions/budget.ext.js";
+export {
+	AllModelsFailedError,
+	assertProductionModelSafety,
+	buildHarnessSettings,
+	CircuitBreaker,
+	CircuitOpenError,
+	classifyError,
+	MockModelsInProductionError,
+	ModelTimeoutError,
+	ProviderCircuitBreakers,
+	withRetry,
+	withTimeout,
+	type CircuitState,
+	type ClassifiedError,
+	type ErrorKind,
+	type ModelSafetyConfig,
+	type ResilienceEvent,
+} from "./runtime/resilience.js";
+export { createFastModelClient, type FastModelClientOptions } from "./runtime/model-catalog.js";
 
 // Public Pi-free exports
 export {
@@ -341,6 +517,17 @@ export {
 	SkillDojo,
 	type SkillDojoEvaluation,
 	type SkillDojoOptions,
+	SleepCycleScheduler,
+	type SleepCycleSchedulerOptions,
+	type SleepTickReport,
+	type SleepSchedulerTimer,
+	type PendingEpisodeScope,
+	promoteProposedSkill,
+	rejectProposedSkill,
+	listProposedSkills,
+	proposeSkillDrafts,
+	sanitizeSkillName,
+	PROPOSED_SKILLS_DIRNAME,
 	SimLog,
 	type SimLogEntry,
 	type SimLogEntryInput,

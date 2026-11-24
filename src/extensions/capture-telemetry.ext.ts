@@ -24,6 +24,11 @@ export type CaptureEpisodeInput = {
 	readonly reason: "answer" | "terminate";
 };
 
+/** Earlier user turns fed to the friction detector (repeat/rephrase detection). */
+const PREVIOUS_USER_MESSAGES = 8;
+const PREVIOUS_USER_PAGE_SIZE = 24;
+const PREVIOUS_USER_MAX_PAGES = 5;
+
 type CaptureEpisodeCheckpoint = {
 	phase: "capture";
 };
@@ -59,12 +64,23 @@ function buildToolTrace(entries: readonly EntryRecord[]): ToolTraceItem[] {
 			.map((d) => d.code)
 			.filter((code): code is string => typeof code === "string" && code.length > 0);
 
+		// Blocked calls have empty output; the reason lives in the diagnostic message ("Tool call blocked: ...").
+		const resultText = [
+			contentText(msg.content),
+			...diagnostics.map((d) => (typeof d.message === "string" ? d.message : "")),
+		]
+			.map((part) => part.trim())
+			.filter((part) => part.length > 0)
+			.join("\n")
+			.slice(0, 500);
+
 		trace.push({
 			callId: msg.toolCallId,
 			toolName: msg.toolName,
 			argumentsJson: JSON.stringify(call?.arguments ?? {}),
 			isError: msg.isError,
 			diagnosticCodes,
+			...(resultText ? { resultText } : {}),
 			...(msg.durationMs !== undefined ? { durationMs: msg.durationMs } : {}),
 		});
 	}
@@ -141,10 +157,38 @@ export function createCaptureTelemetryExtension(capabilities: AppCapabilities): 
 
 				const toolTrace = buildToolTrace(allEntries);
 				const { userMessage, assistantSummary } = extractUserAndAssistantText(allEntries, task.input.answer);
+				// Recent earlier user turns let the friction detector spot rephrased/repeated requests.
+				const previousUserMessages: string[] = [];
+				if (Number(task.input.first) > 1) {
+					// Page backwards (newest first) until enough earlier USER messages are found: a window of
+					// mixed entries is mostly assistant/tool output, so one fixed-size read could find none.
+					const newestFirst: string[] = [];
+					let earlierCursor: Awaited<ReturnType<typeof runtime.entries>>["next"];
+					for (let pageIndex = 0; pageIndex < PREVIOUS_USER_MAX_PAGES; pageIndex++) {
+						const earlier = await runtime.entries(
+							{ maxEntryId: (Number(task.input.first) - 1) as EntryId, order: "descending" },
+							PREVIOUS_USER_PAGE_SIZE,
+							earlierCursor,
+							context,
+						);
+						for (const entry of earlier.items) {
+							const msg = entry.model?.[0];
+							if (msg && msg.role === "user") {
+								const text = contentText(msg.content as never).trim();
+								if (text) newestFirst.push(text.slice(0, 500));
+								if (newestFirst.length >= PREVIOUS_USER_MESSAGES) break;
+							}
+						}
+						earlierCursor = earlier.next;
+						if (newestFirst.length >= PREVIOUS_USER_MESSAGES || earlierCursor === undefined) break;
+					}
+					previousUserMessages.push(...newestFirst.reverse());
+				}
 				const friction = detectFrictionSignals({
 					userMessage,
 					assistantSummary,
 					toolTrace,
+					previousUserMessages,
 				});
 
 				const runId = `run:${task.input.first}:${task.input.last}`;

@@ -1,6 +1,13 @@
 import { int, obj, oneOf, opt, str } from "@earendil-works/pi-schema";
 import type { MemoryService } from "../contracts/app-capabilities.js";
 import type { ToolPackDefinition } from "../harness/registry.js";
+import {
+	formatMemoryLine,
+	renderUntrustedMemoryBlock,
+	sanitizeInlineLabel,
+	sanitizeMemoryKey,
+	sanitizeMemoryText,
+} from "../memory/sanitize.js";
 import { createTenantScopedTool, defineToolPack } from "./tool-pack.js";
 
 const MemoryKindSchema = oneOf(["fact", "preference", "procedure", "constraint", "episodic"] as const);
@@ -40,18 +47,16 @@ export function createMemoryToolPack(memory: MemoryService): ToolPackDefinition 
 			});
 			if (results.length === 0) {
 				return {
-					output: [{ type: "text", text: `No memories matched query "${args.query}".` }],
+					output: [{ type: "text", text: `No memories matched query "${sanitizeInlineLabel(args.query, 80)}".` }],
 					details: { count: 0, ids: [] as string[] },
 				};
 			}
-			const formatted = results
-				.map(
-					(r, i) =>
-						`${i + 1}. [${r.memory.id}] (${r.memory.kind}${r.memory.pinned ? ", pinned" : ""}, conf=${r.memory.confidence.toFixed(2)}) ${r.memory.key}: ${r.memory.content}`,
-				)
-				.join("\n");
+			const lines = results.map((r, i) => {
+				const id = r.memory.id.replace(/[^A-Za-z0-9_-]/g, "");
+				return `${i + 1}. [${id}] (conf=${r.memory.confidence.toFixed(2)}) ${formatMemoryLine(r.memory).slice(2)}`;
+			});
 			return {
-				output: [{ type: "text", text: formatted }],
+				output: [{ type: "text", text: renderUntrustedMemoryBlock(lines) }],
 				details: { count: results.length, ids: results.map((r) => r.memory.id) },
 			};
 		},
@@ -63,9 +68,18 @@ export function createMemoryToolPack(memory: MemoryService): ToolPackDefinition 
 		parameters: MemoryPinParams,
 		replay: "unsafe",
 		execute: async (args, tenant, api) => {
+			// Write-time screen: normalize the key and neutralize instruction-like / role-marker content.
+			const key = sanitizeMemoryKey(args.key);
+			const content = sanitizeMemoryText(args.content);
+			if (!key || !content.text) {
+				return {
+					isError: true,
+					output: [{ type: "text", text: "Refused to pin memory: key and content must be non-empty plain facts." }],
+				};
+			}
 			const saved = await memory.pinMemory(tenant.tenantId, tenant.userId, {
-				key: args.key,
-				content: args.content,
+				key,
+				content: content.text,
 				kind: args.kind ?? "preference",
 				sourceConversationId: String(api.conversationId),
 			});
@@ -73,7 +87,7 @@ export function createMemoryToolPack(memory: MemoryService): ToolPackDefinition 
 				output: [
 					{
 						type: "text",
-						text: `Pinned memory [${saved.id}] (${saved.kind}) ${saved.key}: ${saved.content}`,
+						text: `Pinned memory [${saved.id}] (${saved.kind}) ${saved.key}: ${saved.content}${content.flagged ? " (instruction-like text was neutralized)" : ""}`,
 					},
 				],
 				details: { memoryId: saved.id, key: saved.key },

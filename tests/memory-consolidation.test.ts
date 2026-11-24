@@ -31,11 +31,14 @@ describe("Memory consolidation, promotion gates, and SUPERSEDE tombstones", () =
 			const memory = new SqliteMemoryService(appDb);
 
 			// Seed initial active preference
-			const oldPref = await memory.pinMemory(TENANT.tenantId, TENANT.userId, {
+			// Seeded unpinned: pinned memories are protected from model-originated mutations (see below).
+			const oldPref = (await memory.applyMemoryMutation(TENANT.tenantId, TENANT.userId, {
+				op: "ADD",
 				key: "user.package_manager",
 				content: "Prefer npm for JavaScript packages",
 				kind: "preference",
-			});
+				confidence: 0.9,
+			}))!;
 
 			// Record an unconsolidated episode expressing a contradictory preference + noisy one-off facts
 			await memory.recordEpisode({
@@ -147,11 +150,13 @@ describe("Memory consolidation, promotion gates, and SUPERSEDE tombstones", () =
 		});
 
 		try {
-			const original = await runtime.capabilities.memory.pinMemory(TENANT.tenantId, TENANT.userId, {
+			const original = (await runtime.capabilities.memory.applyMemoryMutation(TENANT.tenantId, TENANT.userId, {
+				op: "ADD",
 				key: "user.theme",
 				content: "Light mode",
 				kind: "preference",
-			});
+				confidence: 0.9,
+			}))!;
 
 			const conv = await runtime.harness.createConversation({ tenant: TENANT });
 			runtime.testModel.enqueueMain({ type: "text", text: "Got it, switching to dark mode." });

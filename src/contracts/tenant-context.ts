@@ -23,6 +23,14 @@ export const DEFAULT_PERMISSIONS = [
 	"domain:approve_request",
 ] as const;
 
+/** Permissions gating process-global operations. `*` and `admin:*` also satisfy them. */
+export const ADMIN_PERMISSIONS = {
+	toolPacks: "admin:tool-packs",
+	usage: "admin:usage",
+	/** Lets a caller read/act on other users' conversations inside the same tenant. */
+	conversations: "admin:conversations",
+} as const;
+
 export function hasPermission(tenant: TenantContext, required: string): boolean {
 	if (tenant.permissions.includes("*")) return true;
 	if (tenant.permissions.includes(required)) return true;
@@ -32,6 +40,19 @@ export function hasPermission(tenant: TenantContext, required: string): boolean 
 		if (tenant.permissions.includes(domainWildcard)) return true;
 	}
 	return false;
+}
+
+/**
+ * Conversation access rule: same tenant AND (same user OR caller holds `*` / `admin:*` / `admin:conversations`).
+ * Tenant is always required: an admin permission never crosses tenants.
+ */
+export function canAccessConversation(
+	caller: Pick<TenantContext, "tenantId" | "userId" | "permissions">,
+	owner: Pick<TenantContext, "tenantId" | "userId">,
+): boolean {
+	if (caller.tenantId !== owner.tenantId) return false;
+	if (caller.userId === owner.userId) return true;
+	return hasPermission(caller as TenantContext, ADMIN_PERMISSIONS.conversations);
 }
 
 export function validateTenantContext(tenant: TenantContext): void {

@@ -18,6 +18,15 @@ export interface SkillDojoEvaluation {
 
 const MS_PER_DAY = 24 * 60 * 60 * 1000;
 
+function positiveOr(value: number | undefined, fallback: number): number {
+	return typeof value === "number" && Number.isFinite(value) && value > 0 ? value : fallback;
+}
+
+function clampRate(value: number | undefined, fallback: number): number {
+	if (typeof value !== "number" || !Number.isFinite(value) || value <= 0) return fallback;
+	return Math.min(1, value);
+}
+
 /**
  * Skill Dojo (Loop 1/2): tracks per-tool and per-skill health metrics and
  * automatically disables stale (> 30d unused) or severely degraded skills.
@@ -30,9 +39,11 @@ export class SkillDojo {
 
 	constructor(telemetry: TelemetryStore, options?: SkillDojoOptions) {
 		this.telemetry = telemetry;
-		this.staleSkillDays = options?.staleSkillDays ?? 30;
-		this.maxErrorRate = options?.maxErrorRate ?? 0.6;
-		this.minErrorSamples = options?.minErrorSamples ?? 5;
+		// Guard against NaN / zero / negative thresholds, which would otherwise disable every skill
+		// immediately (staleSkillDays <= 0) or never (NaN comparisons are always false).
+		this.staleSkillDays = positiveOr(options?.staleSkillDays, 30);
+		this.maxErrorRate = clampRate(options?.maxErrorRate, 0.6);
+		this.minErrorSamples = Math.max(1, Math.floor(positiveOr(options?.minErrorSamples, 5)));
 	}
 
 	async getHealthReport(tenantId: string, kind?: "tool" | "skill"): Promise<SkillHealthMetric[]> {

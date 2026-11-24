@@ -15,7 +15,7 @@ export interface ToolPackDefinition {
 
 interface ManagedPack {
 	readonly definition: ToolPackDefinition;
-	readonly extension: Extension;
+	extension: Extension;
 	enabled: boolean;
 }
 
@@ -46,12 +46,50 @@ export class HarnessRegistryManager {
 
 	/**
 	 * Hot-replaces a single extension in place by name without restarting the Harness.
+	 *
+	 * The previously installed extension with the same name is uninstalled first and the
+	 * replacement takes the same position in the install order (hook/section order matters,
+	 * e.g. guard-shaping must stay ahead of capture-telemetry). Replacing a toolpack's
+	 * extension (`toolpack:<name>`) keeps its enabled/disabled state; a disabled pack stays
+	 * uninstalled. An unknown name is installed as a new core extension.
+	 *
+	 * Note: conversations created with an explicit extension selection keep the extension
+	 * objects they were created with; the replacement applies to registry-default selections
+	 * and to conversations created afterwards.
 	 */
 	replaceExtension(extension: Extension): void {
-		if (this.coreExtensions.has(extension.name)) {
-			this.coreExtensions.set(extension.name, extension);
+		const pack = Array.from(this.toolPacks.values()).find((managed) => managed.extension.name === extension.name);
+		if (pack) {
+			const previous = pack.extension;
+			pack.extension = extension;
+			if (pack.enabled) {
+				this.swapInstalled(previous, extension);
+			}
+			return;
 		}
-		this.registry.install(extension);
+
+		const previous = this.coreExtensions.get(extension.name) ?? this.registry.snapshot().extension(extension.name);
+		this.coreExtensions.set(extension.name, extension);
+		if (previous) {
+			this.swapInstalled(previous, extension);
+		} else {
+			this.registry.install(extension);
+		}
+	}
+
+	/** Uninstalls `previous`, installs `next`, and restores the original install order. */
+	private swapInstalled(previous: Extension, next: Extension): void {
+		const installed = this.registry.snapshot().installed();
+		const index = installed.findIndex((ext) => ext.name === previous.name);
+		const trailing = index >= 0 ? installed.slice(index + 1) : [];
+
+		this.registry.uninstall(previous);
+		this.registry.install(next);
+		// `install` appends after an uninstall: move everything that used to follow behind it again.
+		for (const ext of trailing) {
+			this.registry.uninstall(ext);
+			this.registry.install(ext);
+		}
 	}
 
 	uninstallCoreExtension(name: string): boolean {

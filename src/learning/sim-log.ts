@@ -109,6 +109,18 @@ export class SimLog {
 		};
 	}
 
+	/**
+	 * Idempotent append: no-op (returns `undefined`) when this tenant already has an
+	 * entry for the same module + hypothesis. Lets replayed durable phases record once.
+	 */
+	appendIfAbsent(input: SimLogEntryInput): SimLogEntry | undefined {
+		const existing = this.appDb.db
+			.prepare("SELECT 1 AS present FROM sim_log WHERE tenant_id = ? AND target_module = ? AND hypothesis = ? LIMIT 1")
+			.get(input.tenantId, input.targetModule, input.hypothesis);
+		if (existing) return undefined;
+		return this.append(input);
+	}
+
 	list(filter?: {
 		readonly tenantId?: string;
 		readonly targetModule?: string;
