@@ -96,6 +96,18 @@ All settings are read from environment variables (see `.env.example`). Unknown o
 | `CODEMODE_MAX_WORKERS` | `4` | Process-wide cap on concurrent script workers |
 | `CODEMODE_INLINE_BUDGET` | `3000` | Estimated tokens of tool declarations in the prompt section |
 
+### Answer verifier
+
+A quality gate before an answer stands (`src/extensions/verifier.ext.ts`). It is a durable `onYield` task, so the caller only receives an answer after the check and a crash mid-check resumes it. Short, tool-free answers are not checked. Otherwise one fast-model call reviews the answer against the request, the tool results and any unfinished plan steps. It can send the agent back at most `VERIFIER_MAX_REVISIONS` times per run, and only for concrete problems: unsupported claims, ignored tool errors, an unanswered request, or unfinished plan steps. It fails open (missing fast model, budget block, provider error or bad output lets the answer through). The reviewer's issues are screened for injection before being fed back, because it read untrusted tool output. Default: on with real models, off with mock models (`VERIFIER_ENABLED`, `VERIFIER_MAX_REVISIONS`, `VERIFIER_MIN_ANSWER_CHARS`).
+
+### Planning
+
+The `planning` tool pack (`plan_set`, `plan_update`, `plan_view`) gives the agent a durable, bounded working plan (12 steps) stored in a rewindable document, so restarts and forks see the plan as of their entry. A blocked step requires a reason, which pushes the agent to re-plan or explain the blocker. The plan is never injected into the system prompt (that would break the KV-cache prefix); each tool call returns the whole plan instead. The verifier treats unfinished steps as grounds for revision.
+
+### Trace export
+
+Pi Durable emits typed spans (`pi.durable.phase`, `.submit`, `.entry`, ...) into a host-provided telemetry adapter. Set `TRACE_EXPORT_PATH` to append every settled span as one JSON line (`StoredSpan` shape; one previous file kept at `<path>.1` after `TRACE_EXPORT_MAX_BYTES`). Spans carry IDs and control metadata only, never messages, tool arguments or results, and oversized attribute values are dropped. Pass `bootstrapHarness({ telemetry })` to use your own adapter (for example OpenTelemetry) instead.
+
 ### Gated self-improvement (Harness²-style propose / probe / compose)
 
 The harness can improve its own operating guidance **without ever changing guardrails, permissions, tools or budgets**. The only editable surface is a *prompt addendum* appended to the static system prompt.

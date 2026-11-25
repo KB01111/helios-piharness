@@ -220,3 +220,61 @@ export function listApprovalsFromDoc(doc: Readonly<PendingApprovalsState> | unde
 		.map((item) => ({ ...item }))
 		.sort((a, b) => a.createdAt - b.createdAt);
 }
+
+// ── Durable plan (planning tool pack + verifier) ─────────────────────────────────────────────────────────
+
+export type PlanStepStatus = "pending" | "in_progress" | "done" | "blocked";
+
+export interface PlanStep extends JsonObject {
+	id: string;
+	title: string;
+	status: PlanStepStatus;
+	/** Required context when a step is `blocked`; optional result summary otherwise. */
+	note: string;
+}
+
+export interface PlanDocState extends JsonObject {
+	/** Bumped on every change, so a stale view is detectable. */
+	revision: number;
+	steps: PlanStep[];
+}
+
+/**
+ * The agent's working plan for a multi-step task. Rewindable and copied as of the fork point, so forks (evals) and
+ * restarts see exactly the plan that existed at that entry. It is never injected into the system prompt (that would
+ * break the KV-cache prefix); the planning tools return the whole plan on every call instead.
+ */
+export const PlanDoc = defineDoc<PlanDocState>({
+	kind: "app.plan",
+	version: 1,
+	scope: "conversation",
+	history: "rewindable",
+	fork: "asOf",
+	initial: () => ({ revision: 0, steps: [] }),
+	checkpointWhen: (_value, _ops, info) => info.deltasSinceBase >= 16,
+});
+
+// ── Answer verifier counters ─────────────────────────────────────────────────────────────────────────────
+
+export interface VerifierDocState extends JsonObject {
+	/** `run.first` of the run the revision budget below belongs to. */
+	runFirst: number;
+	/** Revisions the verifier already requested in that run. */
+	revisions: number;
+	checked: number;
+	passed: number;
+	revised: number;
+	skipped: number;
+	/** The check itself failed (model error, budget, bad JSON) and the answer was let through. */
+	failedOpen: number;
+}
+
+export const VerifierDoc = defineDoc<VerifierDocState>({
+	kind: "app.verifier",
+	version: 1,
+	scope: "conversation",
+	history: "latest",
+	fork: "initial",
+	initial: () => ({ runFirst: 0, revisions: 0, checked: 0, passed: 0, revised: 0, skipped: 0, failedOpen: 0 }),
+	checkpointWhen: (_value, _ops, info) => info.deltasSinceBase >= 32,
+});

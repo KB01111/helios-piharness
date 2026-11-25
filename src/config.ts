@@ -69,6 +69,17 @@ export interface AppConfig {
 	// ── Self-improvement ──
 	/** IMPROVEMENTS_DIR: records + active.json of the gated prompt-improvement loop (default `$DATA_DIR/improvements`). */
 	readonly improvementsDir: string;
+	// ── Answer verifier ──
+	/** VERIFIER_ENABLED: review answers with the fast model before they stand (default: on with real models, off with mocks). */
+	readonly verifierEnabled: boolean;
+	/** VERIFIER_MAX_REVISIONS: times one run may be sent back for revision (default 1). */
+	readonly verifierMaxRevisions: number;
+	/** VERIFIER_MIN_ANSWER_CHARS: answers without tool use are only checked from this length (default 600). */
+	readonly verifierMinAnswerChars: number;
+	/** TRACE_EXPORT_PATH: append every settled Pi Durable span as one JSON line to this file (unset = off). */
+	readonly traceExportPath: string | undefined;
+	/** TRACE_EXPORT_MAX_BYTES: rotate the trace file (keeping one `.1`) at this size. Default 50 MiB. */
+	readonly traceExportMaxBytes: number;
 	/** EVALS_DIR: eval set root; cases live in `<dir>/cases/*.json`, the CI baseline in `<dir>/baseline.json` (default `./evals`). */
 	readonly evalsDir: string;
 }
@@ -175,6 +186,11 @@ export function loadConfig(env: Readonly<Record<string, string | undefined>> = p
 		codemodeMaxWorkers: parsePositiveInt(env.CODEMODE_MAX_WORKERS, 4),
 		codemodeInlineBudget: parseNonNegativeInt(env.CODEMODE_INLINE_BUDGET, 3_000),
 		improvementsDir: path.resolve(env.IMPROVEMENTS_DIR ?? path.join(dataDir, "improvements")),
+		verifierEnabled: parseBoolean(env.VERIFIER_ENABLED, !useMockModels),
+		verifierMaxRevisions: parseNonNegativeInt(env.VERIFIER_MAX_REVISIONS, 1),
+		verifierMinAnswerChars: parsePositiveInt(env.VERIFIER_MIN_ANSWER_CHARS, 600),
+		traceExportPath: env.TRACE_EXPORT_PATH?.trim() ? path.resolve(env.TRACE_EXPORT_PATH) : undefined,
+		traceExportMaxBytes: parsePositiveInt(env.TRACE_EXPORT_MAX_BYTES, 50 * 1024 * 1024),
 		evalsDir: path.resolve(env.EVALS_DIR ?? "./evals"),
 	};
 }

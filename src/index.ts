@@ -80,6 +80,8 @@ import { ImprovementError, ImprovementStore, type ImprovementRecord } from "./le
 import { FastModelProposer, StaticProposer } from "./learning/self-improve/llm-proposer.js";
 import { ImprovementService } from "./learning/self-improve/service.js";
 import { SelfImprover, type CandidateProposer, type ImprovementRunReport } from "./learning/self-improve/self-improver.js";
+import { createVerifierExtension } from "./extensions/verifier.ext.js";
+import { JsonlTraceExporter } from "./runtime/trace-export.js";
 import { createHeliosCodemode, type CodemodeHandle } from "./extensions/codemode.ext.js";
 import { createCorePromptExtension, DEFAULT_STATIC_SYSTEM_PROMPT } from "./extensions/core-prompt.ext.js";
 import { createGuardShapingExtension, DEFAULT_TOOL_PERMISSIONS } from "./extensions/guard-shaping.ext.js";
@@ -175,6 +177,7 @@ import {
 	type DomainStore,
 	type InMemoryDomainStoreHooks,
 } from "./tools/example-domain.tools.js";
+import { createPlanToolPack, PLAN_LIMITS, renderPlan, unfinishedSteps } from "./tools/plan.tools.js";
 import { createMemoryToolPack } from "./tools/memory.tools.js";
 import { createHttpServer } from "./transport/http-server.js";
 
@@ -189,6 +192,8 @@ export interface BootstrapHarnessOptions {
 	 * "model" react to its system prompt (also inherited by self-improvement probe harnesses).
 	 */
 	readonly mockMainHandler?: TestModelHandler;
+	/** Telemetry adapter for Pi Durable spans (e.g. OpenTelemetry). Overrides the `TRACE_EXPORT_PATH` JSONL exporter. */
+	readonly telemetry?: import("@earendil-works/pi-telemetry").TelemetryContext;
 	/** Apply operator-approved prompt addenda from `config.improvementsDir` on startup (default true). */
 	readonly applyActiveImprovements?: boolean;
 	readonly config?: Partial<AppConfig>;
@@ -249,6 +254,8 @@ export interface BootstrappedHarness {
 	readonly codemode?: CodemodeHandle;
 	/** Gated prompt self-improvement (propose/probe/compose, human approval). Undefined for isolated probe harnesses. */
 	readonly improvements?: ImprovementService;
+	/** JSONL span exporter when `TRACE_EXPORT_PATH` is set. */
+	readonly traceExporter?: JsonlTraceExporter;
 	close(): Promise<void>;
 }
 
@@ -389,6 +396,16 @@ export async function bootstrapHarness(options: BootstrapHarnessOptions = {}): P
 			})
 		: undefined;
 	if (codemode) registryManager.installCoreExtension(codemode.extension);
+	// The verifier gates every answer, so it is installed last: its onYield task runs after all other hooks.
+	if (config.verifierEnabled) {
+		registryManager.installCoreExtension(
+			createVerifierExtension({
+				fastModel: capabilities.fastModel,
+				maxRevisions: config.verifierMaxRevisions,
+				minAnswerCharsWithoutTools: config.verifierMinAnswerChars,
+			}),
+		);
+	}
 
 	// Register modular toggleable ToolPacks
 	const memoryPack = createMemoryToolPack(capabilities.memory);
@@ -398,9 +415,25 @@ export async function bootstrapHarness(options: BootstrapHarnessOptions = {}): P
 	registryManager.registerToolPack(memoryPack, { enabled: true });
 	registryManager.registerToolPack(artifactPack, { enabled: true });
 	registryManager.registerToolPack(domainBundle.pack, { enabled: true });
+	registryManager.registerToolPack(createPlanToolPack(), { enabled: true });
 
 	const wakeScheduler = options.wakeScheduler ?? new NodeWakeScheduler({ now });
 
+	const traceExporter =
+		!options.telemetry && config.traceExportPath
+			? new JsonlTraceExporter({
+					filePath: config.traceExportPath,
+					maxBytes: config.traceExportMaxBytes,
+					now,
+					onError: (error) =>
+						process.stderr.write(
+							`${JSON.stringify({ level: "warn", event: "trace_export_failed", message: error instanceof Error ? error.message : String(error) })}
+`,
+						),
+				})
+			: undefined;
+
+	const telemetryAdapter = options.telemetry ?? traceExporter;
 	let hostRuntime: HostRuntime;
 	try {
 		hostRuntime = await HostRuntime.open({
@@ -414,9 +447,11 @@ export async function bootstrapHarness(options: BootstrapHarnessOptions = {}): P
 			conversationCreated: createDefaultMaxTurnsInitializer(config.defaultMaxTurns),
 			wakeScheduler,
 			now,
+			...(telemetryAdapter ? { telemetry: telemetryAdapter } : {}),
 			autoResume: options.autoResume ?? true,
 		});
 	} catch (error) {
+		traceExporter?.close();
 		appDb.close();
 		throw error;
 	}
@@ -513,12 +548,14 @@ export async function bootstrapHarness(options: BootstrapHarnessOptions = {}): P
 		sleepCycleScheduler,
 		...(codemode ? { codemode } : {}),
 		...(improvements ? { improvements } : {}),
+		...(traceExporter ? { traceExporter } : {}),
 		close: async () => {
 			sleepCycleScheduler.dispose();
 			try {
 				await conversationSvc.close();
 			} finally {
 				await codemode?.close();
+				traceExporter?.close();
 			}
 		},
 	};
@@ -685,6 +722,11 @@ export {
 	// Defaults
 	DEFAULT_STATIC_SYSTEM_PROMPT,
 	DEFAULT_TOOL_PERMISSIONS,
+	// Planning
+	createPlanToolPack,
+	PLAN_LIMITS,
+	renderPlan,
+	unfinishedSteps,
 	// Evals & gated self-improvement
 	ReplayEvalRunner,
 	loadEvalSet,
