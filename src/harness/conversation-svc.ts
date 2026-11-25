@@ -1,7 +1,10 @@
 import { BACKGROUND_CONTEXT, withAbortSignal } from "@earendil-works/chord/context";
-import { contentText, type AssistantMessage } from "@earendil-works/pi-ai";
+import { contentText, type AssistantMessage, type Message } from "@earendil-works/pi-ai";
+import type { Models } from "@earendil-works/pi-ai/models";
+import { getCurrentSystemPrompt } from "@earendil-works/pi-ai/utils/transcript";
 import {
 	AssistantEntry,
+	ProviderDoc,
 	type Conversation,
 	type ConversationId,
 	type Cursor,
@@ -15,12 +18,14 @@ import {
 import type { AppCapabilities } from "../contracts/app-capabilities.js";
 import type {
 	ConversationInfo,
+	ConversationMode,
 	CreateConversationInput,
 	HarnessEvent,
 	HarnessPort,
 	ModelSpec,
 	PendingApproval,
 	SettledSubmission,
+	SideQuestionAnswer,
 	SignalDeliveryInput,
 	SignalDeliveryResult,
 	SubmissionHandle,
@@ -28,19 +33,30 @@ import type {
 	TaskSettlementView,
 	ToolPackSummary,
 	TranscriptEntryView,
+	UsageBucketView,
 	UsageSummaryView,
 	WatchConversationOptions,
 } from "../contracts/harness-port.js";
 import { NotFoundError, ValidationError } from "../contracts/errors.js";
-import { canAccessConversation, validateTenantContext, type TenantContext } from "../contracts/tenant-context.js";
+import {
+	ADMIN_PERMISSIONS,
+	canAccessConversation,
+	hasPermission,
+	validateTenantContext,
+	type TenantContext,
+} from "../contracts/tenant-context.js";
 import { createLogger, serializeError, type Logger } from "../logger.js";
 import { formatFrozenSkillsIndex, loadSkillCatalog } from "../extensions/skills-loader.ext.js";
 import type { SleepCycleCheckpoint, SleepCycleInput, SleepCycleResult } from "../extensions/sleep-cycle.ext.js";
+import type { McpRegistry, McpServerSummary } from "../mcp/mcp-client.js";
+import { usageCostUsd, usageTokens, type BudgetStore } from "../runtime/budget.js";
 import { clientSafeDetail, clientSafeReason } from "../runtime/client-safe.js";
 import type { HostRuntime } from "../runtime/host-runtime.js";
 import { entryToView, usageToView, watchConversationEvents } from "../runtime/stream-adapter.js";
+import type { PermissionAuditEntry, PermissionAuditStore } from "../security/permission-policy.js";
 import {
 	ConversationMetaDoc,
+	ConversationModeDoc,
 	type ConversationMetaState,
 	PendingApprovalsDoc,
 	deserializeTenantFromDoc,
@@ -69,6 +85,10 @@ export interface ConversationServiceOptions {
 	readonly registryManager: HarnessRegistryManager;
 	readonly capabilities: AppCapabilities;
 	readonly defaultModel: ModelSpec;
+	readonly models?: Models;
+	readonly budgetStore?: BudgetStore;
+	readonly mcpRegistry?: McpRegistry;
+	readonly permissionAuditStore?: PermissionAuditStore;
 	readonly sleepCycleTask: Task<SleepCycleInput, SleepCycleCheckpoint, SleepCycleResult, object>;
 	readonly signals?: ReadonlyArray<SignalToken<unknown>>;
 	readonly now?: () => number;
@@ -88,6 +108,10 @@ export class ConversationService implements HarnessPort {
 	private readonly registryManager: HarnessRegistryManager;
 	private readonly capabilities: AppCapabilities;
 	private readonly defaultModel: ModelSpec;
+	private readonly models?: Models;
+	private readonly budgetStore?: BudgetStore;
+	private readonly mcpRegistry?: McpRegistry;
+	private readonly permissionAuditStore?: PermissionAuditStore;
 	private readonly sleepCycleTask: Task<SleepCycleInput, SleepCycleCheckpoint, SleepCycleResult, object>;
 	private readonly signalMap = new Map<string, SignalToken<unknown>>();
 	private readonly now: () => number;
@@ -105,6 +129,10 @@ export class ConversationService implements HarnessPort {
 		this.registryManager = options.registryManager;
 		this.capabilities = options.capabilities;
 		this.defaultModel = options.defaultModel;
+		this.models = options.models;
+		this.budgetStore = options.budgetStore;
+		this.mcpRegistry = options.mcpRegistry;
+		this.permissionAuditStore = options.permissionAuditStore;
 		this.sleepCycleTask = options.sleepCycleTask;
 		this.now = options.now ?? (() => Date.now());
 		this.onClose = options.onClose;
@@ -138,6 +166,7 @@ export class ConversationService implements HarnessPort {
 			: this.registryManager.getEnabledPackNames();
 
 		const model = input.model ?? this.defaultModel;
+		const initialMode: ConversationMode = input.mode ?? "execute";
 
 		const conversation = await this.harness.createConversation(
 			{
@@ -156,6 +185,14 @@ export class ConversationService implements HarnessPort {
 					doc.frozenCoreMemoryAt = createdAt;
 					doc.frozenSkillsIndex = frozenSkillsIndex;
 					doc.enabledToolPacks = [...enabledToolPacks];
+					doc.subagentDepth = 0;
+					doc.parentConversationId = null;
+
+					if (initialMode !== "execute") {
+						const modeDoc = await tx.doc(ConversationModeDoc, conversationId);
+						modeDoc.mode = initialMode;
+						modeDoc.updatedAt = createdAt;
+					}
 				},
 			},
 			BACKGROUND_CONTEXT,
@@ -166,6 +203,7 @@ export class ConversationService implements HarnessPort {
 			tenant: input.tenant,
 			createdAt,
 			enabledToolPacks,
+			mode: initialMode,
 		};
 	}
 
@@ -180,6 +218,7 @@ export class ConversationService implements HarnessPort {
 		if (!conv) return undefined;
 		const meta = await this.harness.snapshot(ConversationMetaDoc, id, BACKGROUND_CONTEXT);
 		if (!meta) return undefined;
+		const modeDoc = await this.harness.snapshot(ConversationModeDoc, id, BACKGROUND_CONTEXT);
 
 		return {
 			conversationId: String(id),
@@ -187,6 +226,7 @@ export class ConversationService implements HarnessPort {
 			createdAt: meta.createdAt,
 			...(meta.forkedFrom ? { forkedFrom: { ...meta.forkedFrom } } : {}),
 			enabledToolPacks: [...meta.enabledToolPacks],
+			mode: modeDoc?.mode ?? "execute",
 		};
 	}
 
@@ -427,12 +467,34 @@ export class ConversationService implements HarnessPort {
 			return tenantId === undefined || meta.tenant.tenantId === tenantId;
 		};
 
+		const mergeWithGateApprovals = (
+			base: PendingApproval[],
+			gateFilter: { readonly conversationId?: string; readonly tenantId?: string; readonly userId?: string },
+		): PendingApproval[] => {
+			if (!this.permissionAuditStore) {
+				base.sort((a, b) => a.createdAt - b.createdAt);
+				return base.slice(0, limit);
+			}
+			const seen = new Set(base.map((item) => item.taskId));
+			const gateItems = this.permissionAuditStore.listPendingGateApprovals({ ...gateFilter, limit });
+			for (const item of gateItems) {
+				if (!seen.has(item.taskId)) {
+					seen.add(item.taskId);
+					base.push(item);
+				}
+			}
+			base.sort((a, b) => a.createdAt - b.createdAt);
+			return base.slice(0, limit);
+		};
+
+		const callerIsTenantAdmin = caller !== undefined && hasPermission(caller, ADMIN_PERMISSIONS.conversations);
+
 		if (conversationId !== undefined) {
 			if (caller) await this.assertConversationOwner(caller, conversationId);
 			else if (tenantId !== undefined) await this.assertTenantOwnsConversation(tenantId, conversationId);
 			const id = parseId<ConversationId>(conversationId, "conversationId");
 			const doc = await this.harness.snapshot(PendingApprovalsDoc, id, BACKGROUND_CONTEXT);
-			return listApprovalsFromDoc(doc).slice(0, limit);
+			return mergeWithGateApprovals(listApprovalsFromDoc(doc), { conversationId });
 		}
 
 		const results: PendingApproval[] = [];
@@ -449,8 +511,10 @@ export class ConversationService implements HarnessPort {
 				results.push(...listApprovalsFromDoc(doc));
 				if (results.length >= limit) break;
 			}
-			results.sort((a, b) => a.createdAt - b.createdAt);
-			return results.slice(0, limit);
+			return mergeWithGateApprovals(results, {
+				tenantId,
+				...(caller && !callerIsTenantAdmin ? { userId: caller.userId } : {}),
+			});
 		}
 
 		// Trusted embedders with no tenant filter: scan everything.
@@ -468,8 +532,7 @@ export class ConversationService implements HarnessPort {
 			}
 			cursor = page.next;
 		} while (cursor !== undefined);
-		results.sort((a, b) => a.createdAt - b.createdAt);
-		return results.slice(0, limit);
+		return mergeWithGateApprovals(results, {});
 	}
 
 	/**
@@ -640,6 +703,129 @@ export class ConversationService implements HarnessPort {
 
 	listToolPacks(): readonly ToolPackSummary[] {
 		return this.registryManager.listToolPacks();
+	}
+
+	async setConversationMode(
+		conversationId: string,
+		mode: ConversationMode,
+	): Promise<{ readonly conversationId: string; readonly mode: ConversationMode }> {
+		if (mode !== "execute" && mode !== "plan") {
+			throw new ValidationError(`Invalid conversation mode "${String(mode)}"`);
+		}
+		const conv = await this.requireConversation(conversationId);
+		const updatedAt = this.now();
+		await conv.commit(async (tx) => {
+			const doc = await tx.doc(ConversationModeDoc, conv.id);
+			doc.mode = mode;
+			doc.updatedAt = updatedAt;
+		}, BACKGROUND_CONTEXT);
+		return { conversationId, mode };
+	}
+
+	async getConversationMode(conversationId: string): Promise<ConversationMode> {
+		const conv = await this.requireConversation(conversationId);
+		const doc = await this.harness.snapshot(ConversationModeDoc, conv.id, BACKGROUND_CONTEXT);
+		return doc?.mode ?? "execute";
+	}
+
+	/**
+	 * Cached ephemeral `/btw` side question:
+	 * Reads the conversation's committed ContextView + ProviderDoc.sessionId and issues a
+	 * single tool-free completion reusing the exact leading system prompt prefix without
+	 * writing anything to the durable conversation transcript.
+	 */
+	async askSideQuestion(
+		conversationId: string,
+		question: string,
+		signal?: AbortSignal,
+	): Promise<SideQuestionAnswer> {
+		const trimmed = question.trim();
+		if (!trimmed) {
+			throw new ValidationError("Side question must be a non-empty string");
+		}
+		if (!this.models) {
+			throw new Error("Side questions require model catalog access on ConversationService");
+		}
+
+		const ctx = signal ? withAbortSignal(signal, BACKGROUND_CONTEXT) : BACKGROUND_CONTEXT;
+		const conv = await this.requireConversation(conversationId);
+		const [view, agent, providerDoc, meta] = await Promise.all([
+			conv.context(ctx),
+			conv.agent(ctx),
+			this.harness.snapshot(ProviderDoc, conv.id, ctx),
+			this.harness.snapshot(ConversationMetaDoc, conv.id, ctx),
+		]);
+
+		const modelRef = agent.model ?? this.defaultModel;
+		const model = this.models.getModel(modelRef.provider, modelRef.modelId);
+		if (!model) {
+			throw new Error(`Model "${modelRef.provider}:${modelRef.modelId}" is not registered`);
+		}
+
+		const systemPrompt = getCurrentSystemPrompt(view.messages as Message[]);
+		const historyMessages = view.messages.filter((m) => m.role !== "system");
+		const sidePrompt = [
+			"[Ephemeral /btw side question — answer concisely from the conversation context above without calling any tools or modifying state.]",
+			trimmed,
+		].join("\n\n");
+
+		const sessionId = providerDoc?.sessionId;
+		const response = await this.models.completeSimple(
+			model,
+			{
+				...(systemPrompt ? { systemPrompt } : {}),
+				messages: [...historyMessages, { role: "user", content: sidePrompt, timestamp: this.now() }],
+			},
+			{
+				...(signal ? { signal } : {}),
+				...(sessionId ? { sessionId } : {}),
+			},
+		);
+
+		if (response.stopReason === "error") {
+			throw new Error(response.errorMessage ?? "Side question model call failed");
+		}
+
+		let usageView: UsageBucketView | undefined;
+		if (response.usage) {
+			const tokens = usageTokens(response.usage);
+			const cost = usageCostUsd(response.usage);
+			if (this.budgetStore && (tokens > 0 || cost > 0)) {
+				try {
+					this.budgetStore.recordUsage(meta?.tenant.tenantId ?? "default", tokens, cost, this.now());
+				} catch {
+					// metering must never break a completed side answer
+				}
+			}
+			const denom = (response.usage.input ?? 0) + (response.usage.cacheRead ?? 0);
+			usageView = {
+				input: response.usage.input ?? 0,
+				output: response.usage.output ?? 0,
+				cacheRead: response.usage.cacheRead ?? 0,
+				cacheWrite: response.usage.cacheWrite ?? 0,
+				totalTokens: response.usage.totalTokens ?? tokens,
+				totalCost: cost,
+				cacheHitRatio: denom > 0 ? Number(((response.usage.cacheRead ?? 0) / denom).toFixed(4)) : 0,
+			};
+		}
+
+		return {
+			conversationId,
+			answerText: contentText(response.content).trim(),
+			reusedCachePrefix: Boolean(sessionId),
+			...(usageView ? { usage: usageView } : {}),
+		};
+	}
+
+	listMcpServers(): readonly McpServerSummary[] {
+		return this.mcpRegistry ? this.mcpRegistry.listServers() : [];
+	}
+
+	listPermissionAudit(
+		tenantId: string,
+		options?: { readonly conversationId?: string; readonly limit?: number },
+	): readonly PermissionAuditEntry[] {
+		return this.permissionAuditStore ? this.permissionAuditStore.listAudit(tenantId, options) : [];
 	}
 
 	async getTranscript(conversationId: string): Promise<readonly TranscriptEntryView[]> {

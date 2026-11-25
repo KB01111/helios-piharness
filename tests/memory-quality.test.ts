@@ -709,6 +709,8 @@ describe("C. Retrieval quality", () => {
 				 DROP TABLE memory_relations;
 				 DROP TABLE memory_temporal_anchors;
 				 DROP TABLE midterm_episodes_fts;
+				 DROP TABLE permission_audit_log;
+				 DROP TABLE pending_tool_gate_approvals;
 				 DELETE FROM app_migrations WHERE version >= 2;`,
 			);
 			raw.close();
@@ -716,7 +718,7 @@ describe("C. Retrieval quality", () => {
 			const upgraded = AppDatabase.open({ dbPath });
 			try {
 				const versions = (upgraded.db.prepare("SELECT version FROM app_migrations ORDER BY version").all() as Array<{ version: number }>).map((r) => r.version);
-				expect(versions).toEqual([1, 2, 3]);
+				expect(versions).toEqual([1, 2, 3, 4]);
 				const svc = new SqliteMemoryService(upgraded);
 				expect((await svc.search(T, U, "migration"))[0]?.memory.key).toBe("user.keep");
 			} finally {

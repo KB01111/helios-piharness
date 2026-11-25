@@ -100,15 +100,21 @@ export class HarnessRegistryManager {
 		return true;
 	}
 
-	registerToolPack(pack: ToolPackDefinition, options?: { readonly enabled?: boolean }): void {
+	registerToolPack(
+		pack: ToolPackDefinition,
+		options?: { readonly enabled?: boolean; readonly deferred?: boolean },
+	): void {
 		const enabled = options?.enabled ?? true;
+		const tools: readonly ToolRegistration[] = options?.deferred
+			? pack.tools.map((tool) => (tool.deferred ? tool : { ...tool, deferred: true as const }))
+			: pack.tools;
 		const extension = defineExtension({
 			name: `toolpack:${pack.name}`,
 			namespace: {
 				name: pack.name,
 				description: pack.description,
 			},
-			tools: pack.tools,
+			tools,
 		});
 
 		const existing = this.toolPacks.get(pack.name);
@@ -117,7 +123,7 @@ export class HarnessRegistryManager {
 		}
 
 		this.toolPacks.set(pack.name, {
-			definition: pack,
+			definition: { ...pack, tools },
 			extension,
 			enabled,
 		});

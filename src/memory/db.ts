@@ -285,6 +285,46 @@ const MIGRATIONS: readonly Migration[] = [
 			`);
 		},
 	},
+	{
+		version: 4,
+		name: "permission_audit_and_tool_gate_approvals",
+		sql: `
+			CREATE TABLE IF NOT EXISTS permission_audit_log (
+				id INTEGER PRIMARY KEY AUTOINCREMENT,
+				tenant_id TEXT NOT NULL,
+				user_id TEXT NOT NULL,
+				conversation_id TEXT NOT NULL,
+				task_id TEXT NOT NULL,
+				call_id TEXT NOT NULL,
+				tool_name TEXT NOT NULL,
+				tier TEXT NOT NULL,
+				decision TEXT NOT NULL,
+				reason TEXT,
+				reviewer TEXT,
+				created_at INTEGER NOT NULL
+			);
+
+			CREATE INDEX IF NOT EXISTS idx_permission_audit_tenant
+				ON permission_audit_log (tenant_id, conversation_id, id DESC);
+
+			CREATE TABLE IF NOT EXISTS pending_tool_gate_approvals (
+				task_id TEXT PRIMARY KEY,
+				tenant_id TEXT NOT NULL,
+				user_id TEXT NOT NULL,
+				conversation_id TEXT NOT NULL,
+				call_id TEXT NOT NULL,
+				tool_name TEXT NOT NULL,
+				action TEXT NOT NULL,
+				summary TEXT NOT NULL,
+				signal_name TEXT NOT NULL,
+				signal_key TEXT NOT NULL,
+				created_at INTEGER NOT NULL
+			);
+
+			CREATE INDEX IF NOT EXISTS idx_pending_tool_gate_scope
+				ON pending_tool_gate_approvals (tenant_id, user_id, conversation_id, created_at);
+		`,
+	},
 ];
 
 /**

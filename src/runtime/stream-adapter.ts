@@ -80,6 +80,8 @@ export function usageToView(usage: UsageState | undefined): UsageSummaryView {
 		const out: Record<string, UsageBucketView> = {};
 		if (!raw) return out;
 		for (const [key, u] of Object.entries(raw)) {
+			const denom = u.input + u.cacheRead;
+			const cacheHitRatio = denom > 0 ? Number((u.cacheRead / denom).toFixed(4)) : 0;
 			out[key] = {
 				input: u.input,
 				output: u.output,
@@ -87,6 +89,7 @@ export function usageToView(usage: UsageState | undefined): UsageSummaryView {
 				cacheWrite: u.cacheWrite,
 				totalTokens: u.totalTokens,
 				totalCost: u.cost?.total ?? 0,
+				cacheHitRatio,
 			};
 		}
 		return out;
