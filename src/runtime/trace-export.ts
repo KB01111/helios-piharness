@@ -93,7 +93,13 @@ export class JsonlTraceExporter implements TelemetryContext {
 	}
 
 	private rotate(): void {
-		if (this.fd !== undefined) fs.closeSync(this.fd);
+		if (this.fd !== undefined) {
+			const closing = this.fd;
+			// Forget the descriptor first: if the reopen below fails, a stale number the OS may have reused for an
+			// unrelated file must never be written to or closed again.
+			this.fd = undefined;
+			fs.closeSync(closing);
+		}
 		try {
 			fs.renameSync(this.options.filePath, `${this.options.filePath}.1`);
 		} catch {

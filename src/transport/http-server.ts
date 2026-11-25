@@ -202,6 +202,10 @@ export function createHttpServer(harness: HarnessPort, options: HttpServerOption
 		const requestId = incoming && REQUEST_ID_PATTERN.test(incoming) ? incoming : randomUUID();
 		c.set("requestId", requestId);
 		c.header("x-request-id", requestId);
+		// This is a JSON/SSE API: never sniffed, cached by shared caches, or leaking referrers.
+		c.header("x-content-type-options", "nosniff");
+		c.header("cache-control", "no-store");
+		c.header("referrer-policy", "no-referrer");
 		await next();
 	});
 
@@ -496,7 +500,12 @@ export function createHttpServer(harness: HarnessPort, options: HttpServerOption
 		const signalName = requiredString(body, "signalName", { maxLength: 200 });
 		const key = requiredString(body, "key", { maxLength: 500 });
 		await harness.assertTaskOwner(c.get("tenant"), taskId);
-		const result = await harness.deliverSignal({ taskId, signalName, key, payload: body.payload ?? null });
+		// The approver recorded in the audit trail is the authenticated caller, never a client-supplied name.
+		const payload =
+			typeof body.payload === "object" && body.payload !== null && !Array.isArray(body.payload)
+				? { ...(body.payload as JsonRecord), reviewer: c.get("tenant").userId }
+				: (body.payload ?? null);
+		const result = await harness.deliverSignal({ taskId, signalName, key, payload });
 		return c.json(result);
 	});
 
@@ -525,7 +534,14 @@ export function createHttpServer(harness: HarnessPort, options: HttpServerOption
 	});
 
 	app.get("/mcp/servers", (c) => {
-		return c.json({ servers: harness.listMcpServers() });
+		// Upstream error text is operator-level diagnostics; ordinary callers only see connection state.
+		const detailed = hasPermission(c.get("tenant"), ADMIN_PERMISSIONS.usage);
+		const servers = harness.listMcpServers().map((server) => {
+			if (detailed) return server;
+			const { lastError: _omitted, ...rest } = server;
+			return rest;
+		});
+		return c.json({ servers });
 	});
 
 	app.get("/audit/permissions", (c) => {

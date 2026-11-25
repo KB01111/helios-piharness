@@ -718,7 +718,7 @@ describe("C. Retrieval quality", () => {
 			const upgraded = AppDatabase.open({ dbPath });
 			try {
 				const versions = (upgraded.db.prepare("SELECT version FROM app_migrations ORDER BY version").all() as Array<{ version: number }>).map((r) => r.version);
-				expect(versions).toEqual([1, 2, 3, 4]);
+				expect(versions).toEqual([1, 2, 3, 4, 5]);
 				const svc = new SqliteMemoryService(upgraded);
 				expect((await svc.search(T, U, "migration"))[0]?.memory.key).toBe("user.keep");
 			} finally {

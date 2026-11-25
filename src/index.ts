@@ -83,6 +83,8 @@ import { FastModelProposer, StaticProposer } from "./learning/self-improve/llm-p
 import { ImprovementService } from "./learning/self-improve/service.js";
 import { SelfImprover, type CandidateProposer, type ImprovementRunReport } from "./learning/self-improve/self-improver.js";
 import { createVerifierExtension } from "./extensions/verifier.ext.js";
+import { createLogger, serializeError } from "./logger.js";
+import { RetentionService, type RetentionServiceOptions } from "./runtime/retention.js";
 import { createContextPrunerExtension, pruneMessagesForContext, type PruneContextResult } from "./extensions/context-pruner.ext.js";
 import {
 	createMcpAdapterExtension,
@@ -316,6 +318,8 @@ export interface BootstrapHarnessOptions {
 	readonly sleepCycleScheduler?:
 		| false
 		| Partial<Omit<SleepCycleSchedulerOptions, "harness" | "memory" | "appDb">>;
+	/** Data-retention sweeper overrides. `false` disables it. Defaults come from the `RETENTION_*` config. */
+	readonly retention?: false | Partial<Omit<RetentionServiceOptions, "appDb">>;
 	/** Three-tier tool permission policy (`allow` | `ask` | `deny`) merged ahead of env config. */
 	readonly permissionPolicy?: PermissionPolicyConfig;
 	/** Security extras: additional secret redaction patterns and extra read-only tools permitted in Plan Mode. */
@@ -348,6 +352,8 @@ export interface BootstrappedHarness {
 	readonly circuitBreakers: ProviderCircuitBreakers;
 	/** Periodic sleep-cycle scheduler (inactive when disabled via config or `sleepCycleScheduler: false`). */
 	readonly sleepCycleScheduler: SleepCycleScheduler;
+	/** Retention sweeper for append-only operational tables (undefined when disabled). */
+	readonly retention?: RetentionService;
 	/** Codemode sandbox handle; undefined when `CODEMODE_ENABLED=false`. */
 	readonly codemode?: CodemodeHandle;
 	/** Gated prompt self-improvement (propose/probe/compose, human approval). Undefined for isolated probe harnesses. */
@@ -652,6 +658,32 @@ export async function bootstrapHarness(options: BootstrapHarnessOptions = {}): P
 	});
 	sleepCycleScheduler.start();
 
+	let retention: RetentionService | undefined;
+	if (config.retentionEnabled && options.retention !== false && config.appDbPath !== ":memory:") {
+		const retentionLogger = createLogger({ base: { component: "retention" } });
+		retention = new RetentionService({
+			appDb,
+			now,
+			intervalMs: config.retentionIntervalMs,
+			policy: {
+				permissionAuditDays: config.retentionPermissionAuditDays,
+				toolInvocationDays: config.retentionToolInvocationDays,
+				runTelemetryDays: config.retentionRunTelemetryDays,
+				budgetEventDays: config.retentionBudgetEventDays,
+				budgetDailyDays: config.retentionBudgetDailyDays,
+				artifactDays: config.retentionArtifactDays,
+			},
+			onReport: (report) => {
+				if (report.totalDeleted > 0 || report.errors.length > 0) {
+					retentionLogger.info("retention_sweep", { deleted: report.deleted, errors: report.errors });
+				}
+			},
+			onError: (error) => retentionLogger.warn("retention_error", { error: serializeError(error) }),
+			...(options.retention ? options.retention : {}),
+		});
+		retention.start();
+	}
+
 	let improvements: ImprovementService | undefined;
 	if (options.improvements !== false) {
 		const improvementOptions = options.improvements ?? {};
@@ -668,6 +700,7 @@ export async function bootstrapHarness(options: BootstrapHarnessOptions = {}): P
 				applyActiveImprovements: false,
 				staticSystemPrompt: systemPrompt,
 				sleepCycleScheduler: false,
+				retention: false,
 				autoResume: false,
 				wakeScheduler: undefined,
 				capabilities: { skillsDir: capabilities.skillsDir, maxToolOutputBytes: capabilities.maxToolOutputBytes },
@@ -718,6 +751,7 @@ export async function bootstrapHarness(options: BootstrapHarnessOptions = {}): P
 		budgetLimits,
 		circuitBreakers: catalog.circuitBreakers,
 		sleepCycleScheduler,
+		...(retention ? { retention } : {}),
 		...(codemode ? { codemode } : {}),
 		...(improvements ? { improvements } : {}),
 		...(traceExporter ? { traceExporter } : {}),
@@ -725,6 +759,14 @@ export async function bootstrapHarness(options: BootstrapHarnessOptions = {}): P
 		mcpRegistry,
 		close: async () => {
 			sleepCycleScheduler.dispose();
+			// In-flight sleep cycles must settle before the app database closes underneath their marker writes.
+			await Promise.race([
+				sleepCycleScheduler.idle().catch(() => undefined),
+				new Promise<void>((resolve) => setTimeout(resolve, 5_000).unref()),
+			]);
+			retention?.dispose();
+			// An in-flight sweep must finish before the app database is closed underneath it.
+			await retention?.idle();
 			try {
 				await conversationSvc.close();
 			} finally {
@@ -746,6 +788,14 @@ export {
 	type LivenessReport,
 	type ReadinessReport,
 } from "./health.js";
+export {
+	DEFAULT_RETENTION_INTERVAL_MS,
+	DEFAULT_RETENTION_POLICY,
+	RetentionService,
+	type RetentionPolicy,
+	type RetentionReport,
+	type RetentionServiceOptions,
+} from "./runtime/retention.js";
 export { createLogger, resolveLogLevel, type LogLevel, type LogFields, type Logger, type LoggerOptions } from "./logger.js";
 
 // Budgets & model resilience

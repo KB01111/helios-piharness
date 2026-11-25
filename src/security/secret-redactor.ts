@@ -75,6 +75,26 @@ export const DEFAULT_SECRET_PATTERNS: readonly SecretPattern[] = [
 		replacement: "[REDACTED:stripe_key]",
 	},
 	{
+		category: "gitlab_token",
+		pattern: /\bglpat-[A-Za-z0-9_-]{20,100}\b/g,
+		replacement: "[REDACTED:gitlab_token]",
+	},
+	{
+		category: "npm_token",
+		pattern: /\bnpm_[A-Za-z0-9]{36}\b/g,
+		replacement: "[REDACTED:npm_token]",
+	},
+	{
+		category: "google_oauth_token",
+		pattern: /\bya29\.[0-9A-Za-z_-]{20,512}/g,
+		replacement: "[REDACTED:google_oauth_token]",
+	},
+	{
+		category: "sendgrid_key",
+		pattern: /\bSG\.[A-Za-z0-9_-]{16,64}\.[A-Za-z0-9_-]{16,64}\b/g,
+		replacement: "[REDACTED:sendgrid_key]",
+	},
+	{
 		category: "jwt",
 		pattern: /\beyJ[A-Za-z0-9_-]{10,512}\.[A-Za-z0-9_-]{10,1024}\.[A-Za-z0-9_-]{10,512}\b/g,
 		replacement: "[REDACTED:jwt]",
@@ -92,8 +112,9 @@ export const DEFAULT_SECRET_PATTERNS: readonly SecretPattern[] = [
 	{
 		category: "secret_assignment",
 		pattern:
-			/\b(api[_-]?key|access[_-]?token|auth[_-]?token|secret[_-]?key|client[_-]?secret|private[_-]?token|password|passwd)\s*([:=])\s*(["']?)([^\s"'`,;}{]{8,128})\3/gi,
-		replacement: "$1$2$3[REDACTED:secret_assignment]$3",
+			// The key may itself be quoted (JSON: `"password": "..."`), hence the optional quote before the separator.
+			/\b(api[_-]?key|access[_-]?token|auth[_-]?token|secret[_-]?key|client[_-]?secret|private[_-]?token|refresh[_-]?token|token|secret|password|passwd)(["']?)\s*([:=])\s*(["']?)([^\s"'`,;}{]{8,512})\4/gi,
+		replacement: "$1$2$3$4[REDACTED:secret_assignment]$4",
 	},
 ];
 

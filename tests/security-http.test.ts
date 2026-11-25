@@ -139,6 +139,8 @@ describe("Security + HTTP hardening", () => {
 				["POST", `/conversations/${id}/reset`, {}],
 				["POST", `/conversations/${id}/compact`, {}],
 				["POST", `/conversations/${id}/sleep-cycle`, {}],
+				["POST", `/conversations/${id}/mode`, { mode: "plan" }],
+				["POST", `/conversations/${id}/btw`, { question: "hi" }],
 				["GET", `/approvals?conversationId=${id}`],
 			];
 			for (const [method, url, body] of routes) {

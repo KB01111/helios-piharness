@@ -1474,8 +1474,25 @@ export class SqliteMemoryService implements MemoryService {
 				"DELETE FROM memory_temporal_anchors WHERE memory_id = ? AND tenant_id = ? AND user_id = ?",
 			);
 
+			// The raw episodes that evidenced a forgotten memory still hold the verbatim user message and tool arguments.
+			// Scrub their text (keeping the row so the evidence ledger and capture idempotency stay intact) and mark
+			// them consolidated so a later sweep cannot re-derive the memory from them.
+			const scrubEpisodes = this.stmt(
+				`UPDATE midterm_episodes
+				 SET user_message = '', assistant_summary = '', tool_trace_json = '[]', friction_signals_json = '[]',
+				     consolidated = 1
+				 WHERE tenant_id = ? AND user_id = ?
+				   AND id IN (SELECT episode_id FROM memory_evidence WHERE memory_id = ?)`,
+			);
+			const dropEpisodeFts = this.stmt(
+				`DELETE FROM midterm_episodes_fts
+				 WHERE episode_id IN (SELECT episode_id FROM memory_evidence WHERE memory_id = ?)`,
+			);
+
 			for (const id of purgeIds) {
 				if (id !== memoryId) blank.run(ts, ts, id, tenantId, userId);
+				scrubEpisodes.run(tenantId, userId, id);
+				dropEpisodeFts.run(id);
 				dropFts.run(id);
 				dropEmbedding.run(id, tenantId, userId);
 				dropEntityLinks.run(id, tenantId, userId);

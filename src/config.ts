@@ -1,5 +1,6 @@
 import path from "node:path";
 import type { ModelSpec } from "./contracts/harness-port.js";
+import { DEFAULT_RETENTION_INTERVAL_MS, DEFAULT_RETENTION_POLICY } from "./runtime/retention.js";
 import { parseMcpServersEnv, type McpServerConfig } from "./mcp/mcp-client.js";
 
 export interface AppConfig {
@@ -125,6 +126,23 @@ export interface AppConfig {
 	readonly contextPruneKeepRecentTools: number;
 	/** STRUCTURED_COMPACTION_ENABLED: preserve active PlanDoc, mode, approvals & artifact IDs during compaction (default true). */
 	readonly structuredCompactionEnabled: boolean;
+	// ── Data retention (0 = keep forever) ──
+	/** RETENTION_ENABLED: periodically prune append-only operational tables (default true). */
+	readonly retentionEnabled: boolean;
+	/** RETENTION_INTERVAL_MS: sweep interval (default 6h; 0 = sweep once at startup only). */
+	readonly retentionIntervalMs: number;
+	/** RETENTION_PERMISSION_AUDIT_DAYS (default 365). */
+	readonly retentionPermissionAuditDays: number;
+	/** RETENTION_TOOL_INVOCATION_DAYS (default 90). */
+	readonly retentionToolInvocationDays: number;
+	/** RETENTION_RUN_TELEMETRY_DAYS (default 90). */
+	readonly retentionRunTelemetryDays: number;
+	/** RETENTION_BUDGET_EVENT_DAYS (default 30). */
+	readonly retentionBudgetEventDays: number;
+	/** RETENTION_BUDGET_DAILY_DAYS: per-tenant daily spend ledger history (default 400). */
+	readonly retentionBudgetDailyDays: number;
+	/** RETENTION_ARTIFACT_DAYS: offloaded tool-output artifacts incl. files; opt-in because transcripts hold recall handles (default 0). */
+	readonly retentionArtifactDays: number;
 }
 
 export function parseModelSpec(raw: string, fallback: ModelSpec): ModelSpec {
@@ -256,6 +274,14 @@ export function loadConfig(env: Readonly<Record<string, string | undefined>> = p
 		contextPruneThresholdChars: parsePositiveInt(env.CONTEXT_PRUNE_THRESHOLD_CHARS, 32_000),
 		contextPruneKeepRecentTools: parsePositiveInt(env.CONTEXT_PRUNE_KEEP_RECENT_TOOLS, 6),
 		structuredCompactionEnabled: parseBoolean(env.STRUCTURED_COMPACTION_ENABLED, true),
+		retentionEnabled: parseBoolean(env.RETENTION_ENABLED, true),
+		retentionIntervalMs: parseNonNegativeInt(env.RETENTION_INTERVAL_MS, DEFAULT_RETENTION_INTERVAL_MS),
+		retentionPermissionAuditDays: parseNonNegativeInt(env.RETENTION_PERMISSION_AUDIT_DAYS, DEFAULT_RETENTION_POLICY.permissionAuditDays),
+		retentionToolInvocationDays: parseNonNegativeInt(env.RETENTION_TOOL_INVOCATION_DAYS, DEFAULT_RETENTION_POLICY.toolInvocationDays),
+		retentionRunTelemetryDays: parseNonNegativeInt(env.RETENTION_RUN_TELEMETRY_DAYS, DEFAULT_RETENTION_POLICY.runTelemetryDays),
+		retentionBudgetEventDays: parseNonNegativeInt(env.RETENTION_BUDGET_EVENT_DAYS, DEFAULT_RETENTION_POLICY.budgetEventDays),
+		retentionBudgetDailyDays: parseNonNegativeInt(env.RETENTION_BUDGET_DAILY_DAYS, DEFAULT_RETENTION_POLICY.budgetDailyDays),
+		retentionArtifactDays: parseNonNegativeInt(env.RETENTION_ARTIFACT_DAYS, DEFAULT_RETENTION_POLICY.artifactDays),
 	};
 }
 

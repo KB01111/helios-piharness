@@ -325,6 +325,20 @@ const MIGRATIONS: readonly Migration[] = [
 				ON pending_tool_gate_approvals (tenant_id, user_id, conversation_id, created_at);
 		`,
 	},
+	{
+		version: 5,
+		name: "retention_time_indexes",
+		// Age-based retention deletes filter on created_at alone, which the tenant-scoped indexes cannot serve.
+		sql: `
+			CREATE INDEX IF NOT EXISTS idx_permission_audit_created ON permission_audit_log (created_at);
+			CREATE INDEX IF NOT EXISTS idx_tool_invocations_created ON tool_invocations (created_at);
+			CREATE INDEX IF NOT EXISTS idx_run_telemetry_created ON run_telemetry (created_at);
+			CREATE INDEX IF NOT EXISTS idx_artifacts_created ON artifacts (created_at);
+			-- Supersede-chain walks (forget, predecessor lookup) and the per-sweep "who has unconsolidated episodes" scan.
+			CREATE INDEX IF NOT EXISTS idx_longterm_superseded_by ON longterm_memories (superseded_by_id);
+			CREATE INDEX IF NOT EXISTS idx_midterm_unconsolidated ON midterm_episodes (consolidated, tenant_id, user_id);
+		`,
+	},
 ];
 
 /**

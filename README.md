@@ -87,6 +87,60 @@ All settings are read from environment variables (see `.env.example`). Unknown o
 | `SLEEP_CYCLE_CRON_INTERVAL_MS` | `300000` | Periodic sleep-cycle sweep; `0` disables |
 | `SLEEP_CYCLE_SCHEDULER_ENABLED` | `true` | Toggle the sleep-cycle scheduler |
 
+### Permissions, Subagents, MCP & Context
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `SECRET_REDACTION_ENABLED` | `true` | Redact credential-shaped values in tool output before artifacts and model context. Approval summaries and the audit log are always redacted |
+| `TOOL_APPROVAL_REQUIRED` | _(empty)_ | Comma-separated tool names or globs (`domain_mutate_record,mcp_prod__*`) that need durable human approval |
+| `TOOL_DENIED` | _(empty)_ | Comma-separated tool names or globs blocked unconditionally |
+| `TOOL_APPROVAL_TIMEOUT_MS` | `86400000` | How long an `ask`-tier call stays parked before it expires as blocked |
+| `SUBAGENTS_ENABLED` | `true` | Register `subagent_delegate`, `subagent_parallel` and `advisor_consult` |
+| `SUBAGENT_MAX_DEPTH` / `SUBAGENT_MAX_TURNS` / `SUBAGENT_MAX_PARALLEL` / `SUBAGENT_TIMEOUT_MS` | `2` / `8` / `4` / `120000` | Nesting depth, tool rounds per child, children per `subagent_parallel` call, deadline per delegation |
+| `SUBAGENT_READONLY_MODEL` / `ADVISOR_MODEL` | _(main / fast model)_ | Optional model overrides for read-only subagents and `advisor_consult` |
+| `TOOL_SEARCH_ENABLED` | `true` | BM25 `tool_search` over `deferred: true` tools |
+| `MCP_SERVERS` | _(empty)_ | JSON array `[{ "name", "url", "headers"?, "readOnly"?, "timeoutMs"? }]`. Servers connect lazily; responses are capped at 4 MiB and redirects are refused |
+| `CONTEXT_PRUNE_ENABLED` / `CONTEXT_PRUNE_THRESHOLD_CHARS` / `CONTEXT_PRUNE_KEEP_RECENT_TOOLS` | `true` / `32000` / `6` | KV-cache-safe pruning of stale tool output |
+| `STRUCTURED_COMPACTION_ENABLED` | `true` | Keep plan, mode, approvals and artifact handles through compaction |
+| `MODEL_PROVIDER_MAX_RETRIES` | _(SDK default)_ | In-request SDK retries inside one model call (separate from the durable `MODEL_MAX_RETRIES`) |
+| `EVAL_CASE_TIMEOUT_MS` / `EVAL_ONLY` | _(unset)_ | Bound a live eval run / run only the listed case ids |
+
+### Data retention
+
+Append-only operational tables would otherwise grow forever. A sweeper (`src/runtime/retention.ts`) runs at startup and then every `RETENTION_INTERVAL_MS`, deleting in bounded batches so write locks stay short. A window of `0` keeps that data forever. Long-term memory, episodes, skills and the Pi Durable transcript are never touched by it.
+
+| Variable | Default | Prunes |
+| --- | --- | --- |
+| `RETENTION_ENABLED` | `true` | Master switch (never runs against `:memory:` databases) |
+| `RETENTION_INTERVAL_MS` | `21600000` | Sweep interval; `0` sweeps once at startup only |
+| `RETENTION_PERMISSION_AUDIT_DAYS` | `365` | `permission_audit_log` |
+| `RETENTION_TOOL_INVOCATION_DAYS` | `90` | `tool_invocations` (Skill Dojo metrics; keep this above `STALE_SKILL_DAYS`) |
+| `RETENTION_RUN_TELEMETRY_DAYS` | `90` | `run_telemetry` (Skill Forge input) |
+| `RETENTION_BUDGET_EVENT_DAYS` | `30` | `budget_events` |
+| `RETENTION_BUDGET_DAILY_DAYS` | `400` | `budget_tenant_daily` history (the current day, which enforces limits, is always kept) |
+| `RETENTION_ARTIFACT_DAYS` | `0` | Offloaded tool-output artifacts and their files. Opt-in: transcripts hold `art_*` recall handles that would dangle |
+
+Forgetting a memory (`forgetMemory`) also scrubs the raw episodes that evidenced it (verbatim user message, summary and tool arguments), not just the memory row.
+
+### HTTP API
+
+Every route except `/health` and `/ready` needs a bearer token. Other tenants' resources answer 404. Responses carry `x-content-type-options: nosniff`, `cache-control: no-store` and `referrer-policy: no-referrer`.
+
+| Route | Purpose |
+| --- | --- |
+| `POST /conversations` | Create (`model`, `instructions`, `enabledToolPacks`, `maxTurns`, `mode`) |
+| `GET /conversations/:id` | Conversation info and full transcript |
+| `POST /conversations/:id/messages` | Submit (`content`, `requestId`, `whenBusy`, `wait`) |
+| `GET /conversations/:id/stream` | SSE; resume with `Last-Event-ID` or `?afterEntryId=` |
+| `POST /conversations/:id/{fork,abort,reset,compact,sleep-cycle,mode,btw}` | Lifecycle, memory (`memory:write`), plan/execute mode, side question |
+| `GET /approvals` | Pending tool-gate approvals |
+| `POST /signals` | Deliver a decision to a parked task. The recorded `reviewer` is always the authenticated user |
+| `GET /tool-packs`, `POST /tool-packs/:name` | List; toggle (`admin:tool-packs`) |
+| `GET /mcp/servers` | MCP connection state. `lastError` is shown only with `admin:usage` |
+| `GET /usage` | Process-wide usage (`admin:usage`) |
+| `GET /audit/permissions` | Tenant permission audit (`admin:audit`) |
+| `/improvements/*` | Gated self-improvement (`admin:improvements`), see below |
+
 ### Codemode
 
 `@earendil-works/pi-durable/codemode` is installed by default (`src/extensions/codemode.ext.ts`). The model writes JavaScript that calls tools as `await tools.<name>(args)` in a QuickJS/WASM sandbox and only the script's output reaches it. Scripts survive restarts by deterministic replay. Every `tools.*` call is a nested tool call, so tenant guards and permissions still apply. `domain_request_approval` is `callers: ["model"]`, so a script cannot bypass human approval, and `models.*` is disabled.

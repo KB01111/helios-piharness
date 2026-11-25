@@ -97,7 +97,9 @@ function truncateUtf8HeadTail(text: string, maxBytes: number): { head: string; t
 function summarizeArgs(args: Readonly<Record<string, unknown>> | undefined): string {
 	if (!args || Object.keys(args).length === 0) return "{}";
 	try {
-		const raw = JSON.stringify(args);
+		// Approval summaries are persisted (pending approvals, audit log) and served over HTTP, so redact BEFORE truncating:
+		// truncating first could cut a secret in half and defeat the pattern.
+		const raw = redactSecrets(JSON.stringify(args)).text;
 		return raw.length > 240 ? `${raw.slice(0, 237)}...` : raw;
 	} catch {
 		return "{...}";
