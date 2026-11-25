@@ -21,6 +21,10 @@ export const DEFAULT_PERMISSIONS = [
 	"domain:read",
 	"domain:write",
 	"domain:approve_request",
+	"subagent:spawn",
+	"advisor:consult",
+	"mcp:read",
+	"mcp:write",
 ] as const;
 
 /** Permissions gating process-global operations. `*` and `admin:*` also satisfy them. */
@@ -31,6 +35,8 @@ export const ADMIN_PERMISSIONS = {
 	improvements: "admin:improvements",
 	/** Lets a caller read/act on other users' conversations inside the same tenant. */
 	conversations: "admin:conversations",
+	/** Lets a caller inspect the permission audit log for their tenant. */
+	audit: "admin:audit",
 } as const;
 
 export function hasPermission(tenant: TenantContext, required: string): boolean {

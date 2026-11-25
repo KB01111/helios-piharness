@@ -24,6 +24,7 @@ import type {
 } from "./contracts/app-capabilities.js";
 import type {
 	ConversationInfo,
+	ConversationMode,
 	CreateConversationInput,
 	HarnessEvent,
 	HarnessPort,
@@ -31,6 +32,7 @@ import type {
 	ModelSpec,
 	PendingApproval,
 	SettledSubmission,
+	SideQuestionAnswer,
 	SignalDeliveryInput,
 	SignalDeliveryResult,
 	SubmissionHandle,
@@ -81,10 +83,62 @@ import { FastModelProposer, StaticProposer } from "./learning/self-improve/llm-p
 import { ImprovementService } from "./learning/self-improve/service.js";
 import { SelfImprover, type CandidateProposer, type ImprovementRunReport } from "./learning/self-improve/self-improver.js";
 import { createVerifierExtension } from "./extensions/verifier.ext.js";
+import { createContextPrunerExtension, pruneMessagesForContext, type PruneContextResult } from "./extensions/context-pruner.ext.js";
+import {
+	createMcpAdapterExtension,
+	createToolSearchExtension,
+	syncMcpServerToolsToRegistry,
+} from "./extensions/mcp-adapter.ext.js";
 import { JsonlTraceExporter } from "./runtime/trace-export.js";
 import { createHeliosCodemode, type CodemodeHandle } from "./extensions/codemode.ext.js";
 import { createCorePromptExtension, DEFAULT_STATIC_SYSTEM_PROMPT } from "./extensions/core-prompt.ext.js";
-import { createGuardShapingExtension, DEFAULT_TOOL_PERMISSIONS } from "./extensions/guard-shaping.ext.js";
+import {
+	createGuardShapingExtension,
+	DEFAULT_READ_ONLY_TOOLS,
+	DEFAULT_TOOL_PERMISSIONS,
+	ToolGateApprovalSignal,
+} from "./extensions/guard-shaping.ext.js";
+import {
+	formatMcpToolName,
+	HttpMcpTransport,
+	McpRegistry,
+	parseMcpServersEnv,
+	validateMcpServerUrl,
+	type McpContentItem,
+	type McpJsonRpcRequest,
+	type McpJsonRpcResponse,
+	type McpServerConfig,
+	type McpServerSummary,
+	type McpToolAnnotations,
+	type McpToolCallResult,
+	type McpToolDescriptor,
+	type McpTransport,
+} from "./mcp/mcp-client.js";
+import {
+	buildPermissionPolicyFromEnv,
+	DEFAULT_TOOL_GATE_APPROVAL_TIMEOUT_MS,
+	evaluatePermissionPolicy,
+	matchesToolPattern,
+	PermissionAuditStore,
+	type PermissionAuditEntry,
+	type PermissionDecision,
+	type PermissionPolicyConfig,
+	type PermissionRule,
+	type PermissionTier,
+} from "./security/permission-policy.js";
+import {
+	DEFAULT_SECRET_PATTERNS,
+	redactSecrets,
+	type SecretPattern,
+	type SecretRedactionOptions,
+	type SecretRedactionResult,
+} from "./security/secret-redactor.js";
+import {
+	createSubagentToolPack,
+	narrowSubagentPermissions,
+	type SubagentProfile,
+	type SubagentToolPackOptions,
+} from "./tools/subagent.tools.js";
 import {
 	createBudgetExtension,
 	createDefaultMaxTurnsInitializer,
@@ -173,6 +227,7 @@ export {
 } from "./memory/sanitize.js";
 import { HostRuntime, SingleWriterLockError } from "./runtime/host-runtime.js";
 import {
+	createFastModelClient,
 	createModelCatalog,
 	type FastModelClientOptions,
 	type RecordedModelRequest,
@@ -261,6 +316,17 @@ export interface BootstrapHarnessOptions {
 	readonly sleepCycleScheduler?:
 		| false
 		| Partial<Omit<SleepCycleSchedulerOptions, "harness" | "memory" | "appDb">>;
+	/** Three-tier tool permission policy (`allow` | `ask` | `deny`) merged ahead of env config. */
+	readonly permissionPolicy?: PermissionPolicyConfig;
+	/** Security extras: additional secret redaction patterns and extra read-only tools permitted in Plan Mode. */
+	readonly security?: {
+		readonly extraRedactionPatterns?: readonly SecretPattern[];
+		readonly readOnlyTools?: readonly string[];
+	};
+	/** External MCP servers (lazy discovery + deferred tool registration) merged with `MCP_SERVERS`. */
+	readonly mcpServers?: readonly McpServerConfig[];
+	/** Optional custom advisor model client for `advisor_consult` (defaults to `capabilities.fastModel`). */
+	readonly advisorClient?: FastModelClient;
 }
 
 export interface BootstrappedHarness {
@@ -288,6 +354,10 @@ export interface BootstrappedHarness {
 	readonly improvements?: ImprovementService;
 	/** JSONL span exporter when `TRACE_EXPORT_PATH` is set. */
 	readonly traceExporter?: JsonlTraceExporter;
+	/** SQLite-backed permission audit log & pending tool-gate approvals store. */
+	readonly permissionAuditStore: PermissionAuditStore;
+	/** Lazy MCP server registry (servers configured via `MCP_SERVERS` or `options.mcpServers`). */
+	readonly mcpRegistry: McpRegistry;
 	close(): Promise<void>;
 }
 
@@ -368,11 +438,28 @@ export async function bootstrapHarness(options: BootstrapHarnessOptions = {}): P
 	const skillForge = new SkillForge();
 	const skillDojo = new SkillDojo(capabilities.telemetry, { staleSkillDays: capabilities.staleSkillDays });
 	const simLog = new SimLog(appDb, { now });
+	const permissionAuditStore = new PermissionAuditStore(appDb.db, { now });
+	const mcpRegistry = new McpRegistry({
+		now,
+		servers: [...config.mcpServers, ...(options.mcpServers ?? [])],
+	});
+
+	const envPolicy = buildPermissionPolicyFromEnv({
+		approvalRequiredTools: config.toolApprovalRequired,
+		deniedTools: config.toolDenied,
+		approvalTimeoutMs: config.toolApprovalTimeoutMs,
+	});
+	const effectivePermissionPolicy: PermissionPolicyConfig = {
+		defaultTier: options.permissionPolicy?.defaultTier ?? envPolicy.defaultTier ?? "allow",
+		approvalTimeoutMs:
+			options.permissionPolicy?.approvalTimeoutMs ?? envPolicy.approvalTimeoutMs ?? config.toolApprovalTimeoutMs,
+		rules: [...(options.permissionPolicy?.rules ?? []), ...(envPolicy.rules ?? [])],
+	};
 
 	const registryManager = new HarnessRegistryManager();
 
 	// Install isolated core extensions in deterministic order:
-	// guard-shaping runs before capture-telemetry so telemetry observes blocked & offloaded diagnostics.
+	// guard-shaping runs before capture-telemetry so telemetry observes blocked, redacted & offloaded diagnostics.
 	const basePrompt = options.staticSystemPrompt ?? DEFAULT_STATIC_SYSTEM_PROMPT;
 	const improvementStore = new ImprovementStore(config.improvementsDir, now);
 	const effectivePrompt =
@@ -383,6 +470,12 @@ export async function bootstrapHarness(options: BootstrapHarnessOptions = {}): P
 			capabilities,
 			toolPermissions: options.toolPermissions,
 			maxToolOutputBytes: capabilities.maxToolOutputBytes,
+			permissionPolicy: effectivePermissionPolicy,
+			auditStore: permissionAuditStore,
+			secretRedactionEnabled: config.secretRedactionEnabled,
+			extraRedactionPatterns: options.security?.extraRedactionPatterns,
+			readOnlyTools: options.security?.readOnlyTools,
+			isReadOnlyTool: (toolName) => mcpRegistry.isToolReadOnly(toolName),
 		}),
 	);
 	// Budget enforcement runs right after the guard: it vetoes a generation (via the gated Models below)
@@ -407,6 +500,17 @@ export async function bootstrapHarness(options: BootstrapHarnessOptions = {}): P
 			},
 		}),
 	);
+	if (config.contextPruneEnabled || config.structuredCompactionEnabled) {
+		registryManager.installCoreExtension(
+			createContextPrunerExtension({
+				pruneEnabled: config.contextPruneEnabled,
+				thresholdChars: config.contextPruneThresholdChars,
+				keepRecentToolResults: config.contextPruneKeepRecentTools,
+				structuredCompactionEnabled: config.structuredCompactionEnabled,
+				fastModel: capabilities.fastModel,
+			}),
+		);
+	}
 	registryManager.installCoreExtension(createCaptureTelemetryExtension(capabilities));
 	const sleepCycle = createSleepCycleExtension({
 		capabilities,
@@ -418,6 +522,12 @@ export async function bootstrapHarness(options: BootstrapHarnessOptions = {}): P
 	});
 	registryManager.installCoreExtension(sleepCycle.extension);
 	registryManager.installCoreExtension(createSkillsLoaderExtension(capabilities));
+	if (config.toolSearchEnabled) {
+		registryManager.installCoreExtension(createToolSearchExtension());
+	}
+	if (mcpRegistry.hasServers()) {
+		registryManager.installCoreExtension(createMcpAdapterExtension({ mcpRegistry, registryManager }));
+	}
 	// Codemode last: its nested tool calls pass through every hook installed above (tenant guard, budget, capture).
 	const codemode: CodemodeHandle | undefined = config.codemodeEnabled
 		? createHeliosCodemode({
@@ -448,6 +558,31 @@ export async function bootstrapHarness(options: BootstrapHarnessOptions = {}): P
 	registryManager.registerToolPack(artifactPack, { enabled: true });
 	registryManager.registerToolPack(domainBundle.pack, { enabled: true });
 	registryManager.registerToolPack(createPlanToolPack(), { enabled: true });
+	if (config.subagentsEnabled) {
+		const advisorClient =
+			options.advisorClient ??
+			(config.advisorModel && !config.useMockModels
+				? createFastModelClient(catalog.models, config.advisorModel, {
+						timeoutMs: config.fastModelTimeoutMs,
+						maxRetries: config.fastModelMaxRetries,
+						breakers: catalog.circuitBreakers,
+					})
+				: capabilities.fastModel);
+		registryManager.registerToolPack(
+			createSubagentToolPack({
+				defaultModel: catalog.mainModel,
+				...(config.subagentReadOnlyModel && !config.useMockModels
+					? { readOnlyModel: config.subagentReadOnlyModel }
+					: {}),
+				advisorClient,
+				maxDepth: config.subagentMaxDepth,
+				maxTurns: config.subagentMaxTurns,
+				maxParallel: config.subagentMaxParallel,
+				timeoutMs: config.subagentTimeoutMs,
+			}),
+			{ enabled: true },
+		);
+	}
 
 	const wakeScheduler = options.wakeScheduler ?? new NodeWakeScheduler({ now });
 
@@ -493,8 +628,12 @@ export async function bootstrapHarness(options: BootstrapHarnessOptions = {}): P
 		registryManager,
 		capabilities,
 		defaultModel: catalog.mainModel,
+		models: catalog.models,
+		budgetStore,
+		mcpRegistry,
+		permissionAuditStore,
 		sleepCycleTask: sleepCycle.SleepCycleTask,
-		signals: [ApprovalDecisionSignal],
+		signals: [ApprovalDecisionSignal, ToolGateApprovalSignal],
 		now,
 		onClose: () => {
 			appDb.close();
@@ -582,11 +721,14 @@ export async function bootstrapHarness(options: BootstrapHarnessOptions = {}): P
 		...(codemode ? { codemode } : {}),
 		...(improvements ? { improvements } : {}),
 		...(traceExporter ? { traceExporter } : {}),
+		permissionAuditStore,
+		mcpRegistry,
 		close: async () => {
 			sleepCycleScheduler.dispose();
 			try {
 				await conversationSvc.close();
 			} finally {
+				await mcpRegistry.close().catch(() => undefined);
 				await codemode?.close();
 				traceExporter?.close();
 			}
@@ -675,6 +817,7 @@ export {
 	type ToolInvocationMetric,
 	type ToolTraceItem,
 	type ConversationInfo,
+	type ConversationMode,
 	type CreateConversationInput,
 	type HarnessEvent,
 	type HarnessPort,
@@ -682,6 +825,7 @@ export {
 	type ModelSpec,
 	type PendingApproval,
 	type SettledSubmission,
+	type SideQuestionAnswer,
 	type SignalDeliveryInput,
 	type SignalDeliveryResult,
 	type SubmissionHandle,
@@ -755,6 +899,47 @@ export {
 	// Defaults
 	DEFAULT_STATIC_SYSTEM_PROMPT,
 	DEFAULT_TOOL_PERMISSIONS,
+	DEFAULT_READ_ONLY_TOOLS,
+	// Security & Permission Policy
+	redactSecrets,
+	DEFAULT_SECRET_PATTERNS,
+	type SecretPattern,
+	type SecretRedactionOptions,
+	type SecretRedactionResult,
+	PermissionAuditStore,
+	evaluatePermissionPolicy,
+	matchesToolPattern,
+	buildPermissionPolicyFromEnv,
+	DEFAULT_TOOL_GATE_APPROVAL_TIMEOUT_MS,
+	type PermissionTier,
+	type PermissionRule,
+	type PermissionPolicyConfig,
+	type PermissionDecision,
+	type PermissionAuditEntry,
+	// Subagents & Advisor
+	createSubagentToolPack,
+	narrowSubagentPermissions,
+	type SubagentProfile,
+	type SubagentToolPackOptions,
+	// MCP Adapter & Deferred Discovery
+	McpRegistry,
+	HttpMcpTransport,
+	formatMcpToolName,
+	parseMcpServersEnv,
+	validateMcpServerUrl,
+	syncMcpServerToolsToRegistry,
+	type McpTransport,
+	type McpServerConfig,
+	type McpServerSummary,
+	type McpToolDescriptor,
+	type McpToolAnnotations,
+	type McpToolCallResult,
+	type McpContentItem,
+	type McpJsonRpcRequest,
+	type McpJsonRpcResponse,
+	// Context Pruning
+	pruneMessagesForContext,
+	type PruneContextResult,
 	// Planning
 	createPlanToolPack,
 	PLAN_LIMITS,

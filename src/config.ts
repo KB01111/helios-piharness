@@ -1,5 +1,6 @@
 import path from "node:path";
 import type { ModelSpec } from "./contracts/harness-port.js";
+import { parseMcpServersEnv, type McpServerConfig } from "./mcp/mcp-client.js";
 
 export interface AppConfig {
 	readonly port: number;
@@ -86,6 +87,44 @@ export interface AppConfig {
 	readonly improvementToolErrorTolerance: number;
 	/** EVALS_DIR: eval set root; cases live in `<dir>/cases/*.json`, the CI baseline in `<dir>/baseline.json` (default `./evals`). */
 	readonly evalsDir: string;
+	// ── Security & Permission Policy ──
+	/** SECRET_REDACTION_ENABLED: scan and redact secrets/credentials in tool outputs before artifacts & LLM context (default true). */
+	readonly secretRedactionEnabled: boolean;
+	/** TOOL_APPROVAL_REQUIRED: comma-separated tool names/globs that require durable human approval (`ask` tier) before execution. */
+	readonly toolApprovalRequired: readonly string[];
+	/** TOOL_DENIED: comma-separated tool names/globs unconditionally blocked by policy (`deny` tier). */
+	readonly toolDenied: readonly string[];
+	/** TOOL_APPROVAL_TIMEOUT_MS: approval deadline for `ask`-tier tool gates (default 24h). */
+	readonly toolApprovalTimeoutMs: number;
+	// ── Subagents & Advisor ──
+	/** SUBAGENTS_ENABLED: register the `subagents` tool pack (`subagent_delegate`, `subagent_parallel`, `advisor_consult`). Default true. */
+	readonly subagentsEnabled: boolean;
+	/** SUBAGENT_MAX_DEPTH: max recursive subagent nesting depth (default 2). */
+	readonly subagentMaxDepth: number;
+	/** SUBAGENT_MAX_TURNS: max tool rounds per child subagent (default 8). */
+	readonly subagentMaxTurns: number;
+	/** SUBAGENT_MAX_PARALLEL: max concurrent children per `subagent_parallel` call (default 4). */
+	readonly subagentMaxParallel: number;
+	/** SUBAGENT_TIMEOUT_MS: deadline per subagent delegation in ms (default 120000). */
+	readonly subagentTimeoutMs: number;
+	/** SUBAGENT_READONLY_MODEL: optional model override for read-only `researcher`/`reviewer` subagents (defaults to mainModel). */
+	readonly subagentReadOnlyModel: ModelSpec | undefined;
+	/** ADVISOR_MODEL: optional model for `advisor_consult` second opinions (defaults to fastModel). */
+	readonly advisorModel: ModelSpec | undefined;
+	// ── MCP & Deferred Tool Discovery ──
+	/** TOOL_SEARCH_ENABLED: install Pi Durable's BM25 `tool_search` extension for deferred tools (default true). */
+	readonly toolSearchEnabled: boolean;
+	/** MCP_SERVERS: JSON array of lazily-connected MCP servers (`[{ name, url, headers?, readOnly?, timeoutMs? }]`). */
+	readonly mcpServers: readonly McpServerConfig[];
+	// ── Context Pruning & Structured Compaction ──
+	/** CONTEXT_PRUNE_ENABLED: prune stale/superseded tool outputs before model requests when context exceeds threshold (default true). */
+	readonly contextPruneEnabled: boolean;
+	/** CONTEXT_PRUNE_THRESHOLD_CHARS: non-system character count above which pre-request pruning activates (default 32000). */
+	readonly contextPruneThresholdChars: number;
+	/** CONTEXT_PRUNE_KEEP_RECENT_TOOLS: number of most recent tool results always kept verbatim (default 6). */
+	readonly contextPruneKeepRecentTools: number;
+	/** STRUCTURED_COMPACTION_ENABLED: preserve active PlanDoc, mode, approvals & artifact IDs during compaction (default true). */
+	readonly structuredCompactionEnabled: boolean;
 }
 
 export function parseModelSpec(raw: string, fallback: ModelSpec): ModelSpec {
@@ -198,7 +237,34 @@ export function loadConfig(env: Readonly<Record<string, string | undefined>> = p
 		improvementProbeSamples: parsePositiveInt(env.IMPROVEMENT_PROBE_SAMPLES, 1),
 		improvementToolErrorTolerance: parseNonNegativeNumber(env.IMPROVEMENT_TOOL_ERROR_TOLERANCE, 0.05),
 		evalsDir: path.resolve(env.EVALS_DIR ?? "./evals"),
+		secretRedactionEnabled: parseBoolean(env.SECRET_REDACTION_ENABLED, true),
+		toolApprovalRequired: parseStringList(env.TOOL_APPROVAL_REQUIRED),
+		toolDenied: parseStringList(env.TOOL_DENIED),
+		toolApprovalTimeoutMs: parsePositiveInt(env.TOOL_APPROVAL_TIMEOUT_MS, 24 * 60 * 60 * 1000),
+		subagentsEnabled: parseBoolean(env.SUBAGENTS_ENABLED, true),
+		subagentMaxDepth: parsePositiveInt(env.SUBAGENT_MAX_DEPTH, 2),
+		subagentMaxTurns: parsePositiveInt(env.SUBAGENT_MAX_TURNS, 8),
+		subagentMaxParallel: parsePositiveInt(env.SUBAGENT_MAX_PARALLEL, 4),
+		subagentTimeoutMs: parsePositiveInt(env.SUBAGENT_TIMEOUT_MS, 120_000),
+		subagentReadOnlyModel: env.SUBAGENT_READONLY_MODEL?.trim()
+			? parseModelSpec(env.SUBAGENT_READONLY_MODEL, defaultMain)
+			: undefined,
+		advisorModel: env.ADVISOR_MODEL?.trim() ? parseModelSpec(env.ADVISOR_MODEL, defaultFast) : undefined,
+		toolSearchEnabled: parseBoolean(env.TOOL_SEARCH_ENABLED, true),
+		mcpServers: parseMcpServersEnv(env.MCP_SERVERS),
+		contextPruneEnabled: parseBoolean(env.CONTEXT_PRUNE_ENABLED, true),
+		contextPruneThresholdChars: parsePositiveInt(env.CONTEXT_PRUNE_THRESHOLD_CHARS, 32_000),
+		contextPruneKeepRecentTools: parsePositiveInt(env.CONTEXT_PRUNE_KEEP_RECENT_TOOLS, 6),
+		structuredCompactionEnabled: parseBoolean(env.STRUCTURED_COMPACTION_ENABLED, true),
 	};
+}
+
+function parseStringList(raw: string | undefined): string[] {
+	if (raw === undefined || raw.trim() === "") return [];
+	return raw
+		.split(",")
+		.map((item) => item.trim())
+		.filter((item) => item.length > 0);
 }
 
 /**

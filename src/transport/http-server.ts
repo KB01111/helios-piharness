@@ -292,6 +292,7 @@ export function createHttpServer(harness: HarnessPort, options: HttpServerOption
 		const instructions = optionalString(body, "instructions", { maxLength: MAX_CONTENT_CHARS });
 		const enabledToolPacks = optionalStringArray(body, "enabledToolPacks");
 		const maxTurns = optionalPositiveInt(body, "maxTurns", 10_000);
+		const mode = optionalEnum(body, "mode", ["execute", "plan"] as const);
 		// body.tenant is deliberately ignored: identity and permissions come only from the authenticated caller.
 		const created = await harness.createConversation({
 			tenant: c.get("tenant"),
@@ -299,6 +300,7 @@ export function createHttpServer(harness: HarnessPort, options: HttpServerOption
 			...(instructions !== undefined ? { instructions } : {}),
 			...(enabledToolPacks ? { enabledToolPacks } : {}),
 			...(maxTurns !== undefined ? { maxTurns } : {}),
+			...(mode !== undefined ? { mode } : {}),
 		});
 		return c.json(created, 201);
 	});
@@ -466,6 +468,21 @@ export function createHttpServer(harness: HarnessPort, options: HttpServerOption
 		return c.json({ taskId }, 202);
 	});
 
+	app.post("/conversations/:id/mode", async (c) => {
+		const id = await ownedConversationId(c);
+		const body = await readJson(c, { required: true });
+		const mode = optionalEnum(body, "mode", ["execute", "plan"] as const);
+		if (!mode) throw new ValidationError('mode must be "execute" or "plan"');
+		return c.json(await harness.setConversationMode(id, mode));
+	});
+
+	app.post("/conversations/:id/btw", async (c) => {
+		const id = await ownedConversationId(c);
+		const body = await readJson(c, { required: true });
+		const question = requiredString(body, "question", { maxLength: MAX_CONTENT_CHARS });
+		return c.json(await harness.askSideQuestion(id, question, c.req.raw.signal));
+	});
+
 	// --- approvals / signals -----------------------------------------------------------------------------------
 	app.get("/approvals", async (c) => {
 		const conversationId = c.req.query("conversationId");
@@ -505,6 +522,25 @@ export function createHttpServer(harness: HarnessPort, options: HttpServerOption
 		// Usage is aggregated process-wide (all tenants), so it is admin-only.
 		requirePermission(c.get("tenant"), ADMIN_PERMISSIONS.usage);
 		return c.json(await harness.getUsage());
+	});
+
+	app.get("/mcp/servers", (c) => {
+		return c.json({ servers: harness.listMcpServers() });
+	});
+
+	app.get("/audit/permissions", (c) => {
+		const tenant = c.get("tenant");
+		if (!hasPermission(tenant, ADMIN_PERMISSIONS.audit) && !hasPermission(tenant, ADMIN_PERMISSIONS.usage)) {
+			throw new ForbiddenError(`Missing permission "${ADMIN_PERMISSIONS.audit}"`);
+		}
+		const conversationId = c.req.query("conversationId");
+		const limitRaw = c.req.query("limit");
+		const limit = limitRaw ? Number.parseInt(limitRaw, 10) : undefined;
+		const entries = harness.listPermissionAudit(tenant.tenantId, {
+			...(conversationId ? { conversationId } : {}),
+			...(limit !== undefined && Number.isFinite(limit) && limit > 0 ? { limit } : {}),
+		});
+		return c.json({ entries });
 	});
 
 	// --- gated self-improvement (process-global => admin:improvements; the service re-checks the permission) -------

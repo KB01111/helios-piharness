@@ -36,6 +36,10 @@ export type ConversationMetaState = {
 		conversationId: string;
 		entryId: string;
 	} | null;
+	/** Nesting depth for task-owned subagent conversations (0 for top-level conversations). */
+	subagentDepth?: number;
+	/** Parent conversation ID when this conversation was spawned by a subagent tool. */
+	parentConversationId?: string | null;
 };
 
 export const ConversationMetaDoc = defineDoc<ConversationMetaState>({
@@ -58,6 +62,8 @@ export const ConversationMetaDoc = defineDoc<ConversationMetaState>({
 		frozenSkillsIndex: "",
 		enabledToolPacks: [],
 		forkedFrom: null,
+		subagentDepth: 0,
+		parentConversationId: null,
 	}),
 	checkpointWhen: (_value, _ops, info) => info.deltasSinceBase >= 16,
 });
@@ -277,4 +283,26 @@ export const VerifierDoc = defineDoc<VerifierDocState>({
 	fork: "initial",
 	initial: () => ({ runFirst: 0, revisions: 0, checked: 0, passed: 0, revised: 0, skipped: 0, failedOpen: 0 }),
 	checkpointWhen: (_value, _ops, info) => info.deltasSinceBase >= 32,
+});
+
+// ── Conversation mode (read-only Plan Mode vs Execute Mode) ──────────────────────────────────────────────
+
+export interface ConversationModeState extends JsonObject {
+	mode: "execute" | "plan";
+	updatedAt: number;
+}
+
+/**
+ * Runtime-enforced conversation mode (`"plan"` blocks mutating tools in `beforeTool`).
+ * Rewindable so forks inherit the mode as of their fork point. Never injected into the
+ * system prompt so the KV-cache prefix stays byte-identical across mode transitions.
+ */
+export const ConversationModeDoc = defineDoc<ConversationModeState>({
+	kind: "app.conversation-mode",
+	version: 1,
+	scope: "conversation",
+	history: "rewindable",
+	fork: "asOf",
+	initial: () => ({ mode: "execute", updatedAt: 0 }),
+	checkpointWhen: (_value, _ops, info) => info.deltasSinceBase >= 16,
 });

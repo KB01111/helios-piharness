@@ -1,3 +1,5 @@
+import type { McpServerSummary } from "../mcp/mcp-client.js";
+import type { PermissionAuditEntry } from "../security/permission-policy.js";
 import type { TenantContext } from "./tenant-context.js";
 
 /**
@@ -13,12 +15,25 @@ export interface ModelSpec {
 	readonly modelId: string;
 }
 
+/** Runtime execution mode: `"plan"` deterministically blocks all mutating tools in `beforeTool`. */
+export type ConversationMode = "execute" | "plan";
+
+export interface SideQuestionAnswer {
+	readonly conversationId: string;
+	readonly answerText: string;
+	/** True when the provider request reused the conversation's sessionId prompt-cache prefix. */
+	readonly reusedCachePrefix: boolean;
+	readonly usage?: UsageBucketView;
+}
+
 export interface CreateConversationInput {
 	readonly tenant: TenantContext;
 	readonly model?: ModelSpec;
 	readonly instructions?: string;
 	readonly enabledToolPacks?: readonly string[];
 	readonly maxTurns?: number;
+	/** Initial conversation mode (default `"execute"`). */
+	readonly mode?: ConversationMode;
 }
 
 export interface ConversationInfo {
@@ -30,6 +45,7 @@ export interface ConversationInfo {
 		readonly entryId: string;
 	};
 	readonly enabledToolPacks: readonly string[];
+	readonly mode?: ConversationMode;
 }
 
 export interface SubmitMessageInput {
@@ -116,6 +132,8 @@ export interface UsageBucketView {
 	readonly cacheWrite: number;
 	readonly totalTokens: number;
 	readonly totalCost: number;
+	/** Prefix cache efficiency ratio: `cacheRead / (input + cacheRead)` when input+cacheRead > 0, else 0. */
+	readonly cacheHitRatio?: number;
 }
 
 export interface UsageSummaryView {
@@ -270,6 +288,28 @@ export interface HarnessPort {
 
 	setToolPackEnabled(packName: string, enabled: boolean): void;
 	listToolPacks(): readonly ToolPackSummary[];
+
+	/** Switches a conversation between `"plan"` (read-only) and `"execute"` modes. */
+	setConversationMode(
+		conversationId: string,
+		mode: ConversationMode,
+	): Promise<{ readonly conversationId: string; readonly mode: ConversationMode }>;
+	getConversationMode(conversationId: string): Promise<ConversationMode>;
+
+	/**
+	 * Ephemeral `/btw` side question: answers using the conversation's committed context
+	 * and prompt-cache prefix without invoking tools or writing to the durable transcript.
+	 */
+	askSideQuestion(conversationId: string, question: string, signal?: AbortSignal): Promise<SideQuestionAnswer>;
+
+	/** Lists configured MCP servers and their lazy discovery state (never credentials/headers). */
+	listMcpServers(): readonly McpServerSummary[];
+
+	/** Returns recent permission-policy audit records scoped to `tenantId`. */
+	listPermissionAudit(
+		tenantId: string,
+		options?: { readonly conversationId?: string; readonly limit?: number },
+	): readonly PermissionAuditEntry[];
 
 	getTranscript(conversationId: string): Promise<readonly TranscriptEntryView[]>;
 	getUsage(): Promise<UsageSummaryView>;
