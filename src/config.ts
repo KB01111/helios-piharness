@@ -80,6 +80,10 @@ export interface AppConfig {
 	readonly traceExportPath: string | undefined;
 	/** TRACE_EXPORT_MAX_BYTES: rotate the trace file (keeping one `.1`) at this size. Default 50 MiB. */
 	readonly traceExportMaxBytes: number;
+	/** IMPROVEMENT_PROBE_SAMPLES: eval-suite passes averaged per probe (default 1; use 3+ with real, non-deterministic models). */
+	readonly improvementProbeSamples: number;
+	/** IMPROVEMENT_TOOL_ERROR_TOLERANCE: allowed rise of the tool-error RATE in the acceptance gate (default 0.05). */
+	readonly improvementToolErrorTolerance: number;
 	/** EVALS_DIR: eval set root; cases live in `<dir>/cases/*.json`, the CI baseline in `<dir>/baseline.json` (default `./evals`). */
 	readonly evalsDir: string;
 }
@@ -124,7 +128,7 @@ export function loadConfig(env: Readonly<Record<string, string | undefined>> = p
 	const dataDir = path.resolve(env.DATA_DIR ?? "./data");
 	const useMockModels = parseBoolean(
 		env.USE_MOCK_MODELS,
-		!env.ANTHROPIC_API_KEY && !env.OPENAI_API_KEY && !env.GEMINI_API_KEY,
+		!env.ANTHROPIC_API_KEY && !env.OPENAI_API_KEY && !env.GEMINI_API_KEY && !env.OPENROUTER_API_KEY,
 	);
 
 	const defaultMain: ModelSpec = useMockModels
@@ -191,6 +195,8 @@ export function loadConfig(env: Readonly<Record<string, string | undefined>> = p
 		verifierMinAnswerChars: parsePositiveInt(env.VERIFIER_MIN_ANSWER_CHARS, 600),
 		traceExportPath: env.TRACE_EXPORT_PATH?.trim() ? path.resolve(env.TRACE_EXPORT_PATH) : undefined,
 		traceExportMaxBytes: parsePositiveInt(env.TRACE_EXPORT_MAX_BYTES, 50 * 1024 * 1024),
+		improvementProbeSamples: parsePositiveInt(env.IMPROVEMENT_PROBE_SAMPLES, 1),
+		improvementToolErrorTolerance: parseNonNegativeNumber(env.IMPROVEMENT_TOOL_ERROR_TOLERANCE, 0.05),
 		evalsDir: path.resolve(env.EVALS_DIR ?? "./evals"),
 	};
 }

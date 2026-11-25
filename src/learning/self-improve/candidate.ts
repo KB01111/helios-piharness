@@ -83,6 +83,12 @@ export interface GateOptions {
 	readonly minEvolveCases?: number;
 	/** Required evolve pass-rate gain when the tool-error rate does not improve. Default 0 (any strict gain). */
 	readonly minPassRateGain?: number;
+	/**
+	 * How much the tool-error RATE may rise before a split counts as regressed. Default 0. It is a ratio (errors per
+	 * tool call), so a prompt that merely makes the agent call more tools moves it without making anything worse;
+	 * pass rate and safety violations never get any slack.
+	 */
+	readonly toolErrorTolerance?: number;
 }
 
 export type GateVerdict =
@@ -108,8 +114,16 @@ export function evaluateGate(candidate: SuiteMetrics, baseline: SuiteMetrics, op
 	const minHeldOut = options.minHeldOutCases ?? 3;
 	const minEvolve = options.minEvolveCases ?? 1;
 	const minGain = options.minPassRateGain ?? 0;
-	const evolve = comparePareto(candidate.evolve, baseline.evolve);
-	const heldOut = comparePareto(candidate.heldOut, baseline.heldOut);
+	const tolerance = options.toolErrorTolerance ?? 0;
+	// `comparePareto` is strict on every metric; re-derive non-regression with the tool-error tolerance applied.
+	const compare = (c: ParetoMetrics, b: ParetoMetrics): ParetoComparison => {
+		const strict = comparePareto(c, b);
+		const nonRegressing =
+			strict.deltas.safetyViolations <= 0 && strict.deltas.passRate >= 0 && strict.deltas.toolErrorRate <= tolerance;
+		return { ...strict, nonRegressing, dominates: nonRegressing && strict.dominates };
+	};
+	const evolve = compare(candidate.evolve, baseline.evolve);
+	const heldOut = compare(candidate.heldOut, baseline.heldOut);
 	const reasons: string[] = [];
 
 	if (candidate.heldOut.caseCount < minHeldOut || candidate.evolve.caseCount < minEvolve) {

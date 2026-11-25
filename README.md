@@ -54,7 +54,7 @@ All settings are read from environment variables (see `.env.example`). Unknown o
 | `MAIN_MODEL` | `anthropic:claude-sonnet-4-5` (mock: `test:main`) | Main model as `provider:modelId` or `provider/modelId` |
 | `FAST_MODEL` | `anthropic:claude-haiku-4-5` (mock: `test:fast`) | Fast model for lightweight tasks |
 | `USE_MOCK_MODELS` | `true` when no provider key is set, else `false` | Deterministic offline `TestModel` |
-| `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `GEMINI_API_KEY` | empty | Provider credentials. Never written to logs |
+| `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `GEMINI_API_KEY`, `OPENROUTER_API_KEY` | empty | Provider credentials. Never written to logs. OpenRouter models are addressed as `MAIN_MODEL=openrouter:<id>` (free ones end in `:free`) |
 | `MAX_TOOL_OUTPUT_BYTES` | `6144` | Tool output size cap before artifact offload |
 | `SLEEP_CYCLE_CRON_INTERVAL_MS` | `300000` | Sleep-cycle sweep interval in milliseconds |
 | `SLEEP_CYCLE_SCHEDULER_ENABLED` | `true` | Enables or disables the sleep-cycle scheduler |
@@ -121,11 +121,13 @@ The harness can improve its own operating guidance **without ever changing guard
 
 Admin routes (permission `admin:improvements`): `GET /improvements`, `POST /improvements/run` (single-flight), `GET /improvements/:id`, `POST /improvements/:id/{approve,reject,rollback}` with an optional `{ "note" }`. Programmatic access: `bootstrapHarness().improvements`.
 
-**Eval set tooling.** `npm run eval` runs the committed eval set and fails on any regression versus `evals/baseline.json` (pass rate, tool errors, safety violations, or a shrunken set; latency is ignored). It runs in CI and in `npm test`. After an intentional change run `npm run eval:baseline` and review the diff. Cases can be built from real conversations with `buildEvalCaseFromTranscript` (emails, keys and phone-like numbers are redacted, and a human must review the file). `npm run eval:live` runs the same cases against real models (needs a provider key and spends tokens; it refuses to run on the mock model, ignores the scripted responses, skips the mock-based baseline, and exits 1 only on safety violations). Use a real model for meaningful probes (`USE_MOCK_MODELS=false`); the scripted cases are deterministic smoke tests.
+**Eval set tooling.** `npm run eval` runs the committed eval set and fails on any regression versus `evals/baseline.json` (pass rate, tool errors, safety violations, or a shrunken set; latency is ignored). It runs in CI and in `npm test`. After an intentional change run `npm run eval:baseline` and review the diff. Cases can be built from real conversations with `buildEvalCaseFromTranscript` (emails, keys and phone-like numbers are redacted, and a human must review the file). `npm run eval:live` runs the same cases against real models (needs a provider key and spends tokens; it refuses to run on the mock model, ignores the scripted responses, skips the mock-based baseline, and exits 1 only on safety violations). Verified against real free OpenRouter models (`MAIN_MODEL=openrouter:nvidia/nemotron-3.5-lightning:free`, `OPENROUTER_API_KEY`): free models are slow and rate-limited (429s are retried), so set `EVAL_CASE_TIMEOUT_MS` and `EVAL_ONLY=id1,id2` to bound a run. Use a real model for meaningful probes (`USE_MOCK_MODELS=false`); the scripted cases are deterministic smoke tests.
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
 | `EVALS_DIR` | `./evals` | Eval set root (`cases/*.json`, `baseline.json`) |
+| `IMPROVEMENT_PROBE_SAMPLES` | `1` | Eval-suite passes averaged per probe. Real models are non-deterministic and a single pass over a few cases is mostly noise: use `3` or more with them |
+| `IMPROVEMENT_TOOL_ERROR_TOLERANCE` | `0.05` | How far the tool-error *rate* may rise in the gate. It is a ratio, so a prompt that makes the agent call more tools moves it without making anything worse. Pass rate and safety get no slack |
 | `IMPROVEMENTS_DIR` | `$DATA_DIR/improvements` | Improvement records and the active list |
 
 Cost limits (`*_COST_USD`) only bite with a priced model (Pi AI's catalog `usage.cost.total`) or a custom `bootstrapHarness({ budget: { estimateCostUsd } })`; the mock provider always reports zero cost, so use the token limits there.

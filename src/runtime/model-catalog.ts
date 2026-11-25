@@ -9,6 +9,7 @@ import {
 } from "@earendil-works/pi-ai/providers/faux";
 import { googleProvider } from "@earendil-works/pi-ai/providers/google";
 import { openaiProvider } from "@earendil-works/pi-ai/providers/openai";
+import { openrouterProvider } from "@earendil-works/pi-ai/providers/openrouter";
 import type { AssistantMessage, Message, SystemMessage, TranscriptContext, Usage } from "@earendil-works/pi-ai";
 import { contentText, getSystemMessageText } from "@earendil-works/pi-ai";
 import { getCurrentSystemPrompt, getCurrentTools } from "@earendil-works/pi-ai/utils/transcript";
@@ -211,6 +212,7 @@ export function createModelCatalog(options: {
 		models.setProvider(anthropicProvider());
 		models.setProvider(openaiProvider());
 		models.setProvider(googleProvider());
+		models.setProvider(openrouterProvider()); // reads OPENROUTER_API_KEY; use MAIN_MODEL=openrouter:<id>
 	}
 
 	let callSeq = 0;

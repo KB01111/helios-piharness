@@ -83,8 +83,10 @@ export interface SelfImproverOptions {
 	/** The static prompt before any learned addendum. */
 	readonly basePrompt: string;
 	readonly gate?: GateOptions;
-	/** Candidates probed per run (each costs a full eval-suite run). Default 3. */
+	/** Candidates probed per run (each costs `samples` full eval-suite runs). Default 3. */
 	readonly maxCandidates?: number;
+	/** Eval-suite passes averaged per probe (baseline and every candidate). Default 1; use >= 3 with real models. */
+	readonly samples?: number;
 }
 
 function metricsOf(suite: EvalSuiteResult): SuiteMetrics {
@@ -96,6 +98,19 @@ function outcomeToSimLog(verdict: GateVerdict): SimLogOutcome | undefined {
 	if (verdict.kind === "regression") return "reverted";
 	if (verdict.kind === "no_gain") return "failed";
 	return undefined;
+}
+
+/** Mean of per-sample metrics; `caseCount` stays the size of ONE suite and safety violations are summed. */
+export function averageMetrics(samples: readonly ParetoMetrics[]): ParetoMetrics {
+	const n = samples.length;
+	const mean = (pick: (m: ParetoMetrics) => number): number => samples.reduce((sum, m) => sum + pick(m), 0) / n;
+	return {
+		caseCount: samples[0]?.caseCount ?? 0,
+		passRate: mean((m) => m.passRate),
+		avgLatencyMs: mean((m) => m.avgLatencyMs),
+		toolErrorRate: mean((m) => m.toolErrorRate),
+		safetyViolations: samples.reduce((sum, m) => sum + m.safetyViolations, 0),
+	};
 }
 
 function pickMetric(m: ParetoMetrics): Record<string, number> {
@@ -127,13 +142,30 @@ export class SelfImprover {
 		return this.running;
 	}
 
+	/**
+	 * Runs the eval set `samples` times in fresh harnesses and averages the metrics (safety violations are summed, so a
+	 * single bad sample still counts). Real models are non-deterministic: one pass over a handful of cases swings the
+	 * tool-error and pass rates enough to reject or accept a candidate by luck, so use `samples` >= 3 with them.
+	 * The per-case results (used as failure evidence) come from the first sample.
+	 */
 	private async probe(prompt: string, cases: readonly EvalCase[]): Promise<EvalSuiteResult> {
-		const handle = await this.options.probeFactory(prompt);
-		try {
-			return await handle.runner.runSuite(cases);
-		} finally {
-			await handle.close().catch(() => undefined);
+		const samples = Math.max(1, Math.floor(this.options.samples ?? 1));
+		const suites: EvalSuiteResult[] = [];
+		for (let i = 0; i < samples; i++) {
+			const handle = await this.options.probeFactory(prompt);
+			try {
+				suites.push(await handle.runner.runSuite(cases));
+			} finally {
+				await handle.close().catch(() => undefined);
+			}
 		}
+		if (suites.length === 1) return suites[0]!;
+		return {
+			results: suites[0]!.results,
+			evolveMetrics: averageMetrics(suites.map((s) => s.evolveMetrics)),
+			heldOutMetrics: averageMetrics(suites.map((s) => s.heldOutMetrics)),
+			overallMetrics: averageMetrics(suites.map((s) => s.overallMetrics)),
+		};
 	}
 
 	async run(input: { readonly requestedBy: string; readonly tenantId: string; readonly cases: readonly EvalCase[] }): Promise<ImprovementRunReport> {

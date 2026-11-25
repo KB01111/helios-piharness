@@ -88,6 +88,19 @@ describe("gate, lint and store", () => {
 		).toMatchObject({ decision: "reject", kind: "no_gain" });
 	});
 
+	it("gate: tool-error tolerance forgives a small rate rise but never a pass-rate drop or a safety violation", () => {
+		const base = { evolve: metrics(0.5, 4, 0.2), heldOut: metrics(1, 3, 0.2) };
+		const better = { evolve: metrics(0.75, 4, 0.22), heldOut: metrics(1, 3, 0.2) };
+		// Strict (default): a 2-point tool-error rise on the evolve split is a regression.
+		expect(evaluateGate(better, base)).toMatchObject({ decision: "reject", kind: "regression" });
+		expect(evaluateGate(better, base, { toolErrorTolerance: 0.05 }).decision).toBe("accept");
+		// Beyond the tolerance it is still rejected.
+		expect(evaluateGate({ ...better, evolve: metrics(0.75, 4, 0.4) }, base, { toolErrorTolerance: 0.05 })).toMatchObject({ decision: "reject", kind: "regression" });
+		// Tolerance never covers pass rate or safety.
+		expect(evaluateGate({ evolve: metrics(0.75, 4, 0.2), heldOut: metrics(0.67, 3, 0.2) }, base, { toolErrorTolerance: 1 })).toMatchObject({ decision: "reject", kind: "regression" });
+		expect(evaluateGate({ evolve: metrics(0.75, 4, 0.2, 1), heldOut: metrics(1, 3, 0.2) }, base, { toolErrorTolerance: 1 })).toMatchObject({ decision: "reject", kind: "regression" });
+	});
+
 	it("store: approval is human-only, ordered, stale-protected, rollbackable, and ids cannot traverse paths", () => {
 		const dir = fs.mkdtempSync(path.join(os.tmpdir(), "helios-impr-"));
 		dirs.push(dir);
@@ -295,5 +308,88 @@ describe("self-improvement loop end to end", () => {
 		} finally {
 			await rt.close();
 		}
+	});
+});
+
+describe("probe sampling (real models are noisy)", () => {
+	const metricsOf = (passRate: number, toolErrorRate: number, caseCount = 4) => ({
+		caseCount,
+		passRate,
+		avgLatencyMs: 1,
+		toolErrorRate,
+		safetyViolations: 0,
+	});
+	const evalCase = { id: "e1", name: "e1", split: "evolve" as const, tenant: EVAL_TENANT, evalPrompt: "q" };
+	const failing = {
+		caseId: "e1",
+		name: "e1",
+		split: "evolve" as const,
+		passed: false,
+		answerText: "",
+		latencyMs: 1,
+		toolCalls: [],
+		toolErrors: 0,
+		safetyViolations: 0,
+		failures: ["x"],
+	};
+
+	async function runWith(samples: number) {
+		const dir = fs.mkdtempSync(path.join(os.tmpdir(), "helios-sampling-"));
+		const { AppDatabase, SimLog, SelfImprover, ImprovementStore, StaticProposer } = await import("../src/index.js");
+		const appDb = AppDatabase.open({ dbPath: ":memory:" });
+		const seen = { baseline: 0, candidate: 0 };
+		// Baseline tool-error rate per sample: .1 .3 .2 (mean .2). Candidate: .4 0 .1 (mean .167): better on average,
+		// but its FIRST sample (.4) alone looks like a regression.
+		const baselineErr = [0.1, 0.3, 0.2];
+		const candidateErr = [0.4, 0, 0.1];
+		const improver = new SelfImprover({
+			store: new ImprovementStore(dir),
+			simLog: new SimLog(appDb),
+			basePrompt: "base",
+			samples,
+			maxCandidates: 1,
+			proposer: new StaticProposer([{ scope: "invariant", hypothesis: "h", addendum: "GOOD guidance." }]),
+			probeFactory: async (prompt) => ({
+				runner: {
+					runSuite: async () => {
+						const good = prompt.includes("GOOD");
+						const i = good ? seen.candidate++ : seen.baseline++;
+						const err = (good ? candidateErr : baselineErr)[i % 3]!;
+						const evolve = metricsOf(good ? 1 : 0.5, err);
+						const heldOut = metricsOf(1, 0, 3);
+						return { results: good ? [] : [failing], evolveMetrics: evolve, heldOutMetrics: heldOut, overallMetrics: evolve };
+					},
+				},
+				close: async () => undefined,
+			}),
+		});
+		try {
+			const report = await improver.run({ requestedBy: "t", tenantId: "t", cases: [evalCase] });
+			return { report, seen };
+		} finally {
+			appDb.close();
+			fs.rmSync(dir, { recursive: true, force: true });
+		}
+	}
+
+	it("a single noisy sample can reject a good candidate; averaging several samples accepts it", async () => {
+		const single = await runWith(1);
+		expect(single.report.status).toBe("no_accepted_candidate");
+		expect(single.seen).toEqual({ baseline: 1, candidate: 1 });
+
+		const averaged = await runWith(3);
+		expect(averaged.report.status).toBe("proposed");
+		expect(averaged.seen).toEqual({ baseline: 3, candidate: 3 });
+		expect(averaged.report.baseline.evolve.toolErrorRate).toBeCloseTo(0.2, 10);
+		expect(averaged.report.baseline.evolve.caseCount).toBe(4); // size of ONE suite, not samples x cases
+	});
+
+	it("averageMetrics sums safety violations so one bad sample still counts", async () => {
+		const { averageMetrics } = await import("../src/learning/self-improve/self-improver.js");
+		const avg = averageMetrics([
+			{ caseCount: 4, passRate: 1, avgLatencyMs: 10, toolErrorRate: 0, safetyViolations: 0 },
+			{ caseCount: 4, passRate: 0.5, avgLatencyMs: 30, toolErrorRate: 0.2, safetyViolations: 1 },
+		]);
+		expect(avg).toEqual({ caseCount: 4, passRate: 0.75, avgLatencyMs: 20, toolErrorRate: 0.1, safetyViolations: 1 });
 	});
 });

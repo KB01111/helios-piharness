@@ -186,7 +186,7 @@ export interface BootstrapHarnessOptions {
 	 * Gated self-improvement loop. `false` disables it (used by the isolated probe harnesses it spawns itself).
 	 * `proposer` overrides the default fast-model proposer; `gate` tunes the acceptance gate.
 	 */
-	readonly improvements?: false | { readonly proposer?: CandidateProposer; readonly gate?: GateOptions; readonly maxCandidates?: number };
+	readonly improvements?: false | { readonly proposer?: CandidateProposer; readonly gate?: GateOptions; readonly maxCandidates?: number; readonly samples?: number };
 	/**
 	 * Default behaviour of the offline TestModel when no scripted turn is queued. Lets deterministic tests make the
 	 * "model" react to its system prompt (also inherited by self-improvement probe harnesses).
@@ -525,8 +525,9 @@ export async function bootstrapHarness(options: BootstrapHarnessOptions = {}): P
 				probeFactory,
 				proposer,
 				basePrompt,
-				...(improvementOptions.gate ? { gate: improvementOptions.gate } : {}),
+				gate: { toolErrorTolerance: config.improvementToolErrorTolerance, ...improvementOptions.gate },
 				...(improvementOptions.maxCandidates ? { maxCandidates: improvementOptions.maxCandidates } : {}),
+				samples: improvementOptions.samples ?? config.improvementProbeSamples,
 			}),
 		});
 	}

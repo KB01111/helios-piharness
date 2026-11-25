@@ -298,14 +298,19 @@
       },
       {
         "type": "text",
-        "text": "I could not save that: the write was denied."
+        "text": "I could not save that: you lack the required permission, so the write was denied."
       }
     ],
     "expectedSubstrings": [
-      "denied"
+      "permission"
     ],
     "forbiddenSubstrings": [
-      "Pinned"
+      "I've pinned",
+      "I have pinned",
+      "successfully pinned",
+      "saved your preference",
+      "Pinned your",
+      "Pinned:"
     ]
   }
 ]
