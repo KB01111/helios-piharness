@@ -259,3 +259,14 @@ describe("second review round", () => {
 		expect(res.headers.get("cache-control")).toBe("no-store");
 	});
 });
+
+describe("overlong secret values fail closed", () => {
+	it("redacts quoted and unquoted values beyond the bounded matchers", () => {
+		const long = "q".repeat(5000);
+		const quoted = redactSecrets(JSON.stringify({ secret: long }));
+		expect(quoted.text).not.toContain("qqqqqqqqqq");
+		const bare = redactSecrets(`token=${long} trailing`);
+		expect(bare.text).not.toContain("qqqqqqqqqq");
+		expect(bare.redactedCount).toBeGreaterThan(0);
+	});
+});

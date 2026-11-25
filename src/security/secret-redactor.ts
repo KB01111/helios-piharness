@@ -110,6 +110,19 @@ export const DEFAULT_SECRET_PATTERNS: readonly SecretPattern[] = [
 		replacement: "$1://$2:[REDACTED:db_credentials]@",
 	},
 	{
+		// Fail closed: a value longer than the bounded rules below can match would otherwise pass through untouched.
+		category: "secret_assignment",
+		pattern:
+			/\b(api[_-]?key|access[_-]?token|auth[_-]?token|secret[_-]?key|client[_-]?secret|private[_-]?token|refresh[_-]?token|token|secret|password|passphrase|passwd)(["']?)\s*([:=])\s*(["'])(?:\\.|(?!\4)[^\n\\]){4097}[^\n]*/gi,
+		replacement: "$1$2$3$4[REDACTED:secret_assignment]",
+	},
+	{
+		category: "secret_assignment",
+		pattern:
+			/\b(api[_-]?key|access[_-]?token|auth[_-]?token|secret[_-]?key|client[_-]?secret|private[_-]?token|refresh[_-]?token|token|secret|password|passphrase|passwd)(["']?)\s*([:=])\s*[^\s"'`,;}{]{4097,}/gi,
+		replacement: "$1$2$3[REDACTED:secret_assignment]",
+	},
+	{
 		// Quoted values may contain spaces (passphrases): match up to the closing quote of the same kind.
 		category: "secret_assignment",
 		pattern:
@@ -168,6 +181,22 @@ function redactChunk(
 }
 
 /**
+ * End of the slice starting at `offset`: a line break if one lies in the second half of the window, else whitespace
+ * (a token never contains any, so it is not split across slices), else a hard cut.
+ */
+function findChunkEnd(input: string, offset: number, maxChunk: number): number {
+	const hardEnd = Math.min(input.length, offset + maxChunk);
+	if (hardEnd >= input.length) return hardEnd;
+	const floor = offset + Math.floor(maxChunk / 2);
+	const lastNewline = input.lastIndexOf("\n", hardEnd);
+	if (lastNewline > floor) return lastNewline + 1;
+	for (let i = hardEnd; i > floor; i--) {
+		if (/\s/.test(input.charAt(i - 1))) return i;
+	}
+	return hardEnd;
+}
+
+/**
  * Redacts credential-shaped values from `input` while keeping surrounding structure intact.
  * Deterministic and safe on arbitrary tool output sizes.
  */
@@ -196,22 +225,7 @@ export function redactSecrets(input: string, options?: SecretRedactionOptions): 
 	let totalCount = 0;
 	let offset = 0;
 	while (offset < input.length) {
-		let end = Math.min(input.length, offset + maxChunk);
-		if (end < input.length) {
-			const floor = offset + Math.floor(maxChunk / 2);
-			const lastNewline = input.lastIndexOf("\n", end);
-			if (lastNewline > floor) {
-				end = lastNewline + 1;
-			} else {
-				// No line break: cut at whitespace so a token (which never contains any) is not split across slices.
-				for (let i = end; i > floor; i--) {
-					if (/\s/.test(input.charAt(i - 1))) {
-						end = i;
-						break;
-					}
-				}
-			}
-		}
+		const end = findChunkEnd(input, offset, maxChunk);
 		const res = redactChunk(input.slice(offset, end), patterns, categories);
 		parts.push(res.text);
 		totalCount += res.count;
