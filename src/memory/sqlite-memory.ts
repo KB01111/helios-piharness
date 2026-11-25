@@ -1489,13 +1489,14 @@ export class SqliteMemoryService implements MemoryService {
 			);
 			const dropEpisodeFts = this.stmt(
 				`DELETE FROM midterm_episodes_fts
-				 WHERE episode_id IN (SELECT episode_id FROM memory_evidence WHERE memory_id = ?)`,
+				 WHERE tenant_id = ? AND user_id = ?
+				   AND episode_id IN (SELECT episode_id FROM memory_evidence WHERE memory_id = ?)`,
 			);
 
 			for (const id of purgeIds) {
 				if (id !== memoryId) blank.run(ts, ts, id, tenantId, userId);
 				scrubEpisodes.run(tenantId, userId, id);
-				dropEpisodeFts.run(id);
+				dropEpisodeFts.run(tenantId, userId, id);
 				dropFts.run(id);
 				dropEmbedding.run(id, tenantId, userId);
 				dropEntityLinks.run(id, tenantId, userId);

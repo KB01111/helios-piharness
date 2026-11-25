@@ -202,11 +202,12 @@ export function createHttpServer(harness: HarnessPort, options: HttpServerOption
 		const requestId = incoming && REQUEST_ID_PATTERN.test(incoming) ? incoming : randomUUID();
 		c.set("requestId", requestId);
 		c.header("x-request-id", requestId);
-		// This is a JSON/SSE API: never sniffed, cached by shared caches, or leaking referrers.
-		c.header("x-content-type-options", "nosniff");
-		c.header("cache-control", "no-store");
-		c.header("referrer-policy", "no-referrer");
 		await next();
+		// This is a JSON/SSE API: never sniffed, cached by shared caches, or leaking referrers. Set after the handler so
+		// responses that build their own headers (streamSSE replaces Cache-Control) cannot drop them.
+		c.res.headers.set("x-content-type-options", "nosniff");
+		c.res.headers.set("cache-control", "no-store");
+		c.res.headers.set("referrer-policy", "no-referrer");
 	});
 
 	app.onError((err, c) => {

@@ -225,3 +225,37 @@ describe("review follow-ups", () => {
 		}
 	});
 });
+
+describe("second review round", () => {
+	it("redacts GitLab tokens ending in a hyphen and values with escaped quotes", () => {
+		const glpat = `glpat-${"a".repeat(19)}-`;
+		expect(redactSecrets(`x ${glpat} y`).text).not.toContain("aaaaaaaaaa");
+		const escaped = redactSecrets('{"password":"abc\\"defghijkl-SECRETTAIL"}');
+		expect(escaped.text).not.toContain("SECRETTAIL");
+	});
+
+	it("still redacts around an existing marker inside a value", () => {
+		const out = redactSecrets("token=abcdefgh[REDACTED:x]SECRETREST123");
+		expect(out.text).not.toContain("SECRETREST123");
+		// ...but an already-redacted value is left alone and not double counted.
+		expect(redactSecrets("token=[REDACTED:secret_assignment]").redactedCount).toBe(0);
+	});
+
+	it("cuts oversized input at whitespace so a token is not split across slices", () => {
+		const token = `ghp_${"A".repeat(40)}`;
+		const filler = "word ".repeat(2000);
+		const input = `${filler.slice(0, 4090)} ${token} ${filler}`;
+		const out = redactSecrets(input, { maxChunkChars: 4096 });
+		expect(out.text).not.toContain(token);
+		expect(out.redactedCount).toBe(1);
+	});
+
+	it("keeps no-store on responses that set their own headers", async () => {
+		const app = createHttpServer(
+			{ listMcpServers: () => [] } as never,
+			{ auth: bearerTokenAuth({ k: { tenantId: "t", userId: "u" } }), rateLimit: false, registerPublicRoutes: (hono) => hono.get("/own", (c) => c.body("x", 200, { "cache-control": "no-cache" })), publicPaths: ["/health", "/own"] },
+		);
+		const res = await app.request("/own");
+		expect(res.headers.get("cache-control")).toBe("no-store");
+	});
+});

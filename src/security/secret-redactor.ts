@@ -76,7 +76,7 @@ export const DEFAULT_SECRET_PATTERNS: readonly SecretPattern[] = [
 	},
 	{
 		category: "gitlab_token",
-		pattern: /\bglpat-[A-Za-z0-9_-]{20,100}\b/g,
+		pattern: /\bglpat-[A-Za-z0-9_-]{20,100}(?![A-Za-z0-9_-])/g,
 		replacement: "[REDACTED:gitlab_token]",
 	},
 	{
@@ -113,7 +113,7 @@ export const DEFAULT_SECRET_PATTERNS: readonly SecretPattern[] = [
 		// Quoted values may contain spaces (passphrases): match up to the closing quote of the same kind.
 		category: "secret_assignment",
 		pattern:
-			/\b(api[_-]?key|access[_-]?token|auth[_-]?token|secret[_-]?key|client[_-]?secret|private[_-]?token|refresh[_-]?token|token|secret|password|passphrase|passwd)(["']?)\s*([:=])\s*(["'])((?:(?!\4)[^\n]){8,4096})\4/gi,
+			/\b(api[_-]?key|access[_-]?token|auth[_-]?token|secret[_-]?key|client[_-]?secret|private[_-]?token|refresh[_-]?token|token|secret|password|passphrase|passwd)(["']?)\s*([:=])\s*(["'])((?:\\.|(?!\4)[^\n\\]){8,4096})\4/gi,
 		replacement: "$1$2$3$4[REDACTED:secret_assignment]$4",
 	},
 	{
@@ -143,13 +143,17 @@ function redactChunk(
 		const replacement = rule.replacement ?? `[REDACTED:${rule.category}]`;
 		let matchedThisRule = false;
 		text = text.replace(re, (...args) => {
-			// Skip already-redacted placeholders
 			const full = String(args[0] ?? "");
-			if (full.includes("[REDACTED:")) return full;
+			const groups = args.slice(1, -2);
+			// Skip already-redacted placeholders. For assignments only a value that IS a marker counts, so a value that
+			// merely contains one (`abc[REDACTED:x]rest`) is still redacted around it.
+			const valueGroup = rule.category === "secret_assignment" ? groups[4] : undefined;
+			const alreadyRedacted =
+				typeof valueGroup === "string" ? /^\[REDACTED:[^\]]*\]$/.test(valueGroup) : full.includes("[REDACTED:");
+			if (alreadyRedacted) return full;
 			matchedThisRule = true;
 			count += 1;
 			// Support $1/$2/$3 group references in replacement templates
-			const groups = args.slice(1, -2);
 			return replacement.replace(/\$(\d)/g, (_, idx: string) => {
 				const value = groups[Number.parseInt(idx, 10) - 1];
 				return typeof value === "string" ? value : "";
@@ -194,9 +198,18 @@ export function redactSecrets(input: string, options?: SecretRedactionOptions): 
 	while (offset < input.length) {
 		let end = Math.min(input.length, offset + maxChunk);
 		if (end < input.length) {
+			const floor = offset + Math.floor(maxChunk / 2);
 			const lastNewline = input.lastIndexOf("\n", end);
-			if (lastNewline > offset + Math.floor(maxChunk / 2)) {
+			if (lastNewline > floor) {
 				end = lastNewline + 1;
+			} else {
+				// No line break: cut at whitespace so a token (which never contains any) is not split across slices.
+				for (let i = end; i > floor; i--) {
+					if (/\s/.test(input.charAt(i - 1))) {
+						end = i;
+						break;
+					}
+				}
 			}
 		}
 		const res = redactChunk(input.slice(offset, end), patterns, categories);
