@@ -701,13 +701,22 @@ describe("C. Retrieval quality", () => {
 
 			// Roll the file back to a "v1" database.
 			const raw = new DatabaseSync(dbPath);
-			raw.exec("DROP TABLE memory_evidence; DROP TABLE memory_embeddings; DELETE FROM app_migrations WHERE version = 2;");
+			raw.exec(
+				`DROP TABLE memory_evidence;
+				 DROP TABLE memory_embeddings;
+				 DROP TABLE memory_entities;
+				 DROP TABLE memory_entity_links;
+				 DROP TABLE memory_relations;
+				 DROP TABLE memory_temporal_anchors;
+				 DROP TABLE midterm_episodes_fts;
+				 DELETE FROM app_migrations WHERE version >= 2;`,
+			);
 			raw.close();
 
 			const upgraded = AppDatabase.open({ dbPath });
 			try {
 				const versions = (upgraded.db.prepare("SELECT version FROM app_migrations ORDER BY version").all() as Array<{ version: number }>).map((r) => r.version);
-				expect(versions).toEqual([1, 2]);
+				expect(versions).toEqual([1, 2, 3]);
 				const svc = new SqliteMemoryService(upgraded);
 				expect((await svc.search(T, U, "migration"))[0]?.memory.key).toBe("user.keep");
 			} finally {

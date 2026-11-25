@@ -26,6 +26,16 @@ export interface LongTermMemory {
 	readonly sourceConversationId?: string;
 	readonly createdAt: number;
 	readonly updatedAt: number;
+	/** Bi-temporal valid-time start (ms epoch). Defaults to `createdAt`. */
+	readonly validFrom?: number;
+	/** Bi-temporal valid-time end (ms epoch). Set when superseded. */
+	readonly validUntil?: number;
+	/** Number of times this memory was returned in search/retrieval. */
+	readonly accessCount?: number;
+	/** Last retrieval timestamp (ms epoch). */
+	readonly lastAccessedAt?: number;
+	/** Streaming utility feedback weight in [0, 1] (default 0.5). */
+	readonly feedbackWeight?: number;
 }
 
 export interface ToolTraceItem {
@@ -82,6 +92,15 @@ export interface MemorySearchResult {
 	readonly snippet: string;
 	/** Blended relevance score in roughly [0, 1] (higher is better). Present when produced by the re-ranker. */
 	readonly score?: number;
+	/** Whether this hit came from consolidated long-term memory or a recent unconsolidated episode. */
+	readonly source?: "memory" | "episode";
+	/** Per-lane signal breakdown for observability & debugging. */
+	readonly matchSignals?: {
+		readonly lexical?: number;
+		readonly vector?: number;
+		readonly graph?: number;
+		readonly temporal?: number;
+	};
 }
 
 /**
@@ -172,8 +191,31 @@ export interface MemoryService {
 			readonly limit?: number;
 			readonly includeSuperseded?: boolean;
 			readonly kind?: MemoryKind;
+			/** Include recent unconsolidated mid-term episodes alongside long-term memory. Default false. */
+			readonly includeEpisodes?: boolean;
+			/** Enable entity-graph multi-hop PPR retrieval lane. Default true. */
+			readonly useGraph?: boolean;
+			/** Temporal anchor alignment and historical-audit routing. Default "auto". */
+			readonly temporalMode?: "auto" | "off";
+			/** Minimum calibrated relevance score required to return a hit (0 disables abstention filtering). */
+			readonly minScore?: number;
 		},
 	): Promise<MemorySearchResult[]>;
+
+	/**
+	 * Optional: apply streaming utility feedback (`w' = clamp(w + alpha * (rating - w), 0, 1)`)
+	 * to retrieved memories (rating in [0, 1], alpha in (0, 1]). Returns number of rows updated.
+	 */
+	applyFeedback?(
+		tenantId: string,
+		userId: string,
+		memoryIds: readonly string[],
+		rating: number,
+		alpha?: number,
+	): Promise<number>;
+
+	/** Optional: record memory retrieval access timestamps/counts for utility tracking. */
+	recordAccess?(tenantId: string, userId: string, memoryIds: readonly string[]): Promise<void>;
 
 	getCoreMemory(tenantId: string, userId: string, limit?: number): Promise<LongTermMemory[]>;
 	getMemoryById(tenantId: string, userId: string, id: string): Promise<LongTermMemory | undefined>;
