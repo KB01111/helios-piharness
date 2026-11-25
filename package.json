@@ -18,7 +18,9 @@
     "build": "tsc -p tsconfig.build.json",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
-    "test:watch": "vitest"
+    "test:watch": "vitest",
+    "eval": "tsx src/evals/cli.ts",
+    "eval:baseline": "tsx src/evals/cli.ts --update-baseline"
   },
   "dependencies": {
     "@earendil-works/chord": "1.6.0",

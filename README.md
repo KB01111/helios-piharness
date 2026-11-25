@@ -84,6 +84,38 @@ All settings are read from environment variables (see `.env.example`). Unknown o
 | `SLEEP_CYCLE_CRON_INTERVAL_MS` | `300000` | Periodic sleep-cycle sweep; `0` disables |
 | `SLEEP_CYCLE_SCHEDULER_ENABLED` | `true` | Toggle the sleep-cycle scheduler |
 
+### Codemode
+
+`@earendil-works/pi-durable/codemode` is installed by default (`src/extensions/codemode.ext.ts`). The model writes JavaScript that calls tools as `await tools.<name>(args)` in a QuickJS/WASM sandbox and only the script's output reaches it. Scripts survive restarts by deterministic replay. Every `tools.*` call is a nested tool call, so tenant guards and permissions still apply. `domain_request_approval` is `callers: ["model"]`, so a script cannot bypass human approval, and `models.*` is disabled.
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `CODEMODE_ENABLED` | `true` | Install the `codemode` tool |
+| `CODEMODE_MEMORY_MB` | `128` | Heap cap per script VM |
+| `CODEMODE_TIMEOUT_MS` | `120000` | Wall-clock deadline per script, tool time included |
+| `CODEMODE_MAX_WORKERS` | `4` | Process-wide cap on concurrent script workers |
+| `CODEMODE_INLINE_BUDGET` | `3000` | Estimated tokens of tool declarations in the prompt section |
+
+### Gated self-improvement (Harness²-style propose / probe / compose)
+
+The harness can improve its own operating guidance **without ever changing guardrails, permissions, tools or budgets**. The only editable surface is a *prompt addendum* appended to the static system prompt.
+
+1. **Baseline** – the eval set (`evals/cases/*.json`, `evolve` and `held_out` splits) runs on the current prompt.
+2. **Propose** – a proposer (default: the fast model, so fast-model budgets and the circuit breaker apply) reads the failing `evolve` cases, with answers redacted and treated as untrusted data, and drafts up to `maxCandidates` addenda: general ("invariant") and failure-specific ("domain"). Hypotheses already disproven in the SIM log are never retried.
+3. **Probe** – each candidate runs the whole eval set in its own isolated harness (in-memory databases, no scheduler) against the same models.
+4. **Gate** (`evaluateGate`) – accept only with held-out non-regression, zero safety violations, a big-enough eval set (default 3 held-out cases) and a strict evolve gain in pass rate or tool-error rate. Latency never justifies a change. A lint rejects text that weakens controls, mentions identity or secrets, or contains URLs, markup or code.
+5. **Compose** – if several survive, their merge is probed and gated too; the best survivor wins. Every outcome is written to the SIM log.
+6. **Human promotion** – the winner is stored as `pending_approval` and changes nothing until an operator approves it. Approval is refused if the set of active improvements changed since the candidate was measured (re-run instead). Active guidance is capped (4000 chars), persisted in `IMPROVEMENTS_DIR`, re-applied at startup, hot-applied to new conversations, and can be rolled back.
+
+Admin routes (permission `admin:improvements`): `GET /improvements`, `POST /improvements/run` (single-flight), `GET /improvements/:id`, `POST /improvements/:id/{approve,reject,rollback}` with an optional `{ "note" }`. Programmatic access: `bootstrapHarness().improvements`.
+
+**Eval set tooling.** `npm run eval` runs the committed eval set and fails on any regression versus `evals/baseline.json` (pass rate, tool errors, safety violations, or a shrunken set; latency is ignored). It runs in CI and in `npm test`. After an intentional change run `npm run eval:baseline` and review the diff. Cases can be built from real conversations with `buildEvalCaseFromTranscript` (emails, keys and phone-like numbers are redacted, and a human must review the file). Use a real model for meaningful probes (`USE_MOCK_MODELS=false`); the scripted cases are deterministic smoke tests.
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `EVALS_DIR` | `./evals` | Eval set root (`cases/*.json`, `baseline.json`) |
+| `IMPROVEMENTS_DIR` | `$DATA_DIR/improvements` | Improvement records and the active list |
+
 Cost limits (`*_COST_USD`) only bite with a priced model (Pi AI's catalog `usage.cost.total`) or a custom `bootstrapHarness({ budget: { estimateCostUsd } })`; the mock provider always reports zero cost, so use the token limits there.
 
 Embeddings are optional: pass `bootstrapHarness({ embeddingProvider })` to re-rank memory search results by cosine similarity on top of FTS. Core memory frozen into a conversation is refreshed on `resetConversation` and compaction (the prompt prefix is rebuilt then anyway) and stays byte-identical otherwise. Manual `POST /conversations/:id/sleep-cycle` is durably single-flight per conversation, even across restarts.

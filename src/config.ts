@@ -55,6 +55,22 @@ export interface AppConfig {
 	readonly circuitBreakerCooldownMs: number;
 	/** ALLOW_MOCK_MODELS: permit mock models when NODE_ENV=production (see `assertProductionModelSafety`). */
 	readonly allowMockModels: boolean;
+	// ── Codemode (model-written JS that calls tools inside a QuickJS sandbox) ──
+	/** CODEMODE_ENABLED: install the durable `codemode` tool (default true). */
+	readonly codemodeEnabled: boolean;
+	/** CODEMODE_MEMORY_MB: heap cap per script VM (default 128). */
+	readonly codemodeMemoryMb: number;
+	/** CODEMODE_TIMEOUT_MS: wall-clock deadline per script, tool time included (default 120000). */
+	readonly codemodeTimeoutMs: number;
+	/** CODEMODE_MAX_WORKERS: process-wide cap on concurrently running script workers (default 4). */
+	readonly codemodeMaxWorkers: number;
+	/** CODEMODE_INLINE_BUDGET: estimated tokens of tool declarations in the codemode prompt section (default 3000). */
+	readonly codemodeInlineBudget: number;
+	// ── Self-improvement ──
+	/** IMPROVEMENTS_DIR: records + active.json of the gated prompt-improvement loop (default `$DATA_DIR/improvements`). */
+	readonly improvementsDir: string;
+	/** EVALS_DIR: eval set root; cases live in `<dir>/cases/*.json`, the CI baseline in `<dir>/baseline.json` (default `./evals`). */
+	readonly evalsDir: string;
 }
 
 export function parseModelSpec(raw: string, fallback: ModelSpec): ModelSpec {
@@ -153,6 +169,13 @@ export function loadConfig(env: Readonly<Record<string, string | undefined>> = p
 		circuitBreakerFailureThreshold: parsePositiveInt(env.CIRCUIT_BREAKER_FAILURES, 5),
 		circuitBreakerCooldownMs: parsePositiveInt(env.CIRCUIT_BREAKER_COOLDOWN_MS, 30_000),
 		allowMockModels: parseBoolean(env.ALLOW_MOCK_MODELS, false),
+		codemodeEnabled: parseBoolean(env.CODEMODE_ENABLED, true),
+		codemodeMemoryMb: parsePositiveInt(env.CODEMODE_MEMORY_MB, 128),
+		codemodeTimeoutMs: parsePositiveInt(env.CODEMODE_TIMEOUT_MS, 120_000),
+		codemodeMaxWorkers: parsePositiveInt(env.CODEMODE_MAX_WORKERS, 4),
+		codemodeInlineBudget: parseNonNegativeInt(env.CODEMODE_INLINE_BUDGET, 3_000),
+		improvementsDir: path.resolve(env.IMPROVEMENTS_DIR ?? path.join(dataDir, "improvements")),
+		evalsDir: path.resolve(env.EVALS_DIR ?? "./evals"),
 	};
 }
 

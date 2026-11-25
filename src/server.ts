@@ -103,6 +103,7 @@ async function main(): Promise<void> {
 	const app = createHttpServer(activeRuntime.harness, {
 		logger,
 		auth,
+		...(activeRuntime.improvements ? { improvements: activeRuntime.improvements } : {}),
 		publicPaths: ["/health", "/ready"],
 		registerPublicRoutes: (hono) => {
 			// Public verdict only ({status}); version/check details require an authenticated request.

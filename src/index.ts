@@ -55,6 +55,32 @@ import {
 	type ParetoMetrics,
 } from "./evals/types.js";
 import { createCaptureTelemetryExtension } from "./extensions/capture-telemetry.ext.js";
+import {
+	buildEvalCaseFromTranscript,
+	checkAgainstBaseline,
+	EvalSetError,
+	loadEvalSet,
+	parseEvalCases,
+	readBaseline,
+	redactForEval,
+	writeBaseline,
+	type EvalBaseline,
+	type RegressionReport,
+} from "./evals/eval-set.js";
+import {
+	ADDENDUM_LIMITS,
+	composePrompt,
+	evaluateGate,
+	lintAddendum,
+	type CandidateDraft,
+	type GateOptions,
+	type GateVerdict,
+} from "./learning/self-improve/candidate.js";
+import { ImprovementError, ImprovementStore, type ImprovementRecord } from "./learning/self-improve/improvement-store.js";
+import { FastModelProposer, StaticProposer } from "./learning/self-improve/llm-proposer.js";
+import { ImprovementService } from "./learning/self-improve/service.js";
+import { SelfImprover, type CandidateProposer, type ImprovementRunReport } from "./learning/self-improve/self-improver.js";
+import { createHeliosCodemode, type CodemodeHandle } from "./extensions/codemode.ext.js";
 import { createCorePromptExtension, DEFAULT_STATIC_SYSTEM_PROMPT } from "./extensions/core-prompt.ext.js";
 import { createGuardShapingExtension, DEFAULT_TOOL_PERMISSIONS } from "./extensions/guard-shaping.ext.js";
 import {
@@ -153,6 +179,18 @@ import { createMemoryToolPack } from "./tools/memory.tools.js";
 import { createHttpServer } from "./transport/http-server.js";
 
 export interface BootstrapHarnessOptions {
+	/**
+	 * Gated self-improvement loop. `false` disables it (used by the isolated probe harnesses it spawns itself).
+	 * `proposer` overrides the default fast-model proposer; `gate` tunes the acceptance gate.
+	 */
+	readonly improvements?: false | { readonly proposer?: CandidateProposer; readonly gate?: GateOptions; readonly maxCandidates?: number };
+	/**
+	 * Default behaviour of the offline TestModel when no scripted turn is queued. Lets deterministic tests make the
+	 * "model" react to its system prompt (also inherited by self-improvement probe harnesses).
+	 */
+	readonly mockMainHandler?: TestModelHandler;
+	/** Apply operator-approved prompt addenda from `config.improvementsDir` on startup (default true). */
+	readonly applyActiveImprovements?: boolean;
 	readonly config?: Partial<AppConfig>;
 	readonly capabilities?: Partial<AppCapabilities>;
 	/**
@@ -207,6 +245,10 @@ export interface BootstrappedHarness {
 	readonly circuitBreakers: ProviderCircuitBreakers;
 	/** Periodic sleep-cycle scheduler (inactive when disabled via config or `sleepCycleScheduler: false`). */
 	readonly sleepCycleScheduler: SleepCycleScheduler;
+	/** Codemode sandbox handle; undefined when `CODEMODE_ENABLED=false`. */
+	readonly codemode?: CodemodeHandle;
+	/** Gated prompt self-improvement (propose/probe/compose, human approval). Undefined for isolated probe harnesses. */
+	readonly improvements?: ImprovementService;
 	close(): Promise<void>;
 }
 
@@ -258,6 +300,8 @@ export async function bootstrapHarness(options: BootstrapHarnessOptions = {}): P
 		},
 	});
 
+	if (options.mockMainHandler) catalog.testModel.setDefaultMainHandler(options.mockMainHandler);
+
 	const memory =
 		options.capabilities?.memory ??
 		new SqliteMemoryService(appDb, {
@@ -290,11 +334,11 @@ export async function bootstrapHarness(options: BootstrapHarnessOptions = {}): P
 
 	// Install isolated core extensions in deterministic order:
 	// guard-shaping runs before capture-telemetry so telemetry observes blocked & offloaded diagnostics.
-	registryManager.installCoreExtension(
-		createCorePromptExtension({
-			staticSystemPrompt: options.staticSystemPrompt ?? DEFAULT_STATIC_SYSTEM_PROMPT,
-		}),
-	);
+	const basePrompt = options.staticSystemPrompt ?? DEFAULT_STATIC_SYSTEM_PROMPT;
+	const improvementStore = new ImprovementStore(config.improvementsDir, now);
+	const effectivePrompt =
+		options.applyActiveImprovements === false ? basePrompt : composePrompt(basePrompt, improvementStore.activeAddenda());
+	registryManager.installCoreExtension(createCorePromptExtension({ staticSystemPrompt: effectivePrompt }));
 	registryManager.installCoreExtension(
 		createGuardShapingExtension({
 			capabilities,
@@ -335,6 +379,16 @@ export async function bootstrapHarness(options: BootstrapHarnessOptions = {}): P
 	});
 	registryManager.installCoreExtension(sleepCycle.extension);
 	registryManager.installCoreExtension(createSkillsLoaderExtension(capabilities));
+	// Codemode last: its nested tool calls pass through every hook installed above (tenant guard, budget, capture).
+	const codemode: CodemodeHandle | undefined = config.codemodeEnabled
+		? createHeliosCodemode({
+				memoryLimitBytes: config.codemodeMemoryMb * 1024 * 1024,
+				inlineBudget: config.codemodeInlineBudget,
+				maxWorkers: config.codemodeMaxWorkers,
+				timeoutMs: config.codemodeTimeoutMs,
+			})
+		: undefined;
+	if (codemode) registryManager.installCoreExtension(codemode.extension);
 
 	// Register modular toggleable ToolPacks
 	const memoryPack = createMemoryToolPack(capabilities.memory);
@@ -392,6 +446,56 @@ export async function bootstrapHarness(options: BootstrapHarnessOptions = {}): P
 	});
 	sleepCycleScheduler.start();
 
+	let improvements: ImprovementService | undefined;
+	if (options.improvements !== false) {
+		const improvementOptions = options.improvements ?? {};
+		const proposer =
+			improvementOptions.proposer ??
+			(capabilities.fastModel
+				? new FastModelProposer(capabilities.fastModel)
+				: { propose: async () => [] });
+		// Probes are fully isolated harnesses (in-memory databases, no scheduler, no nested loop) over the same models.
+		const probeFactory = async (systemPrompt: string) => {
+			const probe = await bootstrapHarness({
+				...options,
+				improvements: false,
+				applyActiveImprovements: false,
+				staticSystemPrompt: systemPrompt,
+				sleepCycleScheduler: false,
+				autoResume: false,
+				wakeScheduler: undefined,
+				capabilities: { skillsDir: capabilities.skillsDir, maxToolOutputBytes: capabilities.maxToolOutputBytes },
+				config: {
+					...config,
+					piDbPath: ":memory:",
+					appDbPath: ":memory:",
+					sleepCycleSchedulerEnabled: false,
+					improvementsDir: config.improvementsDir,
+				},
+			});
+			return {
+				runner: new ReplayEvalRunner({ harness: probe.harness, testModel: probe.testModel }),
+				close: () => probe.close(),
+			};
+		};
+		improvements = new ImprovementService({
+			store: improvementStore,
+			simLog,
+			evalsDir: config.evalsDir,
+			basePrompt,
+			applyPrompt: (prompt) => registryManager.replaceExtension(createCorePromptExtension({ staticSystemPrompt: prompt })),
+			improver: new SelfImprover({
+				store: improvementStore,
+				simLog,
+				probeFactory,
+				proposer,
+				basePrompt,
+				...(improvementOptions.gate ? { gate: improvementOptions.gate } : {}),
+				...(improvementOptions.maxCandidates ? { maxCandidates: improvementOptions.maxCandidates } : {}),
+			}),
+		});
+	}
+
 	return {
 		config,
 		harness: conversationSvc,
@@ -407,9 +511,15 @@ export async function bootstrapHarness(options: BootstrapHarnessOptions = {}): P
 		budgetLimits,
 		circuitBreakers: catalog.circuitBreakers,
 		sleepCycleScheduler,
-		close: () => {
+		...(codemode ? { codemode } : {}),
+		...(improvements ? { improvements } : {}),
+		close: async () => {
 			sleepCycleScheduler.dispose();
-			return conversationSvc.close();
+			try {
+				await conversationSvc.close();
+			} finally {
+				await codemode?.close();
+			}
 		},
 	};
 }
@@ -575,8 +685,33 @@ export {
 	// Defaults
 	DEFAULT_STATIC_SYSTEM_PROMPT,
 	DEFAULT_TOOL_PERMISSIONS,
-	// Evals
+	// Evals & gated self-improvement
 	ReplayEvalRunner,
+	loadEvalSet,
+	parseEvalCases,
+	buildEvalCaseFromTranscript,
+	redactForEval,
+	readBaseline,
+	writeBaseline,
+	checkAgainstBaseline,
+	EvalSetError,
+	ImprovementStore,
+	ImprovementService,
+	ImprovementError,
+	SelfImprover,
+	FastModelProposer,
+	StaticProposer,
+	evaluateGate,
+	lintAddendum,
+	composePrompt,
+	ADDENDUM_LIMITS,
+	type EvalBaseline,
+	type RegressionReport,
+	type ImprovementRecord,
+	type ImprovementRunReport,
+	type CandidateDraft,
+	type CandidateProposer,
+	type GateVerdict,
 	aggregateParetoMetrics,
 	comparePareto,
 	type EvalCase,

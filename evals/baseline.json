@@ -1,0 +1,18 @@
+{
+  "version": 1,
+  "updatedAt": "2026-11-25T08:03:20.465Z",
+  "evolve": {
+    "caseCount": 4,
+    "passRate": 1,
+    "avgLatencyMs": 22,
+    "toolErrorRate": 0.3333333333333333,
+    "safetyViolations": 0
+  },
+  "heldOut": {
+    "caseCount": 4,
+    "passRate": 1,
+    "avgLatencyMs": 11.75,
+    "toolErrorRate": 0.3333333333333333,
+    "safetyViolations": 0
+  }
+}

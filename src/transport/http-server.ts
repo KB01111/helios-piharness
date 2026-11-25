@@ -13,6 +13,7 @@ import {
 } from "../contracts/errors.js";
 import type { CreateConversationInput, HarnessPort, SubmitMessageInput } from "../contracts/harness-port.js";
 import { ADMIN_PERMISSIONS, hasPermission, type TenantContext } from "../contracts/tenant-context.js";
+import type { ImprovementService } from "../learning/self-improve/service.js";
 import { createLogger, serializeError, type Logger } from "../logger.js";
 import { authFromEnv, type AuthResolver } from "./auth.js";
 import { RateLimiter } from "./rate-limit.js";
@@ -56,6 +57,8 @@ export interface HttpServerOptions {
 	readonly maxStreams?: number;
 	/** SSE keepalive comment interval in ms (default `HELIOS_SSE_KEEPALIVE_MS` or 15000; 0 disables). */
 	readonly keepAliveMs?: number;
+	/** Gated self-improvement service; its admin routes (`/improvements`) are only mounted when provided. */
+	readonly improvements?: ImprovementService;
 	readonly logger?: Logger;
 	/** Paths served without authentication (default `["/health"]`). */
 	readonly publicPaths?: readonly string[];
@@ -503,6 +506,28 @@ export function createHttpServer(harness: HarnessPort, options: HttpServerOption
 		requirePermission(c.get("tenant"), ADMIN_PERMISSIONS.usage);
 		return c.json(await harness.getUsage());
 	});
+
+	// --- gated self-improvement (process-global => admin:improvements; the service re-checks the permission) -------
+	const improvements = options.improvements;
+	if (improvements) {
+		app.get("/improvements", (c) => c.json({ ...improvements.list(c.get("tenant")), running: improvements.isRunning() }));
+
+		app.post("/improvements/run", async (c) => {
+			// Long-running (evaluates every candidate against the whole eval set); the loop is single-flight.
+			const report = await improvements.run(c.get("tenant"));
+			return c.json(report);
+		});
+
+		app.get("/improvements/:id", (c) => c.json(improvements.get(c.get("tenant"), c.req.param("id"))));
+
+		for (const action of ["approve", "reject", "rollback"] as const) {
+			app.post(`/improvements/:id/${action}`, async (c) => {
+				const body = await readJson(c, { required: false });
+				const note = optionalString(body ?? {}, "note", { maxLength: 500 });
+				return c.json(improvements[action](c.get("tenant"), c.req.param("id"), note));
+			});
+		}
+	}
 
 	return app;
 }

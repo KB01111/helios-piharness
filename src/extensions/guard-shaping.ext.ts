@@ -80,6 +80,11 @@ export function createGuardShapingExtension(options: GuardShapingExtensionOption
 				},
 
 				afterTool: async (call, result, api, context) => {
+					// Nested calls (codemode scripts) hand their value to the script, not the transcript,
+					// so offloading their text would only litter the artifact store.
+					if (call.parent) {
+						return undefined;
+					}
 					if (!result.output || result.output.length === 0) {
 						return undefined;
 					}

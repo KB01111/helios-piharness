@@ -27,6 +27,8 @@ export const DEFAULT_PERMISSIONS = [
 export const ADMIN_PERMISSIONS = {
 	toolPacks: "admin:tool-packs",
 	usage: "admin:usage",
+	/** Run the self-improvement loop and approve, reject or roll back its prompt changes. */
+	improvements: "admin:improvements",
 	/** Lets a caller read/act on other users' conversations inside the same tenant. */
 	conversations: "admin:conversations",
 } as const;

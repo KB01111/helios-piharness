@@ -236,6 +236,8 @@ export function createExampleDomainToolPack(options?: { readonly store?: DomainS
 			"Pause execution and wait durably for an external human approval decision signal. Survives restarts without holding a process.",
 		parameters: ApprovalParams,
 		replay: "safe",
+		// A human-approval park must stay a deliberate model-visible step; codemode scripts may not call it.
+		callers: ["model"],
 		execute: async (args, _tenant, api, context) => {
 			const signalKey =
 				api.checkpoint?.signalKey ?? (await api.memo("approval.key", `approval_${api.callId}`, context));
