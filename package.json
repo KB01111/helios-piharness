@@ -20,7 +20,8 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "eval": "tsx src/evals/cli.ts",
-    "eval:baseline": "tsx src/evals/cli.ts --update-baseline"
+    "eval:baseline": "tsx src/evals/cli.ts --update-baseline",
+    "eval:live": "tsx src/evals/cli.ts --live"
   },
   "dependencies": {
     "@earendil-works/chord": "1.6.0",
