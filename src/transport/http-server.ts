@@ -193,8 +193,6 @@ export function createHttpServer(harness: HarnessPort, options: HttpServerOption
 		};
 	};
 
-	// In-flight manual sleep cycles per conversation: a repeat request gets the running task, not a duplicate.
-	const sleepCyclesInFlight = new Map<string, Promise<string>>();
 	// --- request id -------------------------------------------------------------------------------------------
 	app.use("*", async (c, next) => {
 		const incoming = c.req.header("x-request-id");
@@ -456,23 +454,11 @@ export function createHttpServer(harness: HarnessPort, options: HttpServerOption
 		const reason = optionalString(body, "reason", { maxLength: 1000 });
 		const wait = optionalBoolean(body, "wait");
 
-		// Single-flight per conversation: reuse a running cycle instead of starting a duplicate. The promise is
-		// registered before awaiting so concurrent requests cannot both start one.
-		let pending = sleepCyclesInFlight.get(id);
-		if (!pending) {
-			const started = harness.triggerSleepCycle(id, { reason }).then((result) => result.taskId);
-			pending = started;
-			sleepCyclesInFlight.set(id, started);
-			const clear = (): void => {
-				if (sleepCyclesInFlight.get(id) === started) sleepCyclesInFlight.delete(id);
-			};
-			started.then((startedTaskId) => harness.waitTask(startedTaskId).then(clear, clear), clear);
-		}
-		const taskId = await pending;
+		// Single-flight is durable and enforced by the harness: a repeat request (from any process, across restarts)
+		// receives the live task for this conversation instead of starting a duplicate.
+		const { taskId } = await harness.triggerSleepCycle(id, { reason });
 		if (wait === true) {
-			const settled = await harness.waitTask(taskId, c.req.raw.signal);
-			if (sleepCyclesInFlight.get(id) === pending) sleepCyclesInFlight.delete(id);
-			return c.json(settled);
+			return c.json(await harness.waitTask(taskId, c.req.raw.signal));
 		}
 		return c.json({ taskId }, 202);
 	});

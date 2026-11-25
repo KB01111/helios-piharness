@@ -36,6 +36,7 @@ import { canAccessConversation, validateTenantContext, type TenantContext } from
 import { createLogger, serializeError, type Logger } from "../logger.js";
 import { formatFrozenSkillsIndex, loadSkillCatalog } from "../extensions/skills-loader.ext.js";
 import type { SleepCycleCheckpoint, SleepCycleInput, SleepCycleResult } from "../extensions/sleep-cycle.ext.js";
+import { clientSafeDetail, clientSafeReason } from "../runtime/client-safe.js";
 import type { HostRuntime } from "../runtime/host-runtime.js";
 import { entryToView, usageToView, watchConversationEvents } from "../runtime/stream-adapter.js";
 import {
@@ -45,6 +46,7 @@ import {
 	deserializeTenantFromDoc,
 	formatFrozenCoreMemory,
 	listApprovalsFromDoc,
+	refreshFrozenCoreMemory,
 	serializeTenantForDoc,
 } from "./app-documents.js";
 import type { HarnessRegistryManager } from "./registry.js";
@@ -57,24 +59,8 @@ function parseId<T extends number>(raw: string, label: string): T {
 	return parsed as T;
 }
 
-/** Reasons are stable snake_case codes; anything else (free text) is collapsed so it cannot leak internals. */
-const SAFE_REASON_PATTERN = /^[a-z][a-z0-9_.-]{0,63}$/;
-/** Budget vetoes are intentionally client-visible (they tell the caller which limit to raise). */
-const CLIENT_SAFE_DETAIL_PREFIX = "BUDGET_EXCEEDED ";
-const MAX_CLIENT_DETAIL_CHARS = 500;
 /** Cap on the unscoped (all-conversation) approvals listing. */
 const DEFAULT_APPROVALS_LIMIT = 500;
-
-function clientSafeReason(reason: string): string {
-	return SAFE_REASON_PATTERN.test(reason) ? reason : "unanswered";
-}
-
-function clientSafeDetail(detail: unknown): string | undefined {
-	if (typeof detail === "string" && detail.startsWith(CLIENT_SAFE_DETAIL_PREFIX)) {
-		return detail.slice(0, MAX_CLIENT_DETAIL_CHARS);
-	}
-	return undefined;
-}
 
 export interface ConversationServiceOptions {
 	/** Server-side diagnostics sink for error details that are deliberately withheld from clients. */
@@ -107,6 +93,10 @@ export class ConversationService implements HarnessPort {
 	private readonly now: () => number;
 	private readonly onClose?: () => Promise<void> | void;
 	private readonly logger: Logger;
+	/** Conversation id -> owning tenant, built incrementally for tenant-scoped approval listings. */
+	private readonly tenantIndex = new Map<number, ConversationMetaState["tenant"]>();
+	private tenantIndexHighWater = 0;
+	private tenantIndexSync: Promise<void> | undefined;
 
 	constructor(options: ConversationServiceOptions) {
 		this.logger = options.logger ?? createLogger({ level: "warn", base: { component: "conversation-service" } });
@@ -355,11 +345,37 @@ export class ConversationService implements HarnessPort {
 
 	async resetConversation(conversationId: string, handoff?: string): Promise<void> {
 		const conv = await this.requireConversation(conversationId);
+		await this.refreshFrozenCore(conv);
 		await conv.reset(handoff, BACKGROUND_CONTEXT);
+	}
+
+	/**
+	 * Reset and compaction already rewrite the visible history (so the prompt-cache prefix is rebuilt anyway):
+	 * the cheapest moment to pick up memories consolidated since the conversation started. A no-op when the
+	 * rendered core memory is unchanged, and never allowed to fail the reset/compaction itself.
+	 */
+	private async refreshFrozenCore(conv: Conversation): Promise<void> {
+		try {
+			const meta = await this.harness.snapshot(ConversationMetaDoc, conv.id, BACKGROUND_CONTEXT);
+			if (!meta) return;
+			const patch = await refreshFrozenCoreMemory(this.capabilities.memory, meta.tenant, meta, this.now());
+			if (!patch.changed) return;
+			await conv.commit(async (tx) => {
+				const doc = await tx.doc(ConversationMetaDoc, conv.id);
+				doc.frozenCoreMemory = patch.frozenCoreMemory;
+				doc.frozenCoreMemoryAt = patch.frozenCoreMemoryAt;
+			}, BACKGROUND_CONTEXT);
+		} catch (error) {
+			this.logger.warn("frozen_core_memory_refresh_failed", {
+				conversationId: String(conv.id),
+				error: serializeError(error),
+			});
+		}
 	}
 
 	async startCompaction(conversationId: string, instructions?: string): Promise<{ readonly taskId: string }> {
 		const conv = await this.requireConversation(conversationId);
+		await this.refreshFrozenCore(conv);
 		const taskId = await conv.compact(instructions, BACKGROUND_CONTEXT);
 		return { taskId: String(taskId) };
 	}
@@ -371,6 +387,7 @@ export class ConversationService implements HarnessPort {
 	): Promise<{ readonly taskId: string; readonly compacted: boolean }> {
 		const ctx = signal ? withAbortSignal(signal, BACKGROUND_CONTEXT) : BACKGROUND_CONTEXT;
 		const conv = await this.requireConversation(conversationId);
+		await this.refreshFrozenCore(conv);
 		const taskId = await conv.compact(instructions, ctx);
 		const settled = await this.harness.waitForTask(taskId, ctx);
 		if (settled.state.outcome.status !== "completed") {
@@ -405,7 +422,7 @@ export class ConversationService implements HarnessPort {
 		const tenantId = caller?.tenantId ?? options?.tenantId;
 		const limit = Math.max(1, options?.limit ?? DEFAULT_APPROVALS_LIMIT);
 		/** Tenant check always precedes loading the approvals doc, so other tenants' docs are never read. */
-		const mayAccess = (meta: Readonly<ConversationMetaState>): boolean => {
+		const mayAccess = (meta: { readonly tenant: ConversationMetaState["tenant"] }): boolean => {
 			if (caller) return canAccessConversation(caller, meta.tenant);
 			return tenantId === undefined || meta.tenant.tenantId === tenantId;
 		};
@@ -419,6 +436,24 @@ export class ConversationService implements HarnessPort {
 		}
 
 		const results: PendingApproval[] = [];
+
+		if (tenantId !== undefined) {
+			// Tenant-scoped: consult the incremental conversation->tenant index so only this tenant's conversations
+			// have their approvals document read (no per-request meta read of every conversation in the system).
+			await this.syncTenantIndex();
+			// Oldest conversation first, matching the unscoped scan order.
+			for (const rawId of [...this.tenantIndex.keys()].sort((a, b) => a - b)) {
+				const owner = this.tenantIndex.get(rawId);
+				if (!owner || !mayAccess({ tenant: owner })) continue;
+				const doc = await this.harness.snapshot(PendingApprovalsDoc, rawId as ConversationId, BACKGROUND_CONTEXT);
+				results.push(...listApprovalsFromDoc(doc));
+				if (results.length >= limit) break;
+			}
+			results.sort((a, b) => a.createdAt - b.createdAt);
+			return results.slice(0, limit);
+		}
+
+		// Trusted embedders with no tenant filter: scan everything.
 		let cursor: Cursor | undefined;
 		scan: do {
 			const after = cursor;
@@ -427,10 +462,6 @@ export class ConversationService implements HarnessPort {
 				BACKGROUND_CONTEXT,
 			);
 			for (const conv of page.items) {
-				if (tenantId !== undefined) {
-					const meta = await this.harness.snapshot(ConversationMetaDoc, conv.id, BACKGROUND_CONTEXT);
-					if (!meta || !mayAccess(meta)) continue;
-				}
 				const doc = await this.harness.snapshot(PendingApprovalsDoc, conv.id, BACKGROUND_CONTEXT);
 				results.push(...listApprovalsFromDoc(doc));
 				if (results.length >= limit) break scan;
@@ -439,6 +470,40 @@ export class ConversationService implements HarnessPort {
 		} while (cursor !== undefined);
 		results.sort((a, b) => a.createdAt - b.createdAt);
 		return results.slice(0, limit);
+	}
+
+	/**
+	 * Brings the in-memory conversation->tenant index up to date. Conversation ids only grow, so a newest-first scan
+	 * stops at the first id that is already indexed: steady-state cost is one page read, not a full scan. Concurrent
+	 * callers share one in-flight sync.
+	 */
+	private syncTenantIndex(): Promise<void> {
+		this.tenantIndexSync ??= this.runTenantIndexSync().finally(() => {
+			this.tenantIndexSync = undefined;
+		});
+		return this.tenantIndexSync;
+	}
+
+	private async runTenantIndexSync(): Promise<void> {
+		const known = this.tenantIndexHighWater;
+		let newest = known;
+		let cursor: Cursor | undefined;
+		scan: do {
+			const after = cursor;
+			const page = await this.harness.commit(
+				(tx) => tx.scanConversations({ order: "descending" }, 200, after),
+				BACKGROUND_CONTEXT,
+			);
+			for (const conv of page.items) {
+				const id = Number(conv.id);
+				if (id <= known) break scan;
+				const meta = await this.harness.snapshot(ConversationMetaDoc, conv.id, BACKGROUND_CONTEXT);
+				if (meta) this.tenantIndex.set(id, meta.tenant);
+				newest = Math.max(newest, id);
+			}
+			cursor = page.next;
+		} while (cursor !== undefined);
+		this.tenantIndexHighWater = newest;
 	}
 
 	async assertConversationOwner(caller: TenantContext, conversationId: string): Promise<void> {
@@ -488,18 +553,26 @@ export class ConversationService implements HarnessPort {
 		options?: { readonly reason?: string },
 	): Promise<{ readonly taskId: string }> {
 		const conv = await this.requireConversation(conversationId);
-		const taskId = await conv.commit(
-			(tx) =>
-				tx.createTask(
-					this.sleepCycleTask,
-					{ reason: options?.reason ?? "manual", staleSkillDays: null },
-					{
-						ownership: { kind: "conversation" },
-						background: true,
-					},
-				),
-			BACKGROUND_CONTEXT,
-		);
+		// Durable single-flight: the lookup and the create share one transaction, so concurrent callers (and other
+		// processes / restarts) reuse a live cycle for this conversation instead of starting a duplicate.
+		const taskId = await conv.commit(async (tx) => {
+			const recent = await tx.scanTasks(
+				{ conversationId: conv.id, kind: this.sleepCycleTask.definition.name, order: "descending" },
+				10,
+			);
+			const live = recent.items.find(
+				(task) => task.state.status !== "terminal" && task.state.status !== "completing",
+			);
+			if (live) return live.id;
+			return tx.createTask(
+				this.sleepCycleTask,
+				{ reason: options?.reason ?? "manual", staleSkillDays: null },
+				{
+					ownership: { kind: "conversation" },
+					background: true,
+				},
+			);
+		}, BACKGROUND_CONTEXT);
 		this.hostRuntime.resume();
 		return { taskId: String(taskId) };
 	}

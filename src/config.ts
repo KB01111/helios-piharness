@@ -28,6 +28,10 @@ export interface AppConfig {
 	readonly maxTenantDailyTokens: number;
 	/** MAX_TENANT_DAILY_COST_USD */
 	readonly maxTenantDailyCostUsd: number;
+	/** MAX_FAST_MODEL_DAILY_TOKENS: all background fast-model calls combined, per UTC day. */
+	readonly maxFastModelDailyTokens: number;
+	/** MAX_FAST_MODEL_DAILY_COST_USD */
+	readonly maxFastModelDailyCostUsd: number;
 	/** DEFAULT_MAX_TURNS: tool rounds per run when createConversation passes no maxTurns (default 24). */
 	readonly defaultMaxTurns: number;
 	// ── Model resilience ──
@@ -129,6 +133,12 @@ export function loadConfig(env: Readonly<Record<string, string | undefined>> = p
 		maxConversationCostUsd: parseBudgetLimit("MAX_CONVERSATION_COST_USD", env.MAX_CONVERSATION_COST_USD, false),
 		maxTenantDailyTokens: parseBudgetLimit("MAX_TENANT_DAILY_TOKENS", env.MAX_TENANT_DAILY_TOKENS, true),
 		maxTenantDailyCostUsd: parseBudgetLimit("MAX_TENANT_DAILY_COST_USD", env.MAX_TENANT_DAILY_COST_USD, false),
+		maxFastModelDailyTokens: parseBudgetLimit("MAX_FAST_MODEL_DAILY_TOKENS", env.MAX_FAST_MODEL_DAILY_TOKENS, true),
+		maxFastModelDailyCostUsd: parseBudgetLimit(
+			"MAX_FAST_MODEL_DAILY_COST_USD",
+			env.MAX_FAST_MODEL_DAILY_COST_USD,
+			false,
+		),
 		defaultMaxTurns: parsePositiveInt(env.DEFAULT_MAX_TURNS, 24),
 		modelTimeoutMs: parseNonNegativeInt(env.MODEL_TIMEOUT_MS, 120_000),
 		modelMaxRetries: parseNonNegativeInt(env.MODEL_MAX_RETRIES, 3),

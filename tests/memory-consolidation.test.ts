@@ -52,6 +52,18 @@ describe("Memory consolidation, promotion gates, and SUPERSEDE tombstones", () =
 				frictionSignals: [],
 				frictionScore: 3,
 			});
+			// A second conversation backs the repeated-evidence claim below (claimed counts are clamped to the batch).
+			await memory.recordEpisode({
+				tenantId: TENANT.tenantId,
+				userId: TENANT.userId,
+				conversationId: "conv-2",
+				runId: "run-2",
+				userMessage: "Please run the repo tests again.",
+				assistantSummary: "Ran vitest run.",
+				toolTrace: [],
+				frictionSignals: [],
+				frictionScore: 0,
+			});
 
 			const consolidator = new MemoryConsolidator({
 				memory,
@@ -102,7 +114,7 @@ describe("Memory consolidation, promotion gates, and SUPERSEDE tombstones", () =
 			});
 
 			const report = await consolidator.consolidate(TENANT.tenantId, TENANT.userId);
-			expect(report.processedEpisodeIds).toHaveLength(1);
+			expect(report.processedEpisodeIds).toHaveLength(2);
 			expect(report.rejectedByGate).toHaveLength(2);
 			expect(report.addedIds).toHaveLength(1);
 			expect(report.supersededOldIds).toEqual([oldPref.id]);

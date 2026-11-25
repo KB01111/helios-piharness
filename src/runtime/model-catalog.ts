@@ -9,7 +9,7 @@ import {
 } from "@earendil-works/pi-ai/providers/faux";
 import { googleProvider } from "@earendil-works/pi-ai/providers/google";
 import { openaiProvider } from "@earendil-works/pi-ai/providers/openai";
-import type { AssistantMessage, Message, SystemMessage, TranscriptContext } from "@earendil-works/pi-ai";
+import type { AssistantMessage, Message, SystemMessage, TranscriptContext, Usage } from "@earendil-works/pi-ai";
 import { contentText, getSystemMessageText } from "@earendil-works/pi-ai";
 import { getCurrentSystemPrompt, getCurrentTools } from "@earendil-works/pi-ai/utils/transcript";
 import type { FastModelClient } from "../contracts/app-capabilities.js";
@@ -46,6 +46,10 @@ export interface FastModelClientOptions {
 	readonly deps?: ResilienceDeps;
 	/** Retry / fallback / circuit diagnostics. */
 	readonly onEvent?: (event: ResilienceEvent) => void;
+	/** Called before every `completeJson`; throwing vetoes the call (no provider request, no retry). Used for budgets. */
+	readonly guard?: () => void;
+	/** Called with the usage of every successful provider response (metering for budgets). Must not throw. */
+	readonly onUsage?: (usage: Partial<Usage> & { readonly cost?: { readonly total?: number } }) => void;
 }
 
 /**
@@ -406,6 +410,7 @@ export function createFastModelClient(
 			userPrompt: string,
 			callOptions?: { readonly signal?: AbortSignal },
 		): Promise<{ readonly rawText: string; readonly parsed: T | null }> {
+			options.guard?.();
 			const candidates: ModelCandidate<{ readonly rawText: string; readonly parsed: T | null }>[] = chain.map((ref) => ({
 				key: `${ref.provider}:${ref.modelId}`,
 				provider: ref.provider,
@@ -426,6 +431,14 @@ export function createFastModelClient(
 						const error = new Error("Fast model call aborted");
 						error.name = "AbortError";
 						throw error;
+					}
+					// Meter every provider response that came back, including error responses that still billed tokens.
+					if (response.usage) {
+						try {
+							options.onUsage?.(response.usage);
+						} catch {
+							// metering must never break a completion
+						}
 					}
 					if (response.stopReason === "error") {
 						throw new ModelResponseError(response.errorMessage ?? "Fast model returned an error response");

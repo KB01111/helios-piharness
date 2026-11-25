@@ -695,8 +695,13 @@ export class MemoryConsolidator {
 
 			// Promotion gate for brand-new ADD memories:
 			// Must either be an explicit user preference/constraint OR satisfy evidence/repetition threshold.
-			const evidenceCount = proposal.evidenceCount ?? 1;
-			const distinctConversations = proposal.distinctConversations ?? distinctEpisodeConversations;
+			// The model's claimed counts are untrusted: a count can never exceed what this batch actually contains,
+			// so a hallucinated "evidenceCount": 9 cannot pass the repetition gate on a single episode.
+			const evidenceCount = Math.max(1, Math.min(proposal.evidenceCount ?? 1, episodeIds.length));
+			const distinctConversations = Math.max(
+				1,
+				Math.min(proposal.distinctConversations ?? distinctEpisodeConversations, distinctEpisodeConversations),
+			);
 			const passesRepetitionGate =
 				proposalMatchesExplicitCue(cuePhrases, key, content) ||
 				evidenceCount >= this.gates.minEvidenceCount ||

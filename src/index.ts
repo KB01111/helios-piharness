@@ -4,6 +4,7 @@ import type {
 	ArtifactMetadata,
 	ArtifactReadResult,
 	ArtifactStore,
+	EmbeddingProvider,
 	FastModelClient,
 	FrictionSignal,
 	FrictionSignalKind,
@@ -66,6 +67,7 @@ import {
 	BudgetStore,
 	budgetLimitsFromConfig,
 	createBudgetGatedModels,
+	createFastModelBudget,
 	type BudgetLimits,
 	type UsageRecord,
 } from "./runtime/budget.js";
@@ -153,6 +155,11 @@ import { createHttpServer } from "./transport/http-server.js";
 export interface BootstrapHarnessOptions {
 	readonly config?: Partial<AppConfig>;
 	readonly capabilities?: Partial<AppCapabilities>;
+	/**
+	 * Optional embeddings for hybrid memory retrieval (lexical FTS re-ranked with cosine similarity).
+	 * Ignored when `capabilities.memory` is supplied (configure that service directly).
+	 */
+	readonly embeddingProvider?: EmbeddingProvider;
 	readonly domainStore?: DomainStore;
 	readonly wakeScheduler?: WakeScheduler;
 	readonly now?: () => number;
@@ -218,6 +225,20 @@ export async function bootstrapHarness(options: BootstrapHarnessOptions = {}): P
 	const now = options.now ?? (() => Date.now());
 	const appDb = AppDatabase.open({ dbPath: config.appDbPath });
 
+	// Spend ledger shared by the main-conversation budget extension and the background fast-model budget.
+	const budgetLimits = budgetLimitsFromConfig(config);
+	const budgetStore = new BudgetStore(appDb.db, { now });
+	const fastModelBudget =
+		config.maxFastModelDailyTokens > 0 || config.maxFastModelDailyCostUsd > 0
+			? createFastModelBudget({
+					store: budgetStore,
+					maxDailyTokens: config.maxFastModelDailyTokens,
+					maxDailyCostUsd: config.maxFastModelDailyCostUsd,
+					now,
+					estimateCostUsd: options.budget?.estimateCostUsd,
+				})
+			: undefined;
+
 	const catalog = createModelCatalog({
 		mainModel: config.mainModel,
 		fastModel: config.fastModel,
@@ -227,6 +248,7 @@ export async function bootstrapHarness(options: BootstrapHarnessOptions = {}): P
 			fallbacks: config.fastModelFallbacks,
 			timeoutMs: config.fastModelTimeoutMs,
 			maxRetries: config.fastModelMaxRetries,
+			...(fastModelBudget ? { guard: fastModelBudget.guard, onUsage: fastModelBudget.onUsage } : {}),
 			...options.fastModelResilience,
 			breaker: {
 				failureThreshold: config.circuitBreakerFailureThreshold,
@@ -236,7 +258,12 @@ export async function bootstrapHarness(options: BootstrapHarnessOptions = {}): P
 		},
 	});
 
-	const memory =options.capabilities?.memory ?? new SqliteMemoryService(appDb, { now });
+	const memory =
+		options.capabilities?.memory ??
+		new SqliteMemoryService(appDb, {
+			now,
+			...(options.embeddingProvider ? { embeddingProvider: options.embeddingProvider } : {}),
+		});
 	const artifacts =
 		options.capabilities?.artifacts ??
 		new SqliteArtifactStore(appDb, {
@@ -277,9 +304,7 @@ export async function bootstrapHarness(options: BootstrapHarnessOptions = {}): P
 	);
 	// Budget enforcement runs right after the guard: it vetoes a generation (via the gated Models below)
 	// before any provider call, and meters per-tenant daily spend.
-	const budgetLimits = budgetLimitsFromConfig(config);
 	const budgetGate = new BudgetGate();
-	const budgetStore = new BudgetStore(appDb.db, { now });
 	registryManager.installCoreExtension(
 		createBudgetExtension({
 			store: budgetStore,
@@ -406,8 +431,12 @@ export {
 	BudgetGate,
 	BudgetStore,
 	budgetLimitsFromConfig,
+	createFastModelBudget,
 	evaluateBudget,
+	FastModelBudgetExceededError,
 	UNLIMITED_BUDGET,
+	type FastModelBudget,
+	type FastModelBudgetOptions,
 	type BudgetEventRecord,
 	type BudgetLimits,
 	type BudgetViolation,

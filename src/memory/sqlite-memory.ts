@@ -1402,6 +1402,15 @@ export class SqliteTelemetryStore implements TelemetryStore {
 			this.appDb.db
 				.prepare("DELETE FROM disabled_skills WHERE tenant_id = ? AND skill_name = ?")
 				.run(tenantId, skillName);
+			// Re-enabling starts a fresh evaluation window; otherwise Skill Dojo would immediately disable it again
+			// because the stale `last_used_at` / degraded error rate that caused the original disable is unchanged.
+			this.appDb.db
+				.prepare(
+					`UPDATE skill_metrics
+					 SET calls = 0, successes = 0, errors = 0, total_duration_ms = 0, last_used_at = ?
+					 WHERE tenant_id = ? AND name = ? AND kind = 'skill'`,
+				)
+				.run(nowMs ?? this.now(), tenantId, skillName);
 		}
 	}
 

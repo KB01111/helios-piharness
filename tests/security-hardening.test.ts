@@ -373,23 +373,28 @@ describe("POST /sleep-cycle", () => {
 		expect(ok.status).toBe(202);
 	});
 
-	it("returns the running task instead of starting a duplicate, then allows a new one once it settles", async () => {
+	it("delegates single-flight to the harness (durable, see learning-wiring) and returns its task id", async () => {
 		const { harness, calls, settle } = sleepHarness();
 		const app = createHttpServer(harness, { auth: bearerTokenAuth(KEYS), rateLimit: false, logger: QUIET });
-		const post = () => app.request("/conversations/1/sleep-cycle", { method: "POST", headers: headers("tok-a"), body: "{}" });
+		const post = (query = "") =>
+			app.request(`/conversations/1/sleep-cycle${query}`, { method: "POST", headers: headers("tok-a"), body: "{}" });
 
-		const [first, second] = await Promise.all([post(), post()]);
-		const firstTask = ((await first.json()) as { taskId: string }).taskId;
-		const secondTask = ((await second.json()) as { taskId: string }).taskId;
-		expect(secondTask).toBe(firstTask);
-		expect(calls).toHaveLength(1);
+		const first = await post();
+		expect(first.status).toBe(202);
+		expect(((await first.json()) as { taskId: string }).taskId).toBe("101");
+		expect(calls).toEqual(["1"]);
 
-		settle.splice(0).forEach((fn) => fn());
-		await vi.waitFor(async () => {
-			const third = await post();
-			expect(((await third.json()) as { taskId: string }).taskId).not.toBe(firstTask);
+		// `wait: true` settles through waitTask on the task the harness returned.
+		const waiting = app.request("/conversations/1/sleep-cycle", {
+			method: "POST",
+			headers: headers("tok-a"),
+			body: JSON.stringify({ wait: true }),
 		});
-		expect(calls).toHaveLength(2);
+		await vi.waitFor(() => expect(settle.length).toBe(1));
+		settle.splice(0).forEach((fn) => fn());
+		const settled = await waiting;
+		expect(settled.status).toBe(200);
+		expect(await settled.json()).toMatchObject({ taskId: "102", status: "completed" });
 	});
 });
 

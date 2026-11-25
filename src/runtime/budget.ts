@@ -3,9 +3,9 @@
  *
  * - `evaluateBudget` decides whether the next generation may start.
  * - `BudgetStore` keeps per-tenant daily spend in the app SQLite DB (own tables, created lazily).
- * - Scope: only the MAIN conversation's provider calls are metered and gated. Fast-model spend (memory
- *   consolidation, other `FastModelClient.completeJson` calls) is neither counted toward these limits nor
- *   blocked by them; bound it separately (fast-model timeouts/retries, scheduler limits).
+ * - Scope: the MAIN conversation's provider calls are metered and gated per conversation / tenant-day.
+ *   Fast-model spend (memory consolidation, other `FastModelClient.completeJson` calls) has no conversation
+ *   or tenant, so it is metered into one process-wide daily ledger and gated by `createFastModelBudget`.
  * - `BudgetGate` + `createBudgetGatedModels` let the budget extension veto a provider call cleanly:
  *   the vetoed call yields an error assistant message, which Pi Durable settles as an `unanswered`
  *   submission with reason `model_error` and the budget message as `detail` (never retried, never a crash).
@@ -381,4 +381,77 @@ export function createBudgetGatedModels(models: Models, gate: BudgetGate): Model
 			return typeof value === "function" ? (value as (...a: unknown[]) => unknown).bind(target) : value;
 		},
 	});
+}
+
+// ─── Fast-model (background) budget ──────────────────────────────────────────
+
+/** Pseudo-tenant id under which fast-model spend is recorded in the daily ledger. */
+export const FAST_MODEL_BUDGET_TENANT = "__fast_model__";
+
+export interface FastModelBudgetOptions {
+	readonly store: BudgetStore;
+	/** UTC-day token cap for all fast-model calls (`0` = unlimited). */
+	readonly maxDailyTokens: number;
+	/** UTC-day dollar cap for all fast-model calls (`0` = unlimited). */
+	readonly maxDailyCostUsd: number;
+	readonly now?: () => number;
+	/** Dollar cost of one usage record; default is `usage.cost.total`. */
+	readonly estimateCostUsd?: (usage: UsageRecord) => number;
+}
+
+export class FastModelBudgetExceededError extends Error {
+	readonly code: string;
+	constructor(violation: BudgetViolation) {
+		super(violation.message);
+		this.name = "FastModelBudgetExceededError";
+		this.code = violation.code;
+	}
+}
+
+export interface FastModelBudget {
+	/** Throws {@link FastModelBudgetExceededError} once today's fast-model spend has reached a limit. */
+	guard(): void;
+	/** Adds one response's usage to today's fast-model ledger. */
+	onUsage(usage: UsageRecord): void;
+}
+
+/**
+ * Daily cap on background fast-model spend (consolidation, skill mining, ...). Pair `guard` / `onUsage` with
+ * `FastModelClientOptions`. Like the conversation budget, the call that crosses the line completes and the next is
+ * blocked.
+ */
+export function createFastModelBudget(options: FastModelBudgetOptions): FastModelBudget {
+	const now = options.now ?? (() => Date.now());
+	const estimate = options.estimateCostUsd ?? usageCostUsd;
+	return {
+		guard(): void {
+			const used = options.store.getTenantDaily(FAST_MODEL_BUDGET_TENANT, now());
+			const violation =
+				options.maxDailyTokens > 0 && used.tokens >= options.maxDailyTokens
+					? buildFastModelViolation("tokens", options.maxDailyTokens, used.tokens)
+					: options.maxDailyCostUsd > 0 && used.costUsd >= options.maxDailyCostUsd
+						? buildFastModelViolation("cost_usd", options.maxDailyCostUsd, used.costUsd)
+						: undefined;
+			if (violation) throw new FastModelBudgetExceededError(violation);
+		},
+		onUsage(usage: UsageRecord): void {
+			options.store.recordUsage(FAST_MODEL_BUDGET_TENANT, usageTokens(usage), estimate(usage), now());
+		},
+	};
+}
+
+function buildFastModelViolation(metric: BudgetMetric, limit: number, used: number): BudgetViolation {
+	const code = `fast_model_daily_${metric}`;
+	const envName = metric === "tokens" ? "MAX_FAST_MODEL_DAILY_TOKENS" : "MAX_FAST_MODEL_DAILY_COST_USD";
+	return {
+		scope: "tenant_daily",
+		metric,
+		code,
+		limit,
+		used,
+		message:
+			`BUDGET_EXCEEDED ${code}: out of budget for background fast-model calls today (UTC) ` +
+			`(used ${formatAmount(metric, used)} of ${formatAmount(metric, limit)} allowed). ` +
+			`The request was not sent to the model; raise ${envName} or retry after the daily window resets.`,
+	};
 }

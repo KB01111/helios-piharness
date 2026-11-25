@@ -20,6 +20,7 @@ import type {
 	UsageSummaryView,
 	WatchConversationOptions,
 } from "../contracts/harness-port.js";
+import { clientSafeDetail, clientSafeReason } from "./client-safe.js";
 
 export function entryToView(entry: EntryRecord): TranscriptEntryView {
 	const firstMsg = entry.model?.[0] as Message | undefined;
@@ -117,15 +118,17 @@ function extractLiveView(view: ConversationView): LiveStatusView {
 		turns: live?.run?.turns ?? 0,
 		...(streamingText ? { streamingText } : {}),
 		tools: (live?.tools ?? []).map(slotToView),
-		...(live?.runFailure
-			? {
-					runFailure: {
-						reason: live.runFailure.reason,
-						...(live.runFailure.detail !== undefined ? { detail: live.runFailure.detail } : {}),
-					},
-				}
-			: {}),
+		...(live?.runFailure ? { runFailure: toClientFailure(live.runFailure) } : {}),
 	};
+}
+
+/** Failure text is free-form (provider errors, paths): expose a stable reason code and only budget-veto details. */
+function toClientFailure(failure: { readonly reason: string; readonly detail?: unknown }): {
+	reason: string;
+	detail?: string;
+} {
+	const detail = clientSafeDetail(failure.detail);
+	return { reason: clientSafeReason(failure.reason), ...(detail !== undefined ? { detail } : {}) };
 }
 
 /**
@@ -526,14 +529,7 @@ export function watchConversationEvents(
 							conversationId,
 							busy,
 							turns,
-							...(failure
-								? {
-										failure: {
-											reason: failure.reason,
-											...(failure.detail !== undefined ? { detail: failure.detail } : {}),
-										},
-									}
-								: {}),
+							...(failure ? { failure: toClientFailure(failure) } : {}),
 						});
 					}
 				};

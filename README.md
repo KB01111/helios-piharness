@@ -75,6 +75,7 @@ All settings are read from environment variables (see `.env.example`). Unknown o
 | `HARNESS_STREAM_MAX_QUEUE` | `1000` | Per-stream event buffer; overflow closes the stream with reason `overflow` |
 | `MAX_CONVERSATION_TOKENS` / `MAX_CONVERSATION_COST_USD` | `0` | Per-conversation budget (0 = unlimited) |
 | `MAX_TENANT_DAILY_TOKENS` / `MAX_TENANT_DAILY_COST_USD` | `0` | Per-tenant daily budget (0 = unlimited) |
+| `MAX_FAST_MODEL_DAILY_TOKENS` / `MAX_FAST_MODEL_DAILY_COST_USD` | `0` | Process-wide UTC-day cap on background fast-model calls (consolidation, skill mining). Once reached, calls fail fast with `BUDGET_EXCEEDED` instead of reaching the provider (0 = unlimited) |
 | `DEFAULT_MAX_TURNS` | `24` | Turn cap for conversations that do not set one |
 | `MODEL_TIMEOUT_MS`, `MODEL_MAX_RETRIES`, `MODEL_RETRY_BASE_DELAY_MS` | `120000`, `3`, `2000` | Main-model timeout / durable retry |
 | `FAST_MODEL_TIMEOUT_MS`, `FAST_MODEL_MAX_RETRIES`, `FAST_MODEL_FALLBACKS` | `30000`, `2`, _(unset)_ | Fast-model timeout, retry and fallback chain |
@@ -82,6 +83,10 @@ All settings are read from environment variables (see `.env.example`). Unknown o
 | `ALLOW_MOCK_MODELS` | `false` | Allow mock models when `NODE_ENV=production` (otherwise startup fails) |
 | `SLEEP_CYCLE_CRON_INTERVAL_MS` | `300000` | Periodic sleep-cycle sweep; `0` disables |
 | `SLEEP_CYCLE_SCHEDULER_ENABLED` | `true` | Toggle the sleep-cycle scheduler |
+
+Cost limits (`*_COST_USD`) only bite with a priced model (Pi AI's catalog `usage.cost.total`) or a custom `bootstrapHarness({ budget: { estimateCostUsd } })`; the mock provider always reports zero cost, so use the token limits there.
+
+Embeddings are optional: pass `bootstrapHarness({ embeddingProvider })` to re-rank memory search results by cosine similarity on top of FTS. Core memory frozen into a conversation is refreshed on `resetConversation` and compaction (the prompt prefix is rebuilt then anyway) and stays byte-identical otherwise. Manual `POST /conversations/:id/sleep-cycle` is durably single-flight per conversation, even across restarts.
 
 Admin-only routes: `POST /tool-packs/:name` needs `admin:tool-packs`, `GET /usage` needs `admin:usage` (`*` and `admin:*` also work). Mined skill drafts are written to `skills/_proposed/` and only become active after `promoteProposedSkill()`.
 
