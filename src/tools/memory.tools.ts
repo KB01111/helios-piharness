@@ -1,4 +1,4 @@
-import { int, obj, oneOf, opt, str } from "@earendil-works/pi-schema";
+import { bool, int, obj, oneOf, opt, str } from "@earendil-works/pi-schema";
 import type { MemoryService } from "../contracts/app-capabilities.js";
 import type { ToolPackDefinition } from "../harness/registry.js";
 import {
@@ -13,9 +13,11 @@ import { createTenantScopedTool, defineToolPack } from "./tool-pack.js";
 const MemoryKindSchema = oneOf(["fact", "preference", "procedure", "constraint", "episodic"] as const);
 
 const MemorySearchParams = obj({
-	query: str({ description: "Search keywords or phrase to match against long-term memory." }),
+	query: str({ description: "Search keywords, entities, dates, or natural-language question to match against memory." }),
 	limit: opt(int({ minimum: 1, maximum: 50, description: "Max results to return (default 8)." })),
 	kind: opt(MemoryKindSchema),
+	includeEpisodes: opt(bool({ description: "Also search recent unconsolidated session turns (default true)." })),
+	includeSuperseded: opt(bool({ description: "Include superseded historical versions (auto-detected for historical queries when omitted)." })),
 });
 
 const MemoryPinParams = obj({
@@ -37,13 +39,16 @@ const MemoryForgetParams = obj({
 export function createMemoryToolPack(memory: MemoryService): ToolPackDefinition {
 	const memorySearch = createTenantScopedTool({
 		name: "memory_search",
-		description: "Search long-term user memories using full-text search. Safe to replay.",
+		description:
+			"Search long-term memories (hybrid lexical, semantic, entity-graph multi-hop, temporal) and recent unconsolidated session episodes. Safe to replay.",
 		parameters: MemorySearchParams,
 		replay: "safe",
 		execute: async (args, tenant) => {
 			const results = await memory.search(tenant.tenantId, tenant.userId, args.query, {
 				limit: args.limit ?? 8,
 				...(args.kind ? { kind: args.kind } : {}),
+				includeEpisodes: args.includeEpisodes ?? true,
+				...(args.includeSuperseded !== undefined ? { includeSuperseded: args.includeSuperseded } : {}),
 			});
 			if (results.length === 0) {
 				return {
@@ -53,7 +58,13 @@ export function createMemoryToolPack(memory: MemoryService): ToolPackDefinition 
 			}
 			const lines = results.map((r, i) => {
 				const id = r.memory.id.replace(/[^A-Za-z0-9_-]/g, "");
-				return `${i + 1}. [${id}] (conf=${r.memory.confidence.toFixed(2)}) ${formatMemoryLine(r.memory).slice(2)}`;
+				const tag =
+					r.source === "episode"
+						? " [recent-episode]"
+						: r.memory.status === "superseded"
+							? " [historical]"
+							: "";
+				return `${i + 1}. [${id}]${tag} (conf=${r.memory.confidence.toFixed(2)}) ${formatMemoryLine(r.memory).slice(2)}`;
 			});
 			return {
 				output: [{ type: "text", text: renderUntrustedMemoryBlock(lines) }],

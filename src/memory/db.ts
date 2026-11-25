@@ -10,6 +10,13 @@ interface Migration {
 	readonly version: number;
 	readonly name: string;
 	readonly sql: string;
+	readonly run?: (db: DatabaseSync) => void;
+}
+
+function ensureColumn(db: DatabaseSync, table: string, column: string, definition: string): void {
+	const cols = db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>;
+	if (cols.some((c) => c.name === column)) return;
+	db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition};`);
 }
 
 const MIGRATIONS: readonly Migration[] = [
@@ -181,6 +188,103 @@ const MIGRATIONS: readonly Migration[] = [
 				ON memory_embeddings (tenant_id, user_id, model);
 		`,
 	},
+	{
+		version: 3,
+		name: "memory_graph_temporal_and_utility",
+		sql: `
+			-- Tenant-scoped entity vocabulary extracted deterministically from memory keys & content.
+			CREATE TABLE IF NOT EXISTS memory_entities (
+				id TEXT PRIMARY KEY,
+				tenant_id TEXT NOT NULL,
+				user_id TEXT NOT NULL,
+				canonical_name TEXT NOT NULL,
+				display_name TEXT NOT NULL,
+				entity_type TEXT NOT NULL DEFAULT 'entity',
+				updated_at INTEGER NOT NULL,
+				UNIQUE(tenant_id, user_id, canonical_name)
+			);
+
+			CREATE INDEX IF NOT EXISTS idx_memory_entities_scope
+				ON memory_entities (tenant_id, user_id, canonical_name);
+
+			-- Bipartite links connecting memories to their canonical entities (used for multi-hop PPR).
+			CREATE TABLE IF NOT EXISTS memory_entity_links (
+				memory_id TEXT NOT NULL,
+				entity_id TEXT NOT NULL,
+				tenant_id TEXT NOT NULL,
+				user_id TEXT NOT NULL,
+				weight REAL NOT NULL DEFAULT 1.0,
+				PRIMARY KEY (memory_id, entity_id)
+			);
+
+			CREATE INDEX IF NOT EXISTS idx_memory_entity_links_scope
+				ON memory_entity_links (tenant_id, user_id, entity_id);
+			CREATE INDEX IF NOT EXISTS idx_memory_entity_links_memory
+				ON memory_entity_links (memory_id);
+
+			-- Lightweight bi-temporal entity-to-entity relations backed by supporting memories.
+			CREATE TABLE IF NOT EXISTS memory_relations (
+				id TEXT PRIMARY KEY,
+				tenant_id TEXT NOT NULL,
+				user_id TEXT NOT NULL,
+				source_entity_id TEXT NOT NULL,
+				target_entity_id TEXT NOT NULL,
+				relation TEXT NOT NULL,
+				memory_id TEXT NOT NULL,
+				valid_from INTEGER,
+				valid_until INTEGER,
+				weight REAL NOT NULL DEFAULT 1.0
+			);
+
+			CREATE INDEX IF NOT EXISTS idx_memory_relations_scope
+				ON memory_relations (tenant_id, user_id, source_entity_id);
+			CREATE INDEX IF NOT EXISTS idx_memory_relations_memory
+				ON memory_relations (memory_id);
+
+			-- Explicit calendar/date intervals extracted from memory content for temporal-window search.
+			CREATE TABLE IF NOT EXISTS memory_temporal_anchors (
+				id TEXT PRIMARY KEY,
+				memory_id TEXT NOT NULL,
+				tenant_id TEXT NOT NULL,
+				user_id TEXT NOT NULL,
+				start_ms INTEGER NOT NULL,
+				end_ms INTEGER NOT NULL,
+				precision TEXT NOT NULL,
+				label TEXT NOT NULL
+			);
+
+			CREATE INDEX IF NOT EXISTS idx_memory_temporal_scope
+				ON memory_temporal_anchors (tenant_id, user_id, start_ms, end_ms);
+			CREATE INDEX IF NOT EXISTS idx_memory_temporal_memory
+				ON memory_temporal_anchors (memory_id);
+
+			-- FTS5 index over recent unconsolidated mid-term episodes for immediate session recall.
+			CREATE VIRTUAL TABLE IF NOT EXISTS midterm_episodes_fts USING fts5(
+				episode_id UNINDEXED,
+				tenant_id UNINDEXED,
+				user_id UNINDEXED,
+				user_message,
+				assistant_summary
+			);
+		`,
+		run: (db: DatabaseSync) => {
+			ensureColumn(db, "longterm_memories", "valid_from", "INTEGER");
+			ensureColumn(db, "longterm_memories", "valid_until", "INTEGER");
+			ensureColumn(db, "longterm_memories", "access_count", "INTEGER NOT NULL DEFAULT 0");
+			ensureColumn(db, "longterm_memories", "last_accessed_at", "INTEGER");
+			ensureColumn(db, "longterm_memories", "feedback_weight", "REAL NOT NULL DEFAULT 0.5");
+
+			db.exec(`
+				UPDATE longterm_memories SET valid_from = created_at WHERE valid_from IS NULL;
+				UPDATE longterm_memories SET valid_until = updated_at WHERE status = 'superseded' AND valid_until IS NULL;
+				INSERT INTO midterm_episodes_fts (episode_id, tenant_id, user_id, user_message, assistant_summary)
+				SELECT e.id, e.tenant_id, e.user_id, e.user_message, e.assistant_summary
+				FROM midterm_episodes e
+				WHERE e.consolidated = 0
+				  AND NOT EXISTS (SELECT 1 FROM midterm_episodes_fts f WHERE f.episode_id = e.id);
+			`);
+		},
+	},
 ];
 
 /**
@@ -252,6 +356,7 @@ export class AppDatabase {
 					.get(migration.version);
 				if (already) return;
 				this.db.exec(migration.sql);
+				migration.run?.(this.db);
 				this.db
 					.prepare("INSERT OR IGNORE INTO app_migrations (version, name, applied_at) VALUES (?, ?, ?)")
 					.run(migration.version, migration.name, Date.now());

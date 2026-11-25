@@ -131,7 +131,39 @@ export {
 	type FrictionOptions,
 	type SeverityWeights,
 } from "./memory/friction-signals.js";
-export { DEFAULT_RANKING_WEIGHTS, type RankingOptions, type RankingWeights } from "./memory/retrieval.js";
+export {
+	DEFAULT_RANKING_WEIGHTS,
+	calibrateCosine,
+	calibrateLexicalScore,
+	fuseRetrievalSignals,
+	l2Normalize,
+	type MultiLaneSignals,
+	type RankingOptions,
+	type RankingWeights,
+} from "./memory/retrieval.js";
+export {
+	buildBipartiteGraph,
+	canonicalizeEntityName,
+	extractEntities,
+	extractQueryEntities,
+	extractRelations,
+	runEntityPpr,
+	type BipartiteMemoryGraph,
+	type EntityGraphEdge,
+	type ExtractedEntity,
+	type ExtractedEntityType,
+	type ExtractedRelation,
+	type PprResult,
+} from "./memory/graph.js";
+export {
+	buildRelativeTemporalHints,
+	detectHistoricalIntent,
+	extractTemporalAnchors,
+	scoreTemporalAlignment,
+	type HistoricalIntent,
+	type TemporalAnchor,
+	type TemporalPrecision,
+} from "./memory/temporal.js";
 export {
 	MEMORY_LIMITS,
 	renderUntrustedMemoryBlock,
