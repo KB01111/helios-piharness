@@ -201,19 +201,23 @@ export class RetentionService {
 		const select = this.appDb.db.prepare("SELECT id, file_path FROM artifacts WHERE created_at < ? ORDER BY created_at LIMIT ?");
 		const remove = this.appDb.db.prepare("DELETE FROM artifacts WHERE id = ?");
 		return this.drain(() => {
+			let removed = 0;
 			const rows = select.all(cutoffMs, this.batchSize) as Array<{ id: string; file_path: string | null }>;
 			for (const row of rows) {
-				// Row first: a failed file removal then leaves an orphan file, not a row pointing at nothing.
-				remove.run(row.id);
+				// File first: if removal fails the row stays, so a later sweep retries instead of orphaning the file.
 				if (row.file_path) {
 					try {
 						fs.rmSync(row.file_path, { force: true });
 					} catch (error) {
 						this.onError?.(error);
+						continue;
 					}
 				}
+				remove.run(row.id);
+				removed += 1;
 			}
-			return rows.length;
+			// A full batch of undeletable rows must not spin forever on the same rows.
+			return rows.length > 0 && removed === 0 ? 0 : removed;
 		});
 	}
 

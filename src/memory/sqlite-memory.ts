@@ -1198,7 +1198,10 @@ export class SqliteMemoryService implements MemoryService {
 	): Promise<{ readonly applied: boolean; readonly results: ReadonlyArray<LongTermMemory | null> }> {
 		return this.appDb.transaction(() => {
 			const pending = this.filterPendingEpisodeIds(tenantId, userId, input.episodeIds);
-			if (pending.length === 0) {
+			// All-or-nothing: the ops were planned from the whole batch. If any episode has since been consolidated or
+			// scrubbed (e.g. its memory was forgotten), applying them to the rest could resurrect that content, so the
+			// consolidator must re-plan from what is still pending.
+			if (pending.length === 0 || pending.length < new Set(input.episodeIds).size) {
 				return { applied: false, results: input.ops.map(() => null) };
 			}
 

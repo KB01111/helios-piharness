@@ -35,7 +35,7 @@ describe("secret redactor: JSON and vendor-token gaps", () => {
 
 	it("redacts common vendor tokens", () => {
 		const samples = [
-			"glpat-abcdefghij1234567890",
+			`glpat-${"abcdefghij"}1234567890`,
 			`npm_${"a".repeat(36)}`,
 			`ya29.${"b".repeat(40)}`,
 			`SG.${"c".repeat(22)}.${"d".repeat(43)}`,
@@ -189,5 +189,39 @@ describe("HTTP hardening", () => {
 		});
 		expect(res.status).toBe(200);
 		expect(delivered[0]?.payload).toEqual({ approved: true, reviewer: "alice" });
+	});
+});
+
+describe("review follow-ups", () => {
+	it("redacts quoted passphrases that contain spaces and values past 512 chars", () => {
+		const phrase = redactSecrets('{"password": "correct horse battery staple"}');
+		expect(phrase.text).not.toContain("horse battery");
+		expect(redactSecrets("passphrase='two words here'").text).not.toContain("two words");
+		const long = "z".repeat(1500);
+		expect(redactSecrets(`token=${long}`).text).not.toContain("zzzzzzzzzz");
+	});
+
+	it("does not apply a stale consolidation plan once one of its episodes is gone", async () => {
+		const appDb = AppDatabase.open({ dbPath: ":memory:" });
+		try {
+			const memory = new SqliteMemoryService(appDb);
+			const insert = appDb.db.prepare(
+				`INSERT INTO midterm_episodes (id, tenant_id, user_id, conversation_id, run_id, user_message, assistant_summary,
+				   tool_trace_json, friction_signals_json, consolidated, created_at)
+				 VALUES (?, 't', 'u', 'c', ?, 'm', 's', '[]', '[]', ?, 1)`,
+			);
+			insert.run("ep-live", "r1", 0);
+			insert.run("ep-scrubbed", "r2", 1);
+			const result = await memory.applyConsolidation("t", "u", {
+				ops: [{ op: "ADD", key: "k.resurrected", kind: "fact", content: "forgotten fact", confidence: 0.9 }],
+				episodeIds: ["ep-live", "ep-scrubbed"],
+			});
+			expect(result.applied).toBe(false);
+			expect(await memory.search("t", "u", "forgotten fact")).toEqual([]);
+			// The live episode stays pending so the consolidator can re-plan it.
+			expect(appDb.db.prepare("SELECT consolidated FROM midterm_episodes WHERE id = 'ep-live'").get()).toEqual({ consolidated: 0 });
+		} finally {
+			appDb.close();
+		}
 	});
 });

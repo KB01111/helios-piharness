@@ -110,10 +110,17 @@ export const DEFAULT_SECRET_PATTERNS: readonly SecretPattern[] = [
 		replacement: "$1://$2:[REDACTED:db_credentials]@",
 	},
 	{
+		// Quoted values may contain spaces (passphrases): match up to the closing quote of the same kind.
+		category: "secret_assignment",
+		pattern:
+			/\b(api[_-]?key|access[_-]?token|auth[_-]?token|secret[_-]?key|client[_-]?secret|private[_-]?token|refresh[_-]?token|token|secret|password|passphrase|passwd)(["']?)\s*([:=])\s*(["'])((?:(?!\4)[^\n]){8,4096})\4/gi,
+		replacement: "$1$2$3$4[REDACTED:secret_assignment]$4",
+	},
+	{
 		category: "secret_assignment",
 		pattern:
 			// The key may itself be quoted (JSON: `"password": "..."`), hence the optional quote before the separator.
-			/\b(api[_-]?key|access[_-]?token|auth[_-]?token|secret[_-]?key|client[_-]?secret|private[_-]?token|refresh[_-]?token|token|secret|password|passwd)(["']?)\s*([:=])\s*(["']?)([^\s"'`,;}{]{8,512})\4/gi,
+			/\b(api[_-]?key|access[_-]?token|auth[_-]?token|secret[_-]?key|client[_-]?secret|private[_-]?token|refresh[_-]?token|token|secret|password|passwd)(["']?)\s*([:=])\s*(["']?)([^\s"'`,;}{]{8,4096})\4/gi,
 		replacement: "$1$2$3$4[REDACTED:secret_assignment]$4",
 	},
 ];

@@ -94,12 +94,15 @@ function truncateUtf8HeadTail(text: string, maxBytes: number): { head: string; t
 	return { head, tail };
 }
 
-function summarizeArgs(args: Readonly<Record<string, unknown>> | undefined): string {
+function summarizeArgs(
+	args: Readonly<Record<string, unknown>> | undefined,
+	extraPatterns?: readonly SecretPattern[],
+): string {
 	if (!args || Object.keys(args).length === 0) return "{}";
 	try {
 		// Approval summaries are persisted (pending approvals, audit log) and served over HTTP, so redact BEFORE truncating:
 		// truncating first could cut a secret in half and defeat the pattern.
-		const raw = redactSecrets(JSON.stringify(args)).text;
+		const raw = redactSecrets(JSON.stringify(args), extraPatterns ? { extraPatterns } : undefined).text;
 		return raw.length > 240 ? `${raw.slice(0, 237)}...` : raw;
 	} catch {
 		return "{...}";
@@ -173,6 +176,9 @@ export function createGuardShapingExtension(options: GuardShapingExtensionOption
 					const tenantId = tenant?.tenantId ?? "default";
 					const userId = tenant?.userId ?? "anonymous";
 
+					const redactAuditText = (text: string): string =>
+						redactSecrets(text, options.extraRedactionPatterns ? { extraPatterns: options.extraRedactionPatterns } : undefined).text;
+
 					const recordAudit = (
 						tier: "allow" | "ask" | "deny",
 						decision: "allowed" | "blocked" | "approval_requested" | "approved" | "denied" | "expired",
@@ -189,7 +195,8 @@ export function createGuardShapingExtension(options: GuardShapingExtensionOption
 								toolName: call.name,
 								tier,
 								decision,
-								...(reason ? { reason } : {}),
+								// Reasons can carry approver notes or policy text: persist them redacted, like approval summaries.
+								...(reason ? { reason: redactAuditText(reason) } : {}),
 								...(reviewer ? { reviewer } : {}),
 								createdAt: api.now(),
 							});
@@ -261,7 +268,7 @@ export function createGuardShapingExtension(options: GuardShapingExtensionOption
 
 						// No decision yet: record pending gate approval and durably park before tool executes
 						const createdAt = api.now();
-						const summary = `${policyDecision.reason ?? `Approve execution of "${call.name}"`} args=${summarizeArgs(callArgs)}`;
+						const summary = `${policyDecision.reason ?? `Approve execution of "${call.name}"`} args=${summarizeArgs(callArgs, options.extraRedactionPatterns)}`;
 						try {
 							auditStore?.upsertPendingGateApproval({
 								taskId: String(api.taskId),

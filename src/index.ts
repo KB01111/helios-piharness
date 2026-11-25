@@ -665,6 +665,7 @@ export async function bootstrapHarness(options: BootstrapHarnessOptions = {}): P
 			appDb,
 			now,
 			intervalMs: config.retentionIntervalMs,
+			...options.retention,
 			policy: {
 				permissionAuditDays: config.retentionPermissionAuditDays,
 				toolInvocationDays: config.retentionToolInvocationDays,
@@ -672,14 +673,18 @@ export async function bootstrapHarness(options: BootstrapHarnessOptions = {}): P
 				budgetEventDays: config.retentionBudgetEventDays,
 				budgetDailyDays: config.retentionBudgetDailyDays,
 				artifactDays: config.retentionArtifactDays,
+				// Field-by-field: a partial override must not reset the other configured windows to defaults.
+				...(options.retention ? options.retention.policy : undefined),
 			},
-			onReport: (report) => {
-				if (report.totalDeleted > 0 || report.errors.length > 0) {
-					retentionLogger.info("retention_sweep", { deleted: report.deleted, errors: report.errors });
-				}
-			},
-			onError: (error) => retentionLogger.warn("retention_error", { error: serializeError(error) }),
-			...(options.retention ? options.retention : {}),
+			onReport:
+				options.retention?.onReport ??
+				((report) => {
+					if (report.totalDeleted > 0 || report.errors.length > 0) {
+						retentionLogger.info("retention_sweep", { deleted: report.deleted, errors: report.errors });
+					}
+				}),
+			onError:
+				options.retention?.onError ?? ((error) => retentionLogger.warn("retention_error", { error: serializeError(error) })),
 		});
 		retention.start();
 	}
