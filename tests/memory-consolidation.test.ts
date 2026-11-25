@@ -31,11 +31,14 @@ describe("Memory consolidation, promotion gates, and SUPERSEDE tombstones", () =
 			const memory = new SqliteMemoryService(appDb);
 
 			// Seed initial active preference
-			const oldPref = await memory.pinMemory(TENANT.tenantId, TENANT.userId, {
+			// Seeded unpinned: pinned memories are protected from model-originated mutations (see below).
+			const oldPref = (await memory.applyMemoryMutation(TENANT.tenantId, TENANT.userId, {
+				op: "ADD",
 				key: "user.package_manager",
 				content: "Prefer npm for JavaScript packages",
 				kind: "preference",
-			});
+				confidence: 0.9,
+			}))!;
 
 			// Record an unconsolidated episode expressing a contradictory preference + noisy one-off facts
 			await memory.recordEpisode({
@@ -48,6 +51,18 @@ describe("Memory consolidation, promotion gates, and SUPERSEDE tombstones", () =
 				toolTrace: [],
 				frictionSignals: [],
 				frictionScore: 3,
+			});
+			// A second conversation backs the repeated-evidence claim below (claimed counts are clamped to the batch).
+			await memory.recordEpisode({
+				tenantId: TENANT.tenantId,
+				userId: TENANT.userId,
+				conversationId: "conv-2",
+				runId: "run-2",
+				userMessage: "Please run the repo tests again.",
+				assistantSummary: "Ran vitest run.",
+				toolTrace: [],
+				frictionSignals: [],
+				frictionScore: 0,
 			});
 
 			const consolidator = new MemoryConsolidator({
@@ -99,7 +114,7 @@ describe("Memory consolidation, promotion gates, and SUPERSEDE tombstones", () =
 			});
 
 			const report = await consolidator.consolidate(TENANT.tenantId, TENANT.userId);
-			expect(report.processedEpisodeIds).toHaveLength(1);
+			expect(report.processedEpisodeIds).toHaveLength(2);
 			expect(report.rejectedByGate).toHaveLength(2);
 			expect(report.addedIds).toHaveLength(1);
 			expect(report.supersededOldIds).toEqual([oldPref.id]);
@@ -147,11 +162,13 @@ describe("Memory consolidation, promotion gates, and SUPERSEDE tombstones", () =
 		});
 
 		try {
-			const original = await runtime.capabilities.memory.pinMemory(TENANT.tenantId, TENANT.userId, {
+			const original = (await runtime.capabilities.memory.applyMemoryMutation(TENANT.tenantId, TENANT.userId, {
+				op: "ADD",
 				key: "user.theme",
 				content: "Light mode",
 				kind: "preference",
-			});
+				confidence: 0.9,
+			}))!;
 
 			const conv = await runtime.harness.createConversation({ tenant: TENANT });
 			runtime.testModel.enqueueMain({ type: "text", text: "Got it, switching to dark mode." });

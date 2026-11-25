@@ -4,6 +4,7 @@ import {
 	AssistantEntry,
 	type Conversation,
 	type ConversationId,
+	type Cursor,
 	type EntryId,
 	type Harness,
 	type SignalToken,
@@ -28,18 +29,24 @@ import type {
 	ToolPackSummary,
 	TranscriptEntryView,
 	UsageSummaryView,
+	WatchConversationOptions,
 } from "../contracts/harness-port.js";
-import { validateTenantContext } from "../contracts/tenant-context.js";
+import { NotFoundError, ValidationError } from "../contracts/errors.js";
+import { canAccessConversation, validateTenantContext, type TenantContext } from "../contracts/tenant-context.js";
+import { createLogger, serializeError, type Logger } from "../logger.js";
 import { formatFrozenSkillsIndex, loadSkillCatalog } from "../extensions/skills-loader.ext.js";
 import type { SleepCycleCheckpoint, SleepCycleInput, SleepCycleResult } from "../extensions/sleep-cycle.ext.js";
+import { clientSafeDetail, clientSafeReason } from "../runtime/client-safe.js";
 import type { HostRuntime } from "../runtime/host-runtime.js";
 import { entryToView, usageToView, watchConversationEvents } from "../runtime/stream-adapter.js";
 import {
 	ConversationMetaDoc,
+	type ConversationMetaState,
 	PendingApprovalsDoc,
 	deserializeTenantFromDoc,
 	formatFrozenCoreMemory,
 	listApprovalsFromDoc,
+	refreshFrozenCoreMemory,
 	serializeTenantForDoc,
 } from "./app-documents.js";
 import type { HarnessRegistryManager } from "./registry.js";
@@ -47,12 +54,17 @@ import type { HarnessRegistryManager } from "./registry.js";
 function parseId<T extends number>(raw: string, label: string): T {
 	const parsed = Number.parseInt(raw, 10);
 	if (!Number.isSafeInteger(parsed) || parsed <= 0 || String(parsed) !== raw.trim()) {
-		throw new Error(`Invalid ${label} "${raw}"`);
+		throw new ValidationError(`Invalid ${label} "${raw}"`);
 	}
 	return parsed as T;
 }
 
+/** Cap on the unscoped (all-conversation) approvals listing. */
+const DEFAULT_APPROVALS_LIMIT = 500;
+
 export interface ConversationServiceOptions {
+	/** Server-side diagnostics sink for error details that are deliberately withheld from clients. */
+	readonly logger?: Logger;
 	readonly hostRuntime: HostRuntime;
 	readonly registryManager: HarnessRegistryManager;
 	readonly capabilities: AppCapabilities;
@@ -80,8 +92,14 @@ export class ConversationService implements HarnessPort {
 	private readonly signalMap = new Map<string, SignalToken<unknown>>();
 	private readonly now: () => number;
 	private readonly onClose?: () => Promise<void> | void;
+	private readonly logger: Logger;
+	/** Conversation id -> owning tenant, built incrementally for tenant-scoped approval listings. */
+	private readonly tenantIndex = new Map<number, ConversationMetaState["tenant"]>();
+	private tenantIndexHighWater = 0;
+	private tenantIndexSync: Promise<void> | undefined;
 
 	constructor(options: ConversationServiceOptions) {
+		this.logger = options.logger ?? createLogger({ level: "warn", base: { component: "conversation-service" } });
 		this.hostRuntime = options.hostRuntime;
 		this.harness = options.hostRuntime.harness;
 		this.registryManager = options.registryManager;
@@ -177,13 +195,21 @@ export class ConversationService implements HarnessPort {
 		atEntryId: string,
 		overrides?: Partial<CreateConversationInput>,
 	): Promise<ConversationInfo> {
+		// `overrides.tenant` is the authenticated CALLER. It must be allowed to access the parent (same tenant and
+		// same user, or admin:conversations) and becomes the child's identity. The parent's stored permissions are
+		// never copied to a different principal.
+		if (overrides?.tenant) {
+			validateTenantContext(overrides.tenant);
+			await this.assertConversationOwner(overrides.tenant, conversationId);
+		}
 		const parent = await this.requireConversation(conversationId);
 		const entryId = parseId<EntryId>(atEntryId, "atEntryId");
 		const parentMeta = await this.harness.snapshot(ConversationMetaDoc, parent.id, BACKGROUND_CONTEXT);
-
-		if (overrides?.tenant) {
-			validateTenantContext(overrides.tenant);
+		if (!parentMeta) {
+			throw new NotFoundError(`Conversation "${conversationId}" not found`);
 		}
+		// No caller supplied (trusted embedders such as the eval replay runner): inherit the parent's identity.
+		const childTenant = serializeTenantForDoc(overrides?.tenant ?? deserializeTenantFromDoc(parentMeta));
 
 		const selectedExtensions = overrides?.enabledToolPacks
 			? this.registryManager.resolveConversationExtensionSelection(overrides.enabledToolPacks)
@@ -209,9 +235,7 @@ export class ConversationService implements HarnessPort {
 						conversationId,
 						entryId: atEntryId,
 					};
-					if (overrides?.tenant) {
-						doc.tenant = serializeTenantForDoc(overrides.tenant);
-					}
+					doc.tenant = childTenant;
 					if (overrides?.enabledToolPacks) {
 						doc.enabledToolPacks = [...overrides.enabledToolPacks];
 					}
@@ -263,7 +287,7 @@ export class ConversationService implements HarnessPort {
 		const id = parseId<SubmissionId>(submissionId, "submissionId");
 		const submission = await this.harness.submission(id, ctx);
 		if (!submission) {
-			throw new Error(`Submission "${submissionId}" not found`);
+			throw new NotFoundError(`Submission "${submissionId}" not found`);
 		}
 
 		const settled = await submission.wait(ctx);
@@ -285,12 +309,27 @@ export class ConversationService implements HarnessPort {
 			};
 		}
 
+		if (settled.status === "unanswered") {
+			// Free-text reason/detail can carry provider errors, paths or SQL: log them, return a stable code only.
+			this.logger.warn("submission_unanswered", {
+				submissionId: String(settled.id),
+				conversationId,
+				reason: settled.reason,
+				detail: settled.detail,
+			});
+			const detail = clientSafeDetail(settled.detail);
+			return {
+				submissionId: String(settled.id),
+				conversationId,
+				status: "unanswered",
+				reason: clientSafeReason(settled.reason),
+				...(detail !== undefined ? { detail } : {}),
+			};
+		}
 		return {
 			submissionId: String(settled.id),
 			conversationId,
 			status: settled.status,
-			...(settled.status === "unanswered" ? { reason: settled.reason } : {}),
-			...(settled.status === "unanswered" && settled.detail !== undefined ? { detail: settled.detail } : {}),
 		};
 	}
 
@@ -306,24 +345,59 @@ export class ConversationService implements HarnessPort {
 
 	async resetConversation(conversationId: string, handoff?: string): Promise<void> {
 		const conv = await this.requireConversation(conversationId);
+		await this.refreshFrozenCore(conv);
 		await conv.reset(handoff, BACKGROUND_CONTEXT);
+	}
+
+	/**
+	 * Reset and compaction already rewrite the visible history (so the prompt-cache prefix is rebuilt anyway):
+	 * the cheapest moment to pick up memories consolidated since the conversation started. A no-op when the
+	 * rendered core memory is unchanged, and never allowed to fail the reset/compaction itself.
+	 */
+	private async refreshFrozenCore(conv: Conversation): Promise<void> {
+		try {
+			const meta = await this.harness.snapshot(ConversationMetaDoc, conv.id, BACKGROUND_CONTEXT);
+			if (!meta) return;
+			const patch = await refreshFrozenCoreMemory(this.capabilities.memory, meta.tenant, meta, this.now());
+			if (!patch.changed) return;
+			await conv.commit(async (tx) => {
+				const doc = await tx.doc(ConversationMetaDoc, conv.id);
+				doc.frozenCoreMemory = patch.frozenCoreMemory;
+				doc.frozenCoreMemoryAt = patch.frozenCoreMemoryAt;
+			}, BACKGROUND_CONTEXT);
+		} catch (error) {
+			this.logger.warn("frozen_core_memory_refresh_failed", {
+				conversationId: String(conv.id),
+				error: serializeError(error),
+			});
+		}
+	}
+
+	async startCompaction(conversationId: string, instructions?: string): Promise<{ readonly taskId: string }> {
+		const conv = await this.requireConversation(conversationId);
+		await this.refreshFrozenCore(conv);
+		const taskId = await conv.compact(instructions, BACKGROUND_CONTEXT);
+		return { taskId: String(taskId) };
 	}
 
 	async compactConversation(
 		conversationId: string,
 		instructions?: string,
+		signal?: AbortSignal,
 	): Promise<{ readonly taskId: string; readonly compacted: boolean }> {
+		const ctx = signal ? withAbortSignal(signal, BACKGROUND_CONTEXT) : BACKGROUND_CONTEXT;
 		const conv = await this.requireConversation(conversationId);
-		const taskId = await conv.compact(instructions, BACKGROUND_CONTEXT);
-		const settled = await this.harness.waitForTask(taskId, BACKGROUND_CONTEXT);
+		await this.refreshFrozenCore(conv);
+		const taskId = await conv.compact(instructions, ctx);
+		const settled = await this.harness.waitForTask(taskId, ctx);
 		if (settled.state.outcome.status !== "completed") {
 			return { taskId: String(taskId), compacted: false };
 		}
 		const result = settled.state.outcome.result;
 		if (result.submissionId !== undefined) {
-			const sub = await this.harness.submission(result.submissionId, BACKGROUND_CONTEXT);
+			const sub = await this.harness.submission(result.submissionId, ctx);
 			if (sub) {
-				const placed = await sub.wait(BACKGROUND_CONTEXT);
+				const placed = await sub.wait(ctx);
 				return { taskId: String(taskId), compacted: placed.status === "done" };
 			}
 		}
@@ -340,24 +414,138 @@ export class ConversationService implements HarnessPort {
 		return { status };
 	}
 
-	async listPendingApprovals(conversationId?: string): Promise<PendingApproval[]> {
+	async listPendingApprovals(
+		conversationId?: string,
+		options?: { readonly tenantId?: string; readonly tenant?: TenantContext; readonly limit?: number },
+	): Promise<PendingApproval[]> {
+		const caller = options?.tenant;
+		const tenantId = caller?.tenantId ?? options?.tenantId;
+		const limit = Math.max(1, options?.limit ?? DEFAULT_APPROVALS_LIMIT);
+		/** Tenant check always precedes loading the approvals doc, so other tenants' docs are never read. */
+		const mayAccess = (meta: { readonly tenant: ConversationMetaState["tenant"] }): boolean => {
+			if (caller) return canAccessConversation(caller, meta.tenant);
+			return tenantId === undefined || meta.tenant.tenantId === tenantId;
+		};
+
 		if (conversationId !== undefined) {
+			if (caller) await this.assertConversationOwner(caller, conversationId);
+			else if (tenantId !== undefined) await this.assertTenantOwnsConversation(tenantId, conversationId);
 			const id = parseId<ConversationId>(conversationId, "conversationId");
 			const doc = await this.harness.snapshot(PendingApprovalsDoc, id, BACKGROUND_CONTEXT);
-			return listApprovalsFromDoc(doc);
+			return listApprovalsFromDoc(doc).slice(0, limit);
 		}
 
-		const page = await this.harness.commit(
-			(tx) => tx.scanConversations({ order: "ascending" }, 200),
-			BACKGROUND_CONTEXT,
-		);
 		const results: PendingApproval[] = [];
-		for (const conv of page.items) {
-			const doc = await this.harness.snapshot(PendingApprovalsDoc, conv.id, BACKGROUND_CONTEXT);
-			results.push(...listApprovalsFromDoc(doc));
+
+		if (tenantId !== undefined) {
+			// Tenant-scoped: consult the incremental conversation->tenant index so only this tenant's conversations
+			// have their approvals document read (no per-request meta read of every conversation in the system).
+			await this.syncTenantIndex();
+			// Oldest conversation first, matching the unscoped scan order.
+			for (const rawId of [...this.tenantIndex.keys()].sort((a, b) => a - b)) {
+				const owner = this.tenantIndex.get(rawId);
+				if (!owner || !mayAccess({ tenant: owner })) continue;
+				const doc = await this.harness.snapshot(PendingApprovalsDoc, rawId as ConversationId, BACKGROUND_CONTEXT);
+				results.push(...listApprovalsFromDoc(doc));
+				if (results.length >= limit) break;
+			}
+			results.sort((a, b) => a.createdAt - b.createdAt);
+			return results.slice(0, limit);
 		}
+
+		// Trusted embedders with no tenant filter: scan everything.
+		let cursor: Cursor | undefined;
+		scan: do {
+			const after = cursor;
+			const page = await this.harness.commit(
+				(tx) => tx.scanConversations({ order: "ascending" }, 200, after),
+				BACKGROUND_CONTEXT,
+			);
+			for (const conv of page.items) {
+				const doc = await this.harness.snapshot(PendingApprovalsDoc, conv.id, BACKGROUND_CONTEXT);
+				results.push(...listApprovalsFromDoc(doc));
+				if (results.length >= limit) break scan;
+			}
+			cursor = page.next;
+		} while (cursor !== undefined);
 		results.sort((a, b) => a.createdAt - b.createdAt);
-		return results;
+		return results.slice(0, limit);
+	}
+
+	/**
+	 * Brings the in-memory conversation->tenant index up to date. Conversation ids only grow, so a newest-first scan
+	 * stops at the first id that is already indexed: steady-state cost is one page read, not a full scan. Concurrent
+	 * callers share one in-flight sync.
+	 */
+	private syncTenantIndex(): Promise<void> {
+		this.tenantIndexSync ??= this.runTenantIndexSync().finally(() => {
+			this.tenantIndexSync = undefined;
+		});
+		return this.tenantIndexSync;
+	}
+
+	private async runTenantIndexSync(): Promise<void> {
+		const known = this.tenantIndexHighWater;
+		let newest = known;
+		let cursor: Cursor | undefined;
+		scan: do {
+			const after = cursor;
+			const page = await this.harness.commit(
+				(tx) => tx.scanConversations({ order: "descending" }, 200, after),
+				BACKGROUND_CONTEXT,
+			);
+			for (const conv of page.items) {
+				const id = Number(conv.id);
+				if (id <= known) break scan;
+				const meta = await this.harness.snapshot(ConversationMetaDoc, conv.id, BACKGROUND_CONTEXT);
+				if (meta) this.tenantIndex.set(id, meta.tenant);
+				newest = Math.max(newest, id);
+			}
+			cursor = page.next;
+		} while (cursor !== undefined);
+		this.tenantIndexHighWater = newest;
+	}
+
+	async assertConversationOwner(caller: TenantContext, conversationId: string): Promise<void> {
+		const meta = await this.loadMetaIfExists(conversationId);
+		if (!meta || !canAccessConversation(caller, meta.tenant)) {
+			throw new NotFoundError(`Conversation "${conversationId}" not found`);
+		}
+	}
+
+	/** Tenant-wide ownership check for trusted embedders that only know a tenant id (no user). */
+	private async assertTenantOwnsConversation(tenantId: string, conversationId: string): Promise<void> {
+		const meta = await this.loadMetaIfExists(conversationId);
+		if (!meta || meta.tenant.tenantId !== tenantId) {
+			throw new NotFoundError(`Conversation "${conversationId}" not found`);
+		}
+	}
+
+	private async loadMetaIfExists(conversationId: string): Promise<Readonly<ConversationMetaState> | undefined> {
+		let id: ConversationId;
+		try {
+			id = parseId<ConversationId>(conversationId, "conversationId");
+		} catch {
+			return undefined;
+		}
+		const meta = await this.harness.snapshot(ConversationMetaDoc, id, BACKGROUND_CONTEXT);
+		if (!meta) return undefined;
+		const conv = await this.harness.conversation(id, BACKGROUND_CONTEXT);
+		return conv ? meta : undefined;
+	}
+
+	async assertTaskOwner(caller: TenantContext, taskId: string): Promise<void> {
+		let id: TaskId;
+		try {
+			id = parseId<TaskId>(taskId, "taskId");
+		} catch {
+			throw new NotFoundError(`Task "${taskId}" not found`);
+		}
+		const task = await this.harness.getTask(id, BACKGROUND_CONTEXT);
+		if (!task) throw new NotFoundError(`Task "${taskId}" not found`);
+		await this.assertConversationOwner(caller, String(task.conversationId)).catch(() => {
+			throw new NotFoundError(`Task "${taskId}" not found`);
+		});
 	}
 
 	async triggerSleepCycle(
@@ -365,18 +553,26 @@ export class ConversationService implements HarnessPort {
 		options?: { readonly reason?: string },
 	): Promise<{ readonly taskId: string }> {
 		const conv = await this.requireConversation(conversationId);
-		const taskId = await conv.commit(
-			(tx) =>
-				tx.createTask(
-					this.sleepCycleTask,
-					{ reason: options?.reason ?? "manual", staleSkillDays: null },
-					{
-						ownership: { kind: "conversation" },
-						background: true,
-					},
-				),
-			BACKGROUND_CONTEXT,
-		);
+		// Durable single-flight: the lookup and the create share one transaction, so concurrent callers (and other
+		// processes / restarts) reuse a live cycle for this conversation instead of starting a duplicate.
+		const taskId = await conv.commit(async (tx) => {
+			const recent = await tx.scanTasks(
+				{ conversationId: conv.id, kind: this.sleepCycleTask.definition.name, order: "descending" },
+				10,
+			);
+			const live = recent.items.find(
+				(task) => task.state.status !== "terminal" && task.state.status !== "completing",
+			);
+			if (live) return live.id;
+			return tx.createTask(
+				this.sleepCycleTask,
+				{ reason: options?.reason ?? "manual", staleSkillDays: null },
+				{
+					ownership: { kind: "conversation" },
+					background: true,
+				},
+			);
+		}, BACKGROUND_CONTEXT);
 		this.hostRuntime.resume();
 		return { taskId: String(taskId) };
 	}
@@ -393,26 +589,45 @@ export class ConversationService implements HarnessPort {
 				result: outcome.result,
 			};
 		}
+		// Internal error text (provider errors, paths, SQL) is logged, never returned to clients.
 		if (outcome.status === "failed" || outcome.status === "faulted") {
+			this.logger.error("task_settled_with_error", {
+				taskId: String(settled.id),
+				status: outcome.status,
+				error: serializeError(outcome.error),
+			});
 			return {
 				taskId: String(settled.id),
 				status: outcome.status,
-				error: outcome.error.message,
+				error: outcome.status === "failed" ? "Task failed" : "Task faulted",
+				errorCode: `task_${outcome.status}`,
 			};
+		}
+		if (outcome.reason) {
+			this.logger.warn("task_settled_without_completion", {
+				taskId: String(settled.id),
+				status: outcome.status,
+				reason: outcome.reason,
+			});
 		}
 		return {
 			taskId: String(settled.id),
 			status: outcome.status,
-			...(outcome.reason ? { error: outcome.reason } : {}),
+			error: outcome.status === "aborted" ? "Task aborted" : "Task orphaned",
+			errorCode: `task_${outcome.status}`,
 		};
 	}
 
-	watchConversation(conversationId: string, signal?: AbortSignal): AsyncIterable<HarnessEvent> {
+	watchConversation(
+		conversationId: string,
+		signal?: AbortSignal,
+		options?: WatchConversationOptions,
+	): AsyncIterable<HarnessEvent> {
 		const self = this;
 		return {
 			async *[Symbol.asyncIterator](): AsyncGenerator<HarnessEvent> {
 				const conv = await self.requireConversation(conversationId);
-				for await (const event of watchConversationEvents(conv, signal)) {
+				for await (const event of watchConversationEvents(conv, signal, options)) {
 					yield event;
 				}
 			},
@@ -464,7 +679,7 @@ export class ConversationService implements HarnessPort {
 		const id = parseId<ConversationId>(conversationId, "conversationId");
 		const conv = await this.harness.conversation(id, BACKGROUND_CONTEXT);
 		if (!conv) {
-			throw new Error(`Conversation "${conversationId}" not found`);
+			throw new NotFoundError(`Conversation "${conversationId}" not found`);
 		}
 		return conv;
 	}

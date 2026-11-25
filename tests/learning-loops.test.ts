@@ -18,6 +18,7 @@ import {
 	type EvalCase,
 	type TenantContext,
 } from "../src/index.js";
+import { trustedHeadersAuth } from "../src/transport/auth.js";
 
 const TENANT: TenantContext = {
 	tenantId: "tenant-learn",
@@ -318,13 +319,19 @@ describe("Learning loops (Friction, Skill Dojo, Skill Forge, SIM Log, Replay Eva
 			expect(cmp.nonRegressing).toBe(true);
 
 			// Thin Hono HTTP transport smoke test (wraps HarnessPort only)
-			const app = createHttpServer(runtime.harness);
+			const app = createHttpServer(runtime.harness, { auth: trustedHeadersAuth() });
+			const authHeaders = {
+				"content-type": "application/json",
+				"x-tenant-id": TENANT.tenantId,
+				"x-user-id": TENANT.userId,
+				"x-permissions": [...TENANT.permissions, "admin:tool-packs"].join(","),
+			};
 			const healthRes = await app.request("/health");
 			expect(healthRes.status).toBe(200);
 
 			const createRes = await app.request("/conversations", {
 				method: "POST",
-				headers: { "content-type": "application/json" },
+				headers: authHeaders,
 				body: JSON.stringify({ tenant: TENANT }),
 			});
 			expect(createRes.status).toBe(201);
@@ -333,7 +340,7 @@ describe("Learning loops (Friction, Skill Dojo, Skill Forge, SIM Log, Replay Eva
 			runtime.testModel.enqueueMain({ type: "text", text: "HTTP response OK" });
 			const msgRes = await app.request(`/conversations/${created.conversationId}/messages`, {
 				method: "POST",
-				headers: { "content-type": "application/json" },
+				headers: authHeaders,
 				body: JSON.stringify({ content: "Ping over HTTP", wait: true, requestId: "http-1" }),
 			});
 			expect(msgRes.status).toBe(200);
@@ -344,7 +351,7 @@ describe("Learning loops (Friction, Skill Dojo, Skill Forge, SIM Log, Replay Eva
 			// ToolPack toggling over HTTP
 			const toggleRes = await app.request("/tool-packs/example-domain", {
 				method: "POST",
-				headers: { "content-type": "application/json" },
+				headers: authHeaders,
 				body: JSON.stringify({ enabled: false }),
 			});
 			expect(toggleRes.status).toBe(200);

@@ -133,7 +133,10 @@ export interface TaskSettlementView {
 	readonly taskId: string;
 	readonly status: "completed" | "failed" | "aborted" | "orphaned" | "faulted";
 	readonly result?: unknown;
+	/** Generic, client-safe message. Internal error text is logged server-side and never returned. */
 	readonly error?: string;
+	/** Stable machine-readable code (e.g. `task_failed`) present whenever `error` is. */
+	readonly errorCode?: string;
 }
 
 export type HarnessEvent =
@@ -184,12 +187,36 @@ export type HarnessEvent =
 	| {
 			readonly type: "stream_closed";
 			readonly conversationId: string;
-			readonly reason: string;
+			readonly reason: StreamCloseReason;
 	  };
+
+/**
+ * Why a watch stream ended. `overflow` means the consumer was too slow and the bounded event queue
+ * overflowed: the client should reconnect (resuming via `afterEntryId` / `Last-Event-ID`).
+ */
+export type StreamCloseReason = "stopped" | "aborted" | "ended" | "listener_error" | "failed" | "overflow";
+
+/** Options for `HarnessPort.watchConversation`. */
+export interface WatchConversationOptions {
+	/**
+	 * Resume cursor: the initial `snapshot` only carries transcript entries whose id is greater than this
+	 * (live status + usage are always included). Unparseable or unknown ids fall back to a full snapshot.
+	 * Transports should use `entry_appended` entry ids as SSE ids and feed `Last-Event-ID` back here.
+	 */
+	readonly afterEntryId?: string;
+	/** Max buffered events per stream before it is closed with reason "overflow" (default 1000). */
+	readonly maxQueueSize?: number;
+}
 
 export interface HarnessPort {
 	createConversation(input: CreateConversationInput): Promise<ConversationInfo>;
 	getConversation(conversationId: string): Promise<ConversationInfo | undefined>;
+	/**
+	 * Forks a conversation. `overrides.tenant` is the CALLER's authenticated context: the child is owned by (and runs
+	 * with the permissions of) the caller, never the parent's stored identity, and the caller must be allowed to
+	 * access the parent (same tenant and same user, or `admin:conversations`). When omitted (trusted embedders such
+	 * as eval runners) the child inherits the parent's tenant.
+	 */
 	forkConversation(
 		conversationId: string,
 		atEntryId: string,
@@ -205,10 +232,29 @@ export interface HarnessPort {
 	compactConversation(
 		conversationId: string,
 		instructions?: string,
+		signal?: AbortSignal,
 	): Promise<{ readonly taskId: string; readonly compacted: boolean }>;
+	/** Non-blocking compaction: starts the compaction task and returns its id immediately. */
+	startCompaction(conversationId: string, instructions?: string): Promise<{ readonly taskId: string }>;
 
 	deliverSignal(input: SignalDeliveryInput): Promise<SignalDeliveryResult>;
-	listPendingApprovals(conversationId?: string): Promise<PendingApproval[]>;
+	/**
+	 * `options.tenant` (the authenticated caller) restricts results to conversations the caller may access
+	 * (same tenant and same user, or `admin:conversations`). `options.tenantId` restricts to a whole tenant (trusted
+	 * embedders). Unscoped listing across the all-conversation scan is capped at `options.limit` (default 500).
+	 */
+	listPendingApprovals(
+		conversationId?: string,
+		options?: { readonly tenantId?: string; readonly tenant?: TenantContext; readonly limit?: number },
+	): Promise<PendingApproval[]>;
+
+	/**
+	 * Ownership guards. Throw `NotFoundError` (never a distinct "forbidden") when the conversation/task does not
+	 * exist, belongs to another tenant, or belongs to another user of the same tenant (unless the caller holds
+	 * `admin:conversations` / `admin:*` / `*`), so existence is not leaked.
+	 */
+	assertConversationOwner(caller: TenantContext, conversationId: string): Promise<void>;
+	assertTaskOwner(caller: TenantContext, taskId: string): Promise<void>;
 
 	triggerSleepCycle(
 		conversationId: string,
@@ -216,7 +262,11 @@ export interface HarnessPort {
 	): Promise<{ readonly taskId: string }>;
 	waitTask(taskId: string, signal?: AbortSignal): Promise<TaskSettlementView>;
 
-	watchConversation(conversationId: string, signal?: AbortSignal): AsyncIterable<HarnessEvent>;
+	watchConversation(
+		conversationId: string,
+		signal?: AbortSignal,
+		options?: WatchConversationOptions,
+	): AsyncIterable<HarnessEvent>;
 
 	setToolPackEnabled(packName: string, enabled: boolean): void;
 	listToolPacks(): readonly ToolPackSummary[];

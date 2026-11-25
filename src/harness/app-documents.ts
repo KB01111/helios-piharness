@@ -1,8 +1,9 @@
 import type { JsonObject } from "@earendil-works/pi-durable";
 import { defineDoc } from "@earendil-works/pi-durable";
-import type { LongTermMemory } from "../contracts/app-capabilities.js";
+import type { LongTermMemory, MemoryService } from "../contracts/app-capabilities.js";
 import type { PendingApproval } from "../contracts/harness-port.js";
 import type { TenantContext } from "../contracts/tenant-context.js";
+import { formatMemoryLine, renderUntrustedMemoryBlock } from "../memory/sanitize.js";
 
 /**
  * Typed Pi Durable Documents committed atomically alongside the conversation
@@ -134,20 +135,63 @@ export const PendingSideEffectsDoc = defineDoc<PendingSideEffectsState>({
 
 /**
  * Deterministically renders session-start Core Memory bullets.
- * Sorting and formatting are stable so repeated sessions with identical
- * memory state render byte-identically.
+ * Order follows the input (callers pass `getCoreMemory`'s stable ordering); formatting is stable so repeated
+ * sessions with identical memory state render byte-identically.
+ *
+ * Memory text is untrusted (it originates from user text / assistant summaries), so every field is
+ * sanitized at render time and the bullets are wrapped in a delimited "untrusted data, not instructions" block.
  */
 export function formatFrozenCoreMemory(memories: readonly LongTermMemory[]): string {
 	if (memories.length === 0) return "";
-	const lines = memories.map((m) => {
-		const pinTag = m.pinned ? "[pinned] " : "";
-		return `- (${m.kind}) ${pinTag}${m.key}: ${m.content}`;
-	});
-	return [
-		"The following user context was loaded at session start (frozen for prompt cache stability).",
-		"Use `memory_search` to retrieve additional or recently updated memories on demand.",
-		...lines,
-	].join("\n");
+	return renderUntrustedMemoryBlock(
+		memories.map((m) => formatMemoryLine(m)),
+		[
+			"Loaded at session start (frozen for prompt cache stability).",
+			"Use `memory_search` to retrieve additional or recently updated memories on demand.",
+		],
+	);
+}
+
+export interface FrozenCoreMemoryPatch {
+	readonly changed: boolean;
+	readonly frozenCoreMemory: string;
+	readonly frozenCoreMemoryAt: number;
+}
+
+/**
+ * Pure helper to rebuild the frozen core memory (e.g. on conversation reset / compaction) so long
+ * conversations do not run on a stale session-start snapshot.
+ *
+ * Idempotent and cache-friendly: when the rendered text is byte-identical to `current`, the patch is
+ * `changed: false` and the ORIGINAL timestamp is kept, so callers can skip the document write and the
+ * system prompt prefix stays untouched.
+ */
+export function buildFrozenCoreMemoryPatch(
+	current: Pick<ConversationMetaState, "frozenCoreMemory" | "frozenCoreMemoryAt">,
+	memories: readonly LongTermMemory[],
+	nowMs: number,
+): FrozenCoreMemoryPatch {
+	const rendered = formatFrozenCoreMemory(memories);
+	if (rendered === current.frozenCoreMemory) {
+		return {
+			changed: false,
+			frozenCoreMemory: current.frozenCoreMemory,
+			frozenCoreMemoryAt: current.frozenCoreMemoryAt,
+		};
+	}
+	return { changed: true, frozenCoreMemory: rendered, frozenCoreMemoryAt: nowMs };
+}
+
+/** Loads the tenant's current core memory and builds the refresh patch (see `buildFrozenCoreMemoryPatch`). */
+export async function refreshFrozenCoreMemory(
+	memory: Pick<MemoryService, "getCoreMemory">,
+	tenant: Pick<TenantContext, "tenantId" | "userId">,
+	current: Pick<ConversationMetaState, "frozenCoreMemory" | "frozenCoreMemoryAt">,
+	nowMs: number,
+	options?: { readonly limit?: number },
+): Promise<FrozenCoreMemoryPatch> {
+	const memories = await memory.getCoreMemory(tenant.tenantId, tenant.userId, options?.limit);
+	return buildFrozenCoreMemoryPatch(current, memories, nowMs);
 }
 
 export function serializeTenantForDoc(tenant: TenantContext): ConversationMetaState["tenant"] {
