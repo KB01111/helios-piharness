@@ -55,6 +55,37 @@ export interface AppConfig {
 	readonly circuitBreakerCooldownMs: number;
 	/** ALLOW_MOCK_MODELS: permit mock models when NODE_ENV=production (see `assertProductionModelSafety`). */
 	readonly allowMockModels: boolean;
+	// ── Codemode (model-written JS that calls tools inside a QuickJS sandbox) ──
+	/** CODEMODE_ENABLED: install the durable `codemode` tool (default true). */
+	readonly codemodeEnabled: boolean;
+	/** CODEMODE_MEMORY_MB: heap cap per script VM (default 128). */
+	readonly codemodeMemoryMb: number;
+	/** CODEMODE_TIMEOUT_MS: wall-clock deadline per script, tool time included (default 120000). */
+	readonly codemodeTimeoutMs: number;
+	/** CODEMODE_MAX_WORKERS: process-wide cap on concurrently running script workers (default 4). */
+	readonly codemodeMaxWorkers: number;
+	/** CODEMODE_INLINE_BUDGET: estimated tokens of tool declarations in the codemode prompt section (default 3000). */
+	readonly codemodeInlineBudget: number;
+	// ── Self-improvement ──
+	/** IMPROVEMENTS_DIR: records + active.json of the gated prompt-improvement loop (default `$DATA_DIR/improvements`). */
+	readonly improvementsDir: string;
+	// ── Answer verifier ──
+	/** VERIFIER_ENABLED: review answers with the fast model before they stand (default: on with real models, off with mocks). */
+	readonly verifierEnabled: boolean;
+	/** VERIFIER_MAX_REVISIONS: times one run may be sent back for revision (default 1). */
+	readonly verifierMaxRevisions: number;
+	/** VERIFIER_MIN_ANSWER_CHARS: answers without tool use are only checked from this length (default 600). */
+	readonly verifierMinAnswerChars: number;
+	/** TRACE_EXPORT_PATH: append every settled Pi Durable span as one JSON line to this file (unset = off). */
+	readonly traceExportPath: string | undefined;
+	/** TRACE_EXPORT_MAX_BYTES: rotate the trace file (keeping one `.1`) at this size. Default 50 MiB. */
+	readonly traceExportMaxBytes: number;
+	/** IMPROVEMENT_PROBE_SAMPLES: eval-suite passes averaged per probe (default 1; use 3+ with real, non-deterministic models). */
+	readonly improvementProbeSamples: number;
+	/** IMPROVEMENT_TOOL_ERROR_TOLERANCE: allowed rise of the tool-error RATE in the acceptance gate (default 0.05). */
+	readonly improvementToolErrorTolerance: number;
+	/** EVALS_DIR: eval set root; cases live in `<dir>/cases/*.json`, the CI baseline in `<dir>/baseline.json` (default `./evals`). */
+	readonly evalsDir: string;
 }
 
 export function parseModelSpec(raw: string, fallback: ModelSpec): ModelSpec {
@@ -97,7 +128,7 @@ export function loadConfig(env: Readonly<Record<string, string | undefined>> = p
 	const dataDir = path.resolve(env.DATA_DIR ?? "./data");
 	const useMockModels = parseBoolean(
 		env.USE_MOCK_MODELS,
-		!env.ANTHROPIC_API_KEY && !env.OPENAI_API_KEY && !env.GEMINI_API_KEY,
+		!env.ANTHROPIC_API_KEY && !env.OPENAI_API_KEY && !env.GEMINI_API_KEY && !env.OPENROUTER_API_KEY,
 	);
 
 	const defaultMain: ModelSpec = useMockModels
@@ -153,6 +184,20 @@ export function loadConfig(env: Readonly<Record<string, string | undefined>> = p
 		circuitBreakerFailureThreshold: parsePositiveInt(env.CIRCUIT_BREAKER_FAILURES, 5),
 		circuitBreakerCooldownMs: parsePositiveInt(env.CIRCUIT_BREAKER_COOLDOWN_MS, 30_000),
 		allowMockModels: parseBoolean(env.ALLOW_MOCK_MODELS, false),
+		codemodeEnabled: parseBoolean(env.CODEMODE_ENABLED, true),
+		codemodeMemoryMb: parsePositiveInt(env.CODEMODE_MEMORY_MB, 128),
+		codemodeTimeoutMs: parsePositiveInt(env.CODEMODE_TIMEOUT_MS, 120_000),
+		codemodeMaxWorkers: parsePositiveInt(env.CODEMODE_MAX_WORKERS, 4),
+		codemodeInlineBudget: parseNonNegativeInt(env.CODEMODE_INLINE_BUDGET, 3_000),
+		improvementsDir: path.resolve(env.IMPROVEMENTS_DIR ?? path.join(dataDir, "improvements")),
+		verifierEnabled: parseBoolean(env.VERIFIER_ENABLED, !useMockModels),
+		verifierMaxRevisions: parseNonNegativeInt(env.VERIFIER_MAX_REVISIONS, 1),
+		verifierMinAnswerChars: parsePositiveInt(env.VERIFIER_MIN_ANSWER_CHARS, 600),
+		traceExportPath: env.TRACE_EXPORT_PATH?.trim() ? path.resolve(env.TRACE_EXPORT_PATH) : undefined,
+		traceExportMaxBytes: parsePositiveInt(env.TRACE_EXPORT_MAX_BYTES, 50 * 1024 * 1024),
+		improvementProbeSamples: parsePositiveInt(env.IMPROVEMENT_PROBE_SAMPLES, 1),
+		improvementToolErrorTolerance: parseNonNegativeNumber(env.IMPROVEMENT_TOOL_ERROR_TOLERANCE, 0.05),
+		evalsDir: path.resolve(env.EVALS_DIR ?? "./evals"),
 	};
 }
 

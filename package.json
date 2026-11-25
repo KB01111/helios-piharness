@@ -18,13 +18,17 @@
     "build": "tsc -p tsconfig.build.json",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
-    "test:watch": "vitest"
+    "test:watch": "vitest",
+    "eval": "tsx src/evals/cli.ts",
+    "eval:baseline": "tsx src/evals/cli.ts --update-baseline",
+    "eval:live": "tsx src/evals/cli.ts --live"
   },
   "dependencies": {
     "@earendil-works/chord": "1.6.0",
     "@earendil-works/pi-ai": "1.6.0",
     "@earendil-works/pi-durable": "1.6.0",
     "@earendil-works/pi-schema": "1.6.0",
+    "@earendil-works/pi-telemetry": "1.6.0",
     "@hono/node-server": "2.1.11",
     "hono": "4.13.21"
   },

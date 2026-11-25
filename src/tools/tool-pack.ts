@@ -36,6 +36,8 @@ export interface TenantScopedToolConfig<
 	readonly description: string;
 	readonly parameters: TParameters;
 	readonly replay?: "safe" | "unsafe";
+	/** Who may call the tool. `["model"]` keeps it out of reach of codemode scripts (e.g. human-approval parks). */
+	readonly callers?: readonly ("model" | "tools")[];
 	readonly executionMode?: ToolExecutionMode;
 	readonly structuredOutputSchema?: object;
 	readonly outputLimits?: {
@@ -76,6 +78,7 @@ export function createTenantScopedTool<
 		description: config.description,
 		parameters: config.parameters,
 		...(config.replay !== undefined ? { replay: config.replay } : {}),
+		...(config.callers !== undefined ? { callers: config.callers } : {}),
 		...(config.executionMode !== undefined ? { executionMode: config.executionMode } : {}),
 		...(config.structuredOutputSchema !== undefined ? { structuredOutputSchema: config.structuredOutputSchema } : {}),
 		...(config.outputLimits !== undefined ? { outputLimits: config.outputLimits } : {}),

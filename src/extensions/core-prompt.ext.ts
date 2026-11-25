@@ -10,6 +10,7 @@ export const DEFAULT_STATIC_SYSTEM_PROMPT = [
 	"4. For high-impact actions requiring human sign-off, use `domain_request_approval` and wait for the decision.",
 	"5. Read relevant skills via `skill_read` only when a listed skill matches the current task.",
 	"6. Be concise, accurate, and transparent about errors or authorization blocks.",
+	"7. For a task with 3 or more steps, call `plan_set` first, keep it current with `plan_update` (a blocked step needs a reason), and use `plan_view` to re-orient after long tool sequences.",
 ].join("\n");
 
 export interface CorePromptExtensionOptions {

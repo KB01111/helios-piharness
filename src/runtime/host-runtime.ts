@@ -440,6 +440,8 @@ export interface HostRuntimeOptions {
 	readonly autoResume?: boolean;
 	readonly onReport?: (report: Report) => void;
 	readonly conversationCreated?: HarnessOptions["conversationCreated"];
+	/** Host-owned telemetry adapter; Pi Durable emits typed spans (`pi.durable.*`) into it. Default: no-op. */
+	readonly telemetry?: HarnessOptions["telemetry"];
 	/** Logger for lock diagnostics. Default: stdout logger at LOG_LEVEL. */
 	readonly logger?: Logger;
 }
@@ -501,6 +503,7 @@ export class HostRuntime {
 					setTimer: options.setTimer,
 					identity: { attribution: { name: "helios-piharness", url: "https://helios-piharness.local" } },
 					conversationCreated: options.conversationCreated,
+					...(options.telemetry ? { telemetry: options.telemetry } : {}),
 					onWake: (wake: Wake) => {
 						wakeScheduler.schedule({ active: wake.active, ...(wake.at !== undefined ? { at: wake.at } : {}) });
 					},

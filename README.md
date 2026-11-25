@@ -54,7 +54,7 @@ All settings are read from environment variables (see `.env.example`). Unknown o
 | `MAIN_MODEL` | `anthropic:claude-sonnet-4-5` (mock: `test:main`) | Main model as `provider:modelId` or `provider/modelId` |
 | `FAST_MODEL` | `anthropic:claude-haiku-4-5` (mock: `test:fast`) | Fast model for lightweight tasks |
 | `USE_MOCK_MODELS` | `true` when no provider key is set, else `false` | Deterministic offline `TestModel` |
-| `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `GEMINI_API_KEY` | empty | Provider credentials. Never written to logs |
+| `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `GEMINI_API_KEY`, `OPENROUTER_API_KEY` | empty | Provider credentials. Never written to logs. OpenRouter models are addressed as `MAIN_MODEL=openrouter:<id>` (free ones end in `:free`) |
 | `MAX_TOOL_OUTPUT_BYTES` | `6144` | Tool output size cap before artifact offload |
 | `SLEEP_CYCLE_CRON_INTERVAL_MS` | `300000` | Sleep-cycle sweep interval in milliseconds |
 | `SLEEP_CYCLE_SCHEDULER_ENABLED` | `true` | Enables or disables the sleep-cycle scheduler |
@@ -83,6 +83,52 @@ All settings are read from environment variables (see `.env.example`). Unknown o
 | `ALLOW_MOCK_MODELS` | `false` | Allow mock models when `NODE_ENV=production` (otherwise startup fails) |
 | `SLEEP_CYCLE_CRON_INTERVAL_MS` | `300000` | Periodic sleep-cycle sweep; `0` disables |
 | `SLEEP_CYCLE_SCHEDULER_ENABLED` | `true` | Toggle the sleep-cycle scheduler |
+
+### Codemode
+
+`@earendil-works/pi-durable/codemode` is installed by default (`src/extensions/codemode.ext.ts`). The model writes JavaScript that calls tools as `await tools.<name>(args)` in a QuickJS/WASM sandbox and only the script's output reaches it. Scripts survive restarts by deterministic replay. Every `tools.*` call is a nested tool call, so tenant guards and permissions still apply. `domain_request_approval` is `callers: ["model"]`, so a script cannot bypass human approval, and `models.*` is disabled.
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `CODEMODE_ENABLED` | `true` | Install the `codemode` tool |
+| `CODEMODE_MEMORY_MB` | `128` | Heap cap per script VM |
+| `CODEMODE_TIMEOUT_MS` | `120000` | Wall-clock deadline per script, tool time included |
+| `CODEMODE_MAX_WORKERS` | `4` | Process-wide cap on concurrent script workers |
+| `CODEMODE_INLINE_BUDGET` | `3000` | Estimated tokens of tool declarations in the prompt section |
+
+### Answer verifier
+
+A quality gate before an answer stands (`src/extensions/verifier.ext.ts`). It is a durable `onYield` task, so the caller only receives an answer after the check and a crash mid-check resumes it. Short, tool-free answers are not checked. Otherwise one fast-model call reviews the answer against the request, the tool results and any unfinished plan steps. It can send the agent back at most `VERIFIER_MAX_REVISIONS` times per run, and only for concrete problems: unsupported claims, ignored tool errors, an unanswered request, or unfinished plan steps. It fails open (missing fast model, budget block, provider error or bad output lets the answer through). The reviewer's issues are screened for injection before being fed back, because it read untrusted tool output. Default: on with real models, off with mock models (`VERIFIER_ENABLED`, `VERIFIER_MAX_REVISIONS`, `VERIFIER_MIN_ANSWER_CHARS`).
+
+### Planning
+
+The `planning` tool pack (`plan_set`, `plan_update`, `plan_view`) gives the agent a durable, bounded working plan (12 steps) stored in a rewindable document, so restarts and forks see the plan as of their entry. A blocked step requires a reason, which pushes the agent to re-plan or explain the blocker. The plan is never injected into the system prompt (that would break the KV-cache prefix); each tool call returns the whole plan instead. The verifier treats unfinished steps as grounds for revision.
+
+### Trace export
+
+Pi Durable emits typed spans (`pi.durable.phase`, `.submit`, `.entry`, ...) into a host-provided telemetry adapter. Set `TRACE_EXPORT_PATH` to append every settled span as one JSON line (`StoredSpan` shape; one previous file kept at `<path>.1` after `TRACE_EXPORT_MAX_BYTES`). Spans carry IDs and control metadata only, never messages, tool arguments or results, and oversized attribute values are dropped. Pass `bootstrapHarness({ telemetry })` to use your own adapter (for example OpenTelemetry) instead.
+
+### Gated self-improvement (Harness²-style propose / probe / compose)
+
+The harness can improve its own operating guidance **without ever changing guardrails, permissions, tools or budgets**. The only editable surface is a *prompt addendum* appended to the static system prompt.
+
+1. **Baseline** – the eval set (`evals/cases/*.json`, `evolve` and `held_out` splits) runs on the current prompt.
+2. **Propose** – a proposer (default: the fast model, so fast-model budgets and the circuit breaker apply) reads the failing `evolve` cases, with answers redacted and treated as untrusted data, and drafts up to `maxCandidates` addenda: general ("invariant") and failure-specific ("domain"). Hypotheses already disproven in the SIM log are never retried.
+3. **Probe** – each candidate runs the whole eval set in its own isolated harness (in-memory databases, no scheduler) against the same models.
+4. **Gate** (`evaluateGate`) – accept only with held-out non-regression, zero safety violations, a big-enough eval set (default 3 held-out cases) and a strict evolve gain in pass rate or tool-error rate. Latency never justifies a change. A lint rejects text that weakens controls, mentions identity or secrets, or contains URLs, markup or code.
+5. **Compose** – if several survive, their merge is probed and gated too; the best survivor wins. Every outcome is written to the SIM log.
+6. **Human promotion** – the winner is stored as `pending_approval` and changes nothing until an operator approves it. Approval is refused if the set of active improvements changed since the candidate was measured (re-run instead). Active guidance is capped (4000 chars), persisted in `IMPROVEMENTS_DIR`, re-applied at startup, hot-applied to new conversations, and can be rolled back.
+
+Admin routes (permission `admin:improvements`): `GET /improvements`, `POST /improvements/run` (single-flight), `GET /improvements/:id`, `POST /improvements/:id/{approve,reject,rollback}` with an optional `{ "note" }`. Programmatic access: `bootstrapHarness().improvements`.
+
+**Eval set tooling.** `npm run eval` runs the committed eval set and fails on any regression versus `evals/baseline.json` (pass rate, tool errors, safety violations, or a shrunken set; latency is ignored). It runs in CI and in `npm test`. After an intentional change run `npm run eval:baseline` and review the diff. Cases can be built from real conversations with `buildEvalCaseFromTranscript` (emails, keys and phone-like numbers are redacted, and a human must review the file). `npm run eval:live` runs the same cases against real models (needs a provider key and spends tokens; it refuses to run on the mock model, ignores the scripted responses, skips the mock-based baseline, and exits 1 only on safety violations). Verified against real free OpenRouter models (`MAIN_MODEL=openrouter:nvidia/nemotron-3.5-lightning:free`, `OPENROUTER_API_KEY`): free models are slow and rate-limited (429s are retried), so set `EVAL_CASE_TIMEOUT_MS` and `EVAL_ONLY=id1,id2` to bound a run. Use a real model for meaningful probes (`USE_MOCK_MODELS=false`); the scripted cases are deterministic smoke tests.
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `EVALS_DIR` | `./evals` | Eval set root (`cases/*.json`, `baseline.json`) |
+| `IMPROVEMENT_PROBE_SAMPLES` | `1` | Eval-suite passes averaged per probe. Real models are non-deterministic and a single pass over a few cases is mostly noise: use `3` or more with them |
+| `IMPROVEMENT_TOOL_ERROR_TOLERANCE` | `0.05` | How far the tool-error *rate* may rise in the gate. It is a ratio, so a prompt that makes the agent call more tools moves it without making anything worse. Pass rate and safety get no slack |
+| `IMPROVEMENTS_DIR` | `$DATA_DIR/improvements` | Improvement records and the active list |
 
 Cost limits (`*_COST_USD`) only bite with a priced model (Pi AI's catalog `usage.cost.total`) or a custom `bootstrapHarness({ budget: { estimateCostUsd } })`; the mock provider always reports zero cost, so use the token limits there.
 
