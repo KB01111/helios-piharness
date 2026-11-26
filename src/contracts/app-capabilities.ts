@@ -110,7 +110,20 @@ export interface MemorySearchResult {
 export interface EmbeddingProvider {
 	/** Stable model identifier. Stored with vectors; vectors from a different model id are ignored. */
 	readonly model: string;
-	embed(texts: readonly string[], options?: { readonly signal?: AbortSignal }): Promise<ReadonlyArray<ArrayLike<number>>>;
+	/**
+	 * Optional cosine calibration of this model's embedding space: `floor` ~ similarity of unrelated texts,
+	 * `ceiling` ~ similarity of close paraphrases. Retrieval maps cosine onto relevance over `[floor, ceiling]`;
+	 * without it a conservative default tuned for small sentence-transformers (floor 0.24, ceiling 0.74) is used.
+	 */
+	readonly similarity?: { readonly floor: number; readonly ceiling: number };
+	/**
+	 * `inputType` tells asymmetric (instruction-tuned) models whether the texts are search queries or stored
+	 * documents. Memory search embeds queries and documents in separate calls. Providers may ignore it.
+	 */
+	embed(
+		texts: readonly string[],
+		options?: { readonly signal?: AbortSignal; readonly inputType?: "query" | "document" },
+	): Promise<ReadonlyArray<ArrayLike<number>>>;
 }
 
 export type MemoryMutationOp =
@@ -175,6 +188,12 @@ export interface MemoryService {
 		readonly limit?: number;
 		readonly minEpisodes?: number;
 	}): Promise<PendingEpisodeScope[]>;
+
+	/**
+	 * Optional: embed memories that lack a fresh vector (hybrid retrieval). Called by the sleep cycle after
+	 * consolidation so new memories are embedded off the request path. Returns the number of vectors written.
+	 */
+	backfillEmbeddings?(tenantId: string, userId: string, options?: { readonly limit?: number }): Promise<number>;
 
 	recordEpisode(
 		episode: Omit<MidTermEpisode, "id" | "consolidated" | "createdAt"> & { readonly createdAt?: number },

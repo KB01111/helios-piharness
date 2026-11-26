@@ -295,6 +295,15 @@ export function createSleepCycleExtension(options: SleepCycleExtensionOptions): 
 					warnings,
 				);
 
+				// Embed new/changed memories now (idempotent: content-hash keyed) so searches never pay for it.
+				if (capabilities.memory.backfillEmbeddings) {
+					try {
+						await capabilities.memory.backfillEmbeddings(meta.tenant.tenantId, meta.tenant.userId, { limit: 2_000 });
+					} catch (error) {
+						warnings.push(`embedding backfill failed: ${errorMessage(error)}`);
+					}
+				}
+
 				await runtime.commit(
 					() => ({
 						status: "running",

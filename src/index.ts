@@ -182,6 +182,13 @@ import { AppDatabase, type AppDatabaseOptions } from "./memory/db.js";
 import { detectFrictionSignals, type FrictionAnalysisInput, type FrictionAnalysisResult } from "./memory/friction-signals.js";
 import { SqliteArtifactStore, SqliteMemoryService, SqliteTelemetryStore } from "./memory/sqlite-memory.js";
 export type { EmbeddingProvider } from "./contracts/app-capabilities.js";
+export { HttpEmbeddingProvider, RouterEmbeddingProvider, type HttpEmbeddingProviderOptions } from "./embeddings/provider.js";
+export { EmbeddingRouter, type EmbeddingRouterOptions } from "./embeddings/router.js";
+export { createEmbedHttpServer, type EmbedHttpServerOptions } from "./embeddings/server.js";
+export { loadEmbedServerConfig, type EmbedServerConfig } from "./embeddings/config.js";
+export { buildEmbeddingService, type BuiltEmbeddingService } from "./embeddings/factory.js";
+export { runEmbeddingSelfTest, type SelfTestResult } from "./embeddings/self-test.js";
+export { EmbeddingError, type EmbeddingBackend, type EmbeddingInputType, type SimilarityCalibration } from "./embeddings/types.js";
 export {
 	DEFAULT_SEVERITY_WEIGHTS,
 	type FrictionOptions,

@@ -1,6 +1,8 @@
 import type { Server } from "node:http";
 import { serve, type ServerType } from "@hono/node-server";
 import { loadConfig } from "./config.js";
+import type { EmbeddingProvider } from "./contracts/app-capabilities.js";
+import { HttpEmbeddingProvider } from "./embeddings/provider.js";
 import { createHealthChecker, createReadinessHandler } from "./health.js";
 import { bootstrapHarness, type BootstrappedHarness } from "./index.js";
 import { createLogger, serializeError } from "./logger.js";
@@ -84,7 +86,8 @@ async function main(): Promise<void> {
 		shutdown("uncaughtException", 1);
 	});
 
-	bootstrapping = bootstrapHarness({ config });
+	const embeddingProvider = await connectEmbeddings(config, logger);
+	bootstrapping = bootstrapHarness({ config, ...(embeddingProvider ? { embeddingProvider } : {}) });
 	runtime = await bootstrapping;
 	if (shutdownStarted) {
 		// Shutdown began while bootstrapping; it is closing the runtime, so do not start serving.
@@ -131,6 +134,36 @@ async function main(): Promise<void> {
 			});
 		},
 	);
+}
+
+/** Connects the optional embedding endpoint. Unreachable + not required => lexical-only memory with a warning. */
+async function connectEmbeddings(
+	config: ReturnType<typeof loadConfig>,
+	logger: ReturnType<typeof createLogger>,
+): Promise<EmbeddingProvider | undefined> {
+	if (!config.embeddingsUrl) return undefined;
+	try {
+		const provider = await HttpEmbeddingProvider.connect({
+			baseUrl: config.embeddingsUrl,
+			...(config.embeddingsApiKey ? { apiKey: config.embeddingsApiKey } : {}),
+			...(config.embeddingsModel ? { model: config.embeddingsModel } : {}),
+			...(config.embeddingsDimensions ? { dimensions: config.embeddingsDimensions } : {}),
+			timeoutMs: config.embeddingsTimeoutMs,
+		});
+		logger.info("embeddings_connected", {
+			model: provider.model,
+			heliosServer: provider.helios,
+			...(provider.similarity ? { similarity: provider.similarity } : {}),
+		});
+		return provider;
+	} catch (error) {
+		if (config.embeddingsRequired) throw error;
+		logger.warn("embeddings_unavailable", {
+			message: "memory search runs lexical-only until restart",
+			error: serializeError(error),
+		});
+		return undefined;
+	}
 }
 
 main().catch((error: unknown) => {
