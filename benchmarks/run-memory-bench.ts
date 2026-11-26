@@ -24,6 +24,9 @@ import { performance } from "node:perf_hooks";
 import { AppDatabase } from "../src/memory/db.js";
 import { SqliteMemoryService } from "../src/memory/sqlite-memory.js";
 import type { EmbeddingProvider } from "../src/contracts/app-capabilities.js";
+import { loadEmbedServerConfig } from "../src/embeddings/config.js";
+import { buildEmbeddingService } from "../src/embeddings/factory.js";
+import { HttpEmbeddingProvider, RouterEmbeddingProvider } from "../src/embeddings/provider.js";
 import {
 	BENCHMARK_EPISODES,
 	BENCHMARK_MEMORIES,
@@ -775,17 +778,40 @@ async function main(): Promise<void> {
 	const jsonOutIdx = args.indexOf("--json");
 	const jsonOutPath = jsonOutIdx >= 0 ? args[jsonOutIdx + 1] : undefined;
 
-	// Check if local real neural embedding server is reachable
+	const gateIdx = args.indexOf("--gate");
+	const gatePath = gateIdx >= 0 ? args[gateIdx + 1] : undefined;
+	const inProcIdx = args.indexOf("--in-process");
+	const inProcessProfile = inProcIdx >= 0 ? args[inProcIdx + 1] : undefined;
+	const lexicalOnly = args.includes("--lexical-only");
+
+	// Embedder resolution: in-process router (--in-process <profile>) > Helios embedding server > legacy MiniLM server.
 	let embedder: EmbeddingProvider | undefined;
-	try {
-		const health = await fetch(endpoint.replace(/\/v1$/, "/health"));
-		if (health.ok) {
-			embedder = new CachedHttpEmbeddingProvider({ endpoint, model: "sentence-transformers/all-MiniLM-L6-v2" });
-			console.error(`[bench] Connected to real embedding server at ${endpoint}`);
+	let closeEmbedder: (() => Promise<void>) | undefined;
+	if (lexicalOnly) {
+		console.error("[bench] --lexical-only: skipping embedding providers");
+	} else if (inProcessProfile) {
+		const service = buildEmbeddingService(loadEmbedServerConfig({ ...process.env, EMBED_PROFILE: inProcessProfile }));
+		embedder = new RouterEmbeddingProvider(service.router);
+		closeEmbedder = () => service.close();
+		console.error(`[bench] In-process embedding router (${inProcessProfile}): ${embedder.model}`);
+	} else {
+		try {
+			const helios = await HttpEmbeddingProvider.connect({ baseUrl: endpoint, timeoutMs: 120_000 });
+			embedder = helios;
+			console.error(`[bench] Connected to Helios embedding server at ${endpoint}: ${helios.model}`);
+		} catch {
+			try {
+				const health = await fetch(endpoint.replace(/\/v1$/, "/health"));
+				if (health.ok) {
+					embedder = new CachedHttpEmbeddingProvider({ endpoint, model: "sentence-transformers/all-MiniLM-L6-v2" });
+					console.error(`[bench] Connected to legacy embedding server at ${endpoint}`);
+				}
+			} catch {
+				console.error(`[bench] Embedding server not reachable at ${endpoint}; running lexical/synthetic fallback`);
+			}
 		}
-	} catch {
-		console.error(`[bench] Embedding server not reachable at ${endpoint}; running lexical/synthetic fallback`);
 	}
+	const embedderLabel = embedder ? embedder.model.replace(/^.*\//, "") : "";
 
 	const engines: Array<{ engine: BenchMemoryEngine; ingestMs: number; warmMs: number }> = [];
 
@@ -794,7 +820,7 @@ async function main(): Promise<void> {
 
 	// 2. Helios hybrid (real all-MiniLM-L6-v2)
 	if (embedder) {
-		engines.push(await buildHeliosEngine("helios (hybrid)", embedder));
+		engines.push(await buildHeliosEngine(`helios (hybrid ${embedderLabel})`, embedder));
 
 		// 3. Graphiti-Ref (bi-temporal knowledge graph)
 		const tG0 = performance.now();
@@ -825,7 +851,7 @@ async function main(): Promise<void> {
 	const scaleRows = await runHeliosScaleBench([100, 500, 2000]);
 
 	// Print clean Markdown summary table
-	console.log("\n=== QUALITY BENCHMARK (78 queries across 8 categories) ===\n");
+	console.log(`\n=== QUALITY BENCHMARK (${BENCHMARK_QUERIES.length} queries across 8 categories) ===\n`);
 	console.log(
 		"| Engine | Overall R@1 | Overall R@5 | MRR | nDCG@5 | 1-Hop R@5 | Semantic R@5 | MultiHop Target@5 | MultiHop Both@5 | Update Fresh@1 | ZeroStale@3 | Temporal R@5 | HistAudit R@5 | Abstain | RecentEp R@5 | p50 (ms) | p95 (ms) |",
 	);
@@ -848,12 +874,77 @@ async function main(): Promise<void> {
 		);
 	}
 
+	await closeEmbedder?.();
+
 	if (jsonOutPath) {
 		fs.mkdirSync(path.dirname(path.resolve(jsonOutPath)), { recursive: true });
 		fs.writeFileSync(jsonOutPath, JSON.stringify({ timestamp: new Date().toISOString(), results, scaleRows }, null, 2));
 		console.error(`[bench] Saved JSON report to ${jsonOutPath}`);
 	}
+
+	if (gatePath) {
+		const failures = checkGate(gatePath, results);
+		if (failures.length > 0) {
+			console.error(`\n[bench] GATE FAILED (${failures.length}):\n  - ${failures.join("\n  - ")}`);
+			process.exitCode = 1;
+		} else {
+			console.error("\n[bench] Gate passed.");
+		}
+	}
 }
+
+/**
+ * Regression gate. The thresholds file maps an engine-name prefix ("helios (lexical)", "helios (hybrid") to minimum
+ * metric values (`p95Ms` is an upper bound). Engines that did not run (e.g. no embedding model) are skipped.
+ */
+function checkGate(file: string, results: readonly EngineBenchmarkResult[]): string[] {
+	const spec = JSON.parse(fs.readFileSync(file, "utf8")) as Record<string, Record<string, number> | string>;
+	const failures: string[] = [];
+	const metric = (r: EngineBenchmarkResult, name: string): number | undefined => {
+		const c = r.byCategory;
+		const table: Record<string, number | undefined> = {
+			overallRecallAt1: r.overallRecallAt1,
+			overallRecallAt5: r.overallRecallAt5,
+			overallMrr: r.overallMrr,
+			overallNdcgAt5: r.overallNdcgAt5,
+			singleHopR5: c.single_hop.recallAt5,
+			semanticR5: c.semantic_gap.recallAt5,
+			multiHopR1: c.multi_hop.recallAt1,
+			multiHopTargetR5: c.multi_hop.recallAt5,
+			multiHopBothAt5: c.multi_hop.bothHopsAt5,
+			updateFreshAt1: c.knowledge_update.recallAt1,
+			zeroStaleTop3: c.knowledge_update.zeroStaleTop3,
+			temporalR5: c.temporal_window.recallAt5,
+			historicalR5: c.historical_audit.recallAt5,
+			abstention: c.abstention.abstentionRate,
+			sessionRecentR5: c.session_recent.recallAt5,
+			p95Ms: r.queryLatencyP95Ms,
+		};
+		return table[name];
+	};
+	for (const [prefix, thresholds] of Object.entries(spec)) {
+		if (prefix.startsWith("$") || typeof thresholds !== "object") continue;
+		const matching = results.filter((r) => r.engine.startsWith(prefix));
+		if (matching.length === 0) {
+			console.error(`[bench] gate: no engine matching "${prefix}" ran; skipped`);
+			continue;
+		}
+		for (const r of matching) {
+			for (const [name, bound] of Object.entries(thresholds)) {
+				const value = metric(r, name);
+				if (value === undefined) {
+					failures.push(`${r.engine}: unknown metric ${name}`);
+					continue;
+				}
+				const upper = name.endsWith("Ms");
+				const ok = upper ? value <= bound : value + 1e-9 >= bound;
+				if (!ok) failures.push(`${r.engine}: ${name}=${value.toFixed(3)} ${upper ? ">" : "<"} ${bound}`);
+			}
+		}
+	}
+	return failures;
+}
+
 
 main().catch((err) => {
 	console.error(err);

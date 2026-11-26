@@ -1,0 +1,42 @@
+{
+  "$comment": "Memory benchmark regression gate (npm run bench:memory:gate). Keys are engine-name prefixes; values are minimum scores (p95Ms is an upper bound). Engines that did not run are skipped: CI runs lexical-only, the hybrid gate applies whenever an embedding server or --in-process profile is available.",
+  "helios (lexical)": {
+    "overallRecallAt1": 0.66,
+    "overallRecallAt5": 0.88,
+    "overallMrr": 0.76,
+    "overallNdcgAt5": 0.79,
+    "singleHopR5": 1,
+    "semanticR5": 0.33,
+    "multiHopTargetR5": 1,
+    "multiHopBothAt5": 1,
+    "updateFreshAt1": 0.9,
+    "zeroStaleTop3": 1,
+    "temporalR5": 1,
+    "historicalR5": 1,
+    "abstention": 1,
+    "sessionRecentR5": 1,
+    "p95Ms": 25
+  },
+  "helios (hybrid embeddinggemma-2": {
+    "overallRecallAt1": 0.85,
+    "overallRecallAt5": 1,
+    "overallMrr": 0.92,
+    "overallNdcgAt5": 0.94,
+    "singleHopR5": 1,
+    "semanticR5": 1,
+    "multiHopTargetR5": 1,
+    "multiHopBothAt5": 1,
+    "updateFreshAt1": 1,
+    "zeroStaleTop3": 1,
+    "temporalR5": 1,
+    "historicalR5": 1,
+    "abstention": 0.6,
+    "sessionRecentR5": 1
+  },
+  "helios (hybrid": {
+    "overallRecallAt5": 0.95,
+    "semanticR5": 0.9,
+    "multiHopBothAt5": 1,
+    "zeroStaleTop3": 1
+  }
+}

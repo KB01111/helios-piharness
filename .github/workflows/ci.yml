@@ -41,6 +41,9 @@ jobs:
       - name: Eval regression gate
         run: npm run eval
 
+      - name: Memory benchmark gate (lexical)
+        run: npm run bench:memory:gate -- --lexical-only
+
       - name: Build
         run: npm run build
 

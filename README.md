@@ -37,8 +37,40 @@ By default, when no provider API keys are configured (or `USE_MOCK_MODELS=true`)
 - `npm run dev` — Start HTTP/SSE server in watch mode (`tsx`)
 - `npm run start` — Start HTTP/SSE server
 - `npm run build` — Compile ESM library and declarations to `dist/`
-- `npm run typecheck` — Strict TypeScript type-check (`src/` and `tests/`)
+- `npm run typecheck` — Strict TypeScript type-check (`src/`, `tests/`, `benchmarks/`)
 - `npm test` — Run all Vitest integration suites
+- `npm run embed:server` — OpenAI-compatible embedding server (EmbeddingGemma 2 by default; `embed:server:npu`, `embed:server:cloud`)
+- `npm run bench:memory` — Memory quality + scalability benchmark (uses the embedding server when it is running)
+- `npm run bench:memory:gate` — Same, failing on regressions against `benchmarks/thresholds.json` (CI runs it lexical-only)
+
+## Embeddings & Memory Benchmark
+
+Hybrid memory retrieval (lexical FTS5 + entity-graph PPR + temporal + **semantic vectors**) needs an embedding model. Helios ships its own embedding server with four backends behind one OpenAI-compatible API (details: [`docs/embeddings.md`](docs/embeddings.md)):
+
+| Profile | Backend | Model | Hardware |
+| --- | --- | --- | --- |
+| `gemma2` *(default)* | in-process ONNX (Transformers.js) | EmbeddingGemma 2 (`onnx-community/embeddinggemma-2-ONNX`, q4) | CPU, or `EMBED_ONNX_DEVICE=dml` for the Radeon iGPU |
+| `npu` | FastFlowLM (`flm serve … --embed 1`) | `embed-gemma:300m` | AMD Ryzen AI NPU (XDNA/XDNA2) |
+| `openai` | any OpenAI-compatible API | `text-embedding-3-small` (OpenAI, OpenRouter, Lemonade, Ollama, TEI, vLLM…) | cloud / remote |
+| `gemini` | Google Gemini `batchEmbedContents` | `gemini-embedding-001` | cloud |
+
+```bash
+npm run embed:server                       # EmbeddingGemma 2 on 127.0.0.1:18765
+EMBEDDINGS_URL=http://127.0.0.1:18765/v1 npm run dev
+```
+
+The server applies EmbeddingGemma's asymmetric query/document prompts, Matryoshka truncation (`EMBED_DIMENSIONS`), caching, circuit breaking and same-space fallback, and runs a **quality self-test at startup** that measures the model's cosine calibration (published to the harness) and quarantines any backend whose vectors cannot separate related from unrelated text.
+
+**Benchmark** (`npm run bench:memory`, 78 queries / 8 categories, deterministic):
+
+| Engine | R@1 | R@5 | MRR | nDCG@5 | Semantic R@5 | Multi-hop both@5 | Update fresh@1 | Historical R@5 | Abstain | Recent-episode R@5 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| helios (lexical, no model) | 66.2% | 88.2% | 0.770 | 0.800 | 33.3% | 100% | 90% | 100% | 100% | 100% |
+| **helios (hybrid, EmbeddingGemma 2)** | **85.3%** | **100%** | **0.926** | **0.945** | **100%** | 100% | 100% | 100% | 60% | 100% |
+| graphiti-ref (same embeddings) | 69.1% | 94.1% | 0.806 | 0.840 | 100% | 100% | 90% | 100% | 0% | 0% |
+| hipporag-ref (same embeddings) | 47.1% | 86.8% | 0.657 | 0.706 | 100% | 100% | 50% | 0% | 0% | 0% |
+
+Hybrid search p50 ≈ 2.5 ms with warm query cache (≈ 30 ms cold on CPU); 2,000-memory oldest-needle recall 100%.
 
 ## Configuration Reference
 
@@ -121,6 +153,18 @@ Append-only operational tables would otherwise grow forever. A sweeper (`src/run
 | `RETENTION_ARTIFACT_DAYS` | `0` | Offloaded tool-output artifacts and their files. Opt-in: transcripts hold `art_*` recall handles that would dangle |
 
 Forgetting a memory (`forgetMemory`) also scrubs the raw episodes that evidenced it (verbatim user message, summary and tool arguments), not just the memory row.
+
+### Embeddings (hybrid memory retrieval)
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `EMBEDDINGS_URL` | _(unset: lexical-only)_ | Helios embedding server (`http://127.0.0.1:18765/v1`) or any OpenAI-compatible endpoint |
+| `EMBEDDINGS_API_KEY` | _(unset)_ | Bearer token (falls back to `OPENAI_API_KEY` for `api.openai.com`) |
+| `EMBEDDINGS_MODEL` | _(from server)_ | Upstream model; required for non-Helios endpoints |
+| `EMBEDDINGS_DIMENSIONS` | _(native)_ | Matryoshka output size requested from the endpoint |
+| `EMBEDDINGS_TIMEOUT_MS` / `EMBEDDINGS_REQUIRED` | `15000` / `false` | Request timeout; abort startup when unreachable instead of running lexical-only |
+
+Embedding-server variables (`EMBED_*`) are documented in [`docs/embeddings.md`](docs/embeddings.md) and `.env.example`.
 
 ### HTTP API
 
