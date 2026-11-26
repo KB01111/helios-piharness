@@ -538,14 +538,20 @@ export class HostRuntime {
 			}
 		});
 
-		const initialWake = harness.wake();
-		wakeScheduler.schedule({
-			active: initialWake.active,
-			...(initialWake.at !== undefined ? { at: initialWake.at } : {}),
-		});
+		try {
+			const initialWake = harness.wake();
+			wakeScheduler.schedule({
+				active: initialWake.active,
+				...(initialWake.at !== undefined ? { at: initialWake.at } : {}),
+			});
 
-		if (options.autoResume ?? true) {
-			harness.resume();
+			if (options.autoResume ?? true) {
+				harness.resume();
+			}
+		} catch (error) {
+			// Release the writer lock and storage: otherwise a retry in this process is refused as "already opened".
+			await runtime.close(context).catch(() => undefined);
+			throw error;
 		}
 
 		return runtime;

@@ -89,6 +89,9 @@ export interface McpServerSummary {
 }
 
 const DEFAULT_TIMEOUT_MS = 30_000;
+/** Largest response body accepted from an MCP server (a hostile or broken server must not exhaust memory). */
+export const DEFAULT_MAX_RESPONSE_BYTES = 4 * 1024 * 1024;
+const MAX_LAST_ERROR_CHARS = 300;
 const DEFAULT_CACHE_TTL_MS = 5 * 60_000;
 const SAFE_SERVER_NAME = /^[a-zA-Z0-9][a-zA-Z0-9_-]{0,47}$/;
 const SAFE_TOOL_NAME = /^[a-zA-Z0-9][a-zA-Z0-9._:-]{0,127}$/;
@@ -134,6 +137,35 @@ function parseSseJsonRpc(bodyText: string, expectedId: number | string): McpJson
 	throw new Error("MCP Streamable HTTP SSE response contained no JSON-RPC payload");
 }
 
+/** Reads a response body as text, failing as soon as it exceeds `maxBytes` instead of buffering it all. */
+export async function readBoundedText(res: Response, maxBytes: number): Promise<string> {
+	const declared = Number.parseInt(res.headers.get("content-length") ?? "", 10);
+	if (Number.isFinite(declared) && declared > maxBytes) {
+		await res.body?.cancel().catch(() => undefined);
+		throw new Error(`MCP response too large (${declared} bytes, limit ${maxBytes})`);
+	}
+	const body = res.body;
+	if (!body) return "";
+	const reader = body.getReader();
+	const chunks: Uint8Array[] = [];
+	let total = 0;
+	try {
+		for (;;) {
+			const { done, value } = await reader.read();
+			if (done) break;
+			total += value.byteLength;
+			if (total > maxBytes) {
+				await reader.cancel().catch(() => undefined);
+				throw new Error(`MCP response too large (over ${maxBytes} bytes)`);
+			}
+			chunks.push(value);
+		}
+	} finally {
+		reader.releaseLock();
+	}
+	return Buffer.concat(chunks).toString("utf8");
+}
+
 /**
  * Standard MCP Streamable HTTP JSON-RPC 2.0 transport over Node's built-in `fetch`.
  */
@@ -141,16 +173,19 @@ export class HttpMcpTransport implements McpTransport {
 	private readonly url: string;
 	private readonly headers: Readonly<Record<string, string>>;
 	private readonly timeoutMs: number;
+	private readonly maxResponseBytes: number;
 	private sessionId: string | undefined;
 
 	constructor(options: {
 		readonly url: string;
 		readonly headers?: Readonly<Record<string, string>>;
 		readonly timeoutMs?: number;
+		readonly maxResponseBytes?: number;
 	}) {
 		this.url = validateMcpServerUrl(options.url);
 		this.headers = options.headers ? { ...options.headers } : {};
 		this.timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+		this.maxResponseBytes = options.maxResponseBytes ?? DEFAULT_MAX_RESPONSE_BYTES;
 	}
 
 	async send(request: McpJsonRpcRequest, signal?: AbortSignal): Promise<McpJsonRpcResponse> {
@@ -178,6 +213,8 @@ export class HttpMcpTransport implements McpTransport {
 				},
 				body: JSON.stringify(request),
 				signal: controller.signal,
+				// A redirect could bounce credentialed requests to an internal address; an MCP endpoint must answer directly.
+				redirect: "error",
 			});
 
 			const nextSession = res.headers.get("mcp-session-id");
@@ -188,7 +225,7 @@ export class HttpMcpTransport implements McpTransport {
 			}
 
 			const contentType = (res.headers.get("content-type") ?? "").toLowerCase();
-			const bodyText = await res.text();
+			const bodyText = await readBoundedText(res, this.maxResponseBytes);
 			if (contentType.includes("text/event-stream")) {
 				return parseSseJsonRpc(bodyText, request.id);
 			}
@@ -343,7 +380,8 @@ export class McpRegistry {
 				entry.lastError = undefined;
 				return entry.tools;
 			} catch (error) {
-				entry.lastError = error instanceof Error ? error.message : String(error);
+				// Upstream text can echo response bodies; keep only a short diagnostic.
+				entry.lastError = (error instanceof Error ? error.message : String(error)).slice(0, MAX_LAST_ERROR_CHARS);
 				throw error;
 			} finally {
 				entry.inFlightDiscovery = undefined;

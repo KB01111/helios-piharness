@@ -75,6 +75,26 @@ export const DEFAULT_SECRET_PATTERNS: readonly SecretPattern[] = [
 		replacement: "[REDACTED:stripe_key]",
 	},
 	{
+		category: "gitlab_token",
+		pattern: /\bglpat-[A-Za-z0-9_-]{20,100}(?![A-Za-z0-9_-])/g,
+		replacement: "[REDACTED:gitlab_token]",
+	},
+	{
+		category: "npm_token",
+		pattern: /\bnpm_[A-Za-z0-9]{36}\b/g,
+		replacement: "[REDACTED:npm_token]",
+	},
+	{
+		category: "google_oauth_token",
+		pattern: /\bya29\.[0-9A-Za-z_-]{20,512}/g,
+		replacement: "[REDACTED:google_oauth_token]",
+	},
+	{
+		category: "sendgrid_key",
+		pattern: /\bSG\.[A-Za-z0-9_-]{16,64}\.[A-Za-z0-9_-]{16,64}\b/g,
+		replacement: "[REDACTED:sendgrid_key]",
+	},
+	{
 		category: "jwt",
 		pattern: /\beyJ[A-Za-z0-9_-]{10,512}\.[A-Za-z0-9_-]{10,1024}\.[A-Za-z0-9_-]{10,512}\b/g,
 		replacement: "[REDACTED:jwt]",
@@ -90,10 +110,31 @@ export const DEFAULT_SECRET_PATTERNS: readonly SecretPattern[] = [
 		replacement: "$1://$2:[REDACTED:db_credentials]@",
 	},
 	{
+		// Fail closed: a value longer than the bounded rules below can match would otherwise pass through untouched.
 		category: "secret_assignment",
 		pattern:
-			/\b(api[_-]?key|access[_-]?token|auth[_-]?token|secret[_-]?key|client[_-]?secret|private[_-]?token|password|passwd)\s*([:=])\s*(["']?)([^\s"'`,;}{]{8,128})\3/gi,
-		replacement: "$1$2$3[REDACTED:secret_assignment]$3",
+			/\b(api[_-]?key|access[_-]?token|auth[_-]?token|secret[_-]?key|client[_-]?secret|private[_-]?token|refresh[_-]?token|token|secret|password|passphrase|passwd)(["']?)\s*([:=])\s*(["'])(?:\\.|(?!\4)[^\n\\]){4097}[^\n]*/gi,
+		replacement: "$1$2$3$4[REDACTED:secret_assignment]",
+	},
+	{
+		category: "secret_assignment",
+		pattern:
+			/\b(api[_-]?key|access[_-]?token|auth[_-]?token|secret[_-]?key|client[_-]?secret|private[_-]?token|refresh[_-]?token|token|secret|password|passphrase|passwd)(["']?)\s*([:=])\s*[^\s"'`,;}{]{4097,}/gi,
+		replacement: "$1$2$3[REDACTED:secret_assignment]",
+	},
+	{
+		// Quoted values may contain spaces (passphrases): match up to the closing quote of the same kind.
+		category: "secret_assignment",
+		pattern:
+			/\b(api[_-]?key|access[_-]?token|auth[_-]?token|secret[_-]?key|client[_-]?secret|private[_-]?token|refresh[_-]?token|token|secret|password|passphrase|passwd)(["']?)\s*([:=])\s*(["'])((?:\\.|(?!\4)[^\n\\]){8,4096})\4/gi,
+		replacement: "$1$2$3$4[REDACTED:secret_assignment]$4",
+	},
+	{
+		category: "secret_assignment",
+		pattern:
+			// The key may itself be quoted (JSON: `"password": "..."`), hence the optional quote before the separator.
+			/\b(api[_-]?key|access[_-]?token|auth[_-]?token|secret[_-]?key|client[_-]?secret|private[_-]?token|refresh[_-]?token|token|secret|password|passwd)(["']?)\s*([:=])\s*(["']?)([^\s"'`,;}{]{8,4096})\4/gi,
+		replacement: "$1$2$3$4[REDACTED:secret_assignment]$4",
 	},
 ];
 
@@ -115,13 +156,17 @@ function redactChunk(
 		const replacement = rule.replacement ?? `[REDACTED:${rule.category}]`;
 		let matchedThisRule = false;
 		text = text.replace(re, (...args) => {
-			// Skip already-redacted placeholders
 			const full = String(args[0] ?? "");
-			if (full.includes("[REDACTED:")) return full;
+			const groups = args.slice(1, -2);
+			// Skip already-redacted placeholders. For assignments only a value that IS a marker counts, so a value that
+			// merely contains one (`abc[REDACTED:x]rest`) is still redacted around it.
+			const valueGroup = rule.category === "secret_assignment" ? groups[4] : undefined;
+			const alreadyRedacted =
+				typeof valueGroup === "string" ? /^\[REDACTED:[^\]]*\]$/.test(valueGroup) : full.includes("[REDACTED:");
+			if (alreadyRedacted) return full;
 			matchedThisRule = true;
 			count += 1;
 			// Support $1/$2/$3 group references in replacement templates
-			const groups = args.slice(1, -2);
 			return replacement.replace(/\$(\d)/g, (_, idx: string) => {
 				const value = groups[Number.parseInt(idx, 10) - 1];
 				return typeof value === "string" ? value : "";
@@ -133,6 +178,22 @@ function redactChunk(
 	}
 
 	return { text, count };
+}
+
+/**
+ * End of the slice starting at `offset`: a line break if one lies in the second half of the window, else whitespace
+ * (a token never contains any, so it is not split across slices), else a hard cut.
+ */
+function findChunkEnd(input: string, offset: number, maxChunk: number): number {
+	const hardEnd = Math.min(input.length, offset + maxChunk);
+	if (hardEnd >= input.length) return hardEnd;
+	const floor = offset + Math.floor(maxChunk / 2);
+	const lastNewline = input.lastIndexOf("\n", hardEnd);
+	if (lastNewline > floor) return lastNewline + 1;
+	for (let i = hardEnd; i > floor; i--) {
+		if (/\s/.test(input.charAt(i - 1))) return i;
+	}
+	return hardEnd;
 }
 
 /**
@@ -164,13 +225,7 @@ export function redactSecrets(input: string, options?: SecretRedactionOptions): 
 	let totalCount = 0;
 	let offset = 0;
 	while (offset < input.length) {
-		let end = Math.min(input.length, offset + maxChunk);
-		if (end < input.length) {
-			const lastNewline = input.lastIndexOf("\n", end);
-			if (lastNewline > offset + Math.floor(maxChunk / 2)) {
-				end = lastNewline + 1;
-			}
-		}
+		const end = findChunkEnd(input, offset, maxChunk);
 		const res = redactChunk(input.slice(offset, end), patterns, categories);
 		parts.push(res.text);
 		totalCount += res.count;
