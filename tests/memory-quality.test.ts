@@ -658,7 +658,8 @@ describe("C. Retrieval quality", () => {
 				await hybrid.applyMemoryMutation(T, U, { op: "UPDATE", targetId: tool.id, content: "Now cooks recipes", confidence: 0.9 });
 				provider.calls.length = 0;
 				expect(await hybrid.search(T, U, "text editor")).toHaveLength(0);
-				expect(provider.calls[0]).toHaveLength(2);
+				// the query and the stale document are embedded in separate calls (asymmetric query/document prompts)
+				expect(provider.calls).toEqual([["text editor"], ["user.tool: Now cooks recipes"]]);
 
 				// forgetting removes the vector
 				expect(await hybrid.forgetMemory(T, U, tool.id)).toBe(true);

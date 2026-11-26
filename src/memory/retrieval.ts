@@ -333,16 +333,21 @@ export function hybridScore(blend: number, cosine: number, vectorWeight: number)
 }
 
 /**
- * Calibrates raw embedding cosine similarity into [0, 1] above the high-dimensional embedding noise
- * floor (`floor = 0.24`) with a concave curve over `[0.24, 0.74]`. Unrelated texts (cosine <= 0.26)
- * stay cleanly below abstention thresholds while genuine zero-overlap semantic paraphrases (~0.30..0.55)
- * receive strong calibrated relevance.
+ * Calibrates raw embedding cosine similarity into [0, 1] above the model's embedding noise floor with a
+ * concave curve over `[floor, ceiling]` (default `[0.24, 0.74]`, tuned for all-MiniLM-L6-v2; instruction-tuned
+ * models such as EmbeddingGemma have much higher unrelated-text cosines and publish their own calibration).
+ * Unrelated texts (cosine <= floor) stay cleanly below abstention thresholds while genuine zero-overlap
+ * semantic paraphrases receive strong calibrated relevance.
  */
-export function calibrateCosine(cosine: number, floor = 0.24): number {
+export function calibrateCosine(cosine: number, floor = 0.24, ceiling = 0.74): number {
 	if (!Number.isFinite(cosine) || cosine <= floor) return 0;
-	const norm = Math.min(1, (cosine - floor) / (0.74 - floor));
+	const span = ceiling > floor ? ceiling - floor : 0.5;
+	const norm = Math.min(1, (cosine - floor) / span);
 	return Math.pow(norm, 0.55);
 }
+
+/** Default cosine calibration (small sentence-transformers such as all-MiniLM-L6-v2). */
+export const DEFAULT_COSINE_CALIBRATION: { readonly floor: number; readonly ceiling: number } = { floor: 0.24, ceiling: 0.74 };
 
 export interface MultiLaneSignals {
 	readonly lexical: number;
@@ -356,6 +361,13 @@ export interface MultiLaneSignals {
 	readonly temporalConflict?: boolean;
 	/** Optional multiplier for historical-audit queries (e.g. >1 for superseded, <1 for excluded current state). */
 	readonly historicalMultiplier?: number;
+	/** Cosine calibration of the active embedding model (default `DEFAULT_COSINE_CALIBRATION`). */
+	readonly cosineCalibration?: { readonly floor: number; readonly ceiling: number };
+	/**
+	 * Query-relative salience of this memory's cosine in [0, 1] (see `vectorSalience`). Multiplies the calibrated
+	 * vector relevance; omitted = 1 (no gating, e.g. tiny stores where per-query statistics are unreliable).
+	 */
+	readonly vectorSalience?: number;
 }
 
 /**
@@ -365,6 +377,21 @@ export interface MultiLaneSignals {
  * Key property: metadata MODULATES genuine relevance (`relevance * (0.78 + 0.40 * meta)`) rather than
  * inventing score out of thin air, guaranteeing clean abstention on unanswerable queries!
  */
+/** Scores are linear below this knee and saturate smoothly above it (see `softCap`). */
+export const SCORE_SOFT_CAP_KNEE = 0.85;
+
+/**
+ * Monotonic soft saturation into [0, 1): identity up to `SCORE_SOFT_CAP_KNEE`, then an exponential approach to 1
+ * with matching slope. Unlike a hard `min(1, x)` it never collapses strong candidates into ties, which would
+ * otherwise be broken by arbitrary memory ids (e.g. superseded vs current versions in historical queries).
+ */
+export function softCap(x: number): number {
+	if (!Number.isFinite(x)) return x > 0 ? 1 : 0;
+	if (x <= SCORE_SOFT_CAP_KNEE) return x;
+	const head = 1 - SCORE_SOFT_CAP_KNEE;
+	return SCORE_SOFT_CAP_KNEE + head * (1 - Math.exp(-(x - SCORE_SOFT_CAP_KNEE) / head));
+}
+
 export function fuseRetrievalSignals(
 	signals: MultiLaneSignals,
 	memory: RankableMemory,
@@ -373,7 +400,9 @@ export function fuseRetrievalSignals(
 ): number {
 	const lex = Math.max(0, Math.min(1, signals.lexical));
 	const hasVector = signals.cosine !== undefined;
-	const vec = hasVector ? calibrateCosine(signals.cosine!) : 0;
+	const cal = signals.cosineCalibration ?? DEFAULT_COSINE_CALIBRATION;
+	const salience = Math.max(0, Math.min(1, signals.vectorSalience ?? 1));
+	const vec = hasVector ? calibrateCosine(signals.cosine!, cal.floor, cal.ceiling) * salience : 0;
 	const graph = Math.max(0, Math.min(1, signals.graph));
 	const temporal = Math.max(0, Math.min(1, signals.temporal));
 
@@ -385,7 +414,7 @@ export function fuseRetrievalSignals(
 		const vwShift = (opts.vectorWeight - 0.45) * 0.25;
 		const weightedLex = Math.max(0, Math.min(1, lex * (1 - vwShift)));
 		const weightedVec = Math.max(0, Math.min(1, vec * (1 + vwShift)));
-		relevance = Math.min(1, 0.9 * Math.max(weightedLex, weightedVec) + 0.24 * Math.min(weightedLex, weightedVec));
+		relevance = softCap(0.9 * Math.max(weightedLex, weightedVec) + 0.24 * Math.min(weightedLex, weightedVec));
 		if (primary > 0 && relevance === 0) relevance = 0.85 * primary + 0.2 * secondary;
 	} else {
 		relevance = lex;
@@ -394,12 +423,13 @@ export function fuseRetrievalSignals(
 	// 2. Entity-graph multi-hop PPR lane (additive residual so bridged 2-hop targets surface beside/above hop-1!)
 	if (graph > 0) {
 		const graphGain = hasVector ? 0.6 : 0.62;
-		relevance = Math.min(1, relevance + graphGain * graph * (1 - 0.3 * relevance));
+		// Noisy-OR: graph evidence fills the gap left by direct evidence instead of re-boosting what already matched.
+		relevance = softCap(relevance + graphGain * graph * (1 - relevance));
 	}
 
 	// 3. Temporal anchor alignment (tightness-ranked boost; mild dampen on explicit off-year conflict)
 	if (temporal > 0) {
-		relevance = Math.min(1, relevance + 0.34 * temporal * (1 - 0.3 * relevance));
+		relevance = softCap(relevance + 0.34 * temporal * (1 - 0.3 * relevance));
 	} else if (signals.temporalConflict && relevance > 0) {
 		relevance *= 0.74;
 	}
@@ -415,7 +445,50 @@ export function fuseRetrievalSignals(
 		finalScore *= signals.historicalMultiplier;
 	}
 
-	return Math.max(0, Math.min(1, finalScore));
+	return Math.max(0, softCap(finalScore));
+}
+
+/** Per-query cosine distribution over the searched scope (all in-scope memories with a vector). */
+export interface CosineStats {
+	readonly count: number;
+	readonly mean: number;
+	readonly std: number;
+}
+
+/** Minimum scope size for query-relative salience; smaller stores keep absolute calibration only. */
+export const SALIENCE_MIN_SCOPE = 20;
+/** z-score below which a cosine is indistinguishable from this query's background (1.5 sigma ~ top 7%). */
+export const SALIENCE_Z_LOW = 1.5;
+/** z-score from which a cosine is a clear outlier for this query (3 sigma ~ top 0.1%). */
+export const SALIENCE_Z_HIGH = 3;
+
+export function cosineStats(cosines: Iterable<number>): CosineStats {
+	let n = 0;
+	let sum = 0;
+	let sumSq = 0;
+	for (const c of cosines) {
+		if (!Number.isFinite(c)) continue;
+		n += 1;
+		sum += c;
+		sumSq += c * c;
+	}
+	if (n === 0) return { count: 0, mean: 0, std: 0 };
+	const mean = sum / n;
+	return { count: n, mean, std: Math.sqrt(Math.max(0, sumSq / n - mean * mean)) };
+}
+
+/**
+ * Query-relative salience of a cosine: smoothstep of its z-score against the query's own similarity distribution
+ * over the whole scope. Instruction-tuned embedders (EmbeddingGemma: unrelated ~0.54, matches ~0.77) have a narrow
+ * absolute band where the strongest unrelated pairs reach the weakest true matches; what separates a real match is
+ * that it stands out from everything else the query touches. Unanswerable queries produce no outlier and are gated
+ * down, which keeps abstention clean without a per-model threshold. Returns 1 (no gating) for small scopes.
+ */
+export function vectorSalience(cosine: number, stats: CosineStats | undefined): number {
+	if (!stats || stats.count < SALIENCE_MIN_SCOPE || stats.std < 1e-6) return 1;
+	const z = (cosine - stats.mean) / stats.std;
+	const t = Math.max(0, Math.min(1, (z - SALIENCE_Z_LOW) / (SALIENCE_Z_HIGH - SALIENCE_Z_LOW)));
+	return t * t * (3 - 2 * t);
 }
 
 // ---------------------------------------------------------------------------------------------------------------------

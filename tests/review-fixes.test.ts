@@ -144,7 +144,9 @@ describe("embeddings", () => {
 
 			const hits = await memory.search(T, U, "text editor");
 			expect(hits.map((h) => h.memory.id)).toEqual([mem.id]);
-			expect(calls.at(-1)).toHaveLength(2); // query + the re-embedded corrupt row
+			// query and the re-embedded corrupt row go out as separate query/document calls
+			expect(calls).toContainEqual(["text editor"]);
+			expect(calls).toContainEqual(["user.tool: daily editor"]);
 			const stored = appDb.db.prepare("SELECT length(vector) AS n FROM memory_embeddings WHERE memory_id = ?").get(mem.id) as { n: number };
 			expect(stored.n).toBe(8);
 		} finally {
