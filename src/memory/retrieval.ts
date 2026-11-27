@@ -484,8 +484,8 @@ export function cosineStats(cosines: Iterable<number>): CosineStats {
  * that it stands out from everything else the query touches. Unanswerable queries produce no outlier and are gated
  * down, which keeps abstention clean without a per-model threshold. Returns 1 (no gating) for small scopes.
  */
-export function vectorSalience(cosine: number, stats: CosineStats | undefined): number {
-	if (!stats || stats.count < SALIENCE_MIN_SCOPE || stats.std < 1e-6) return 1;
+export function vectorSalience(cosine: number, stats: CosineStats | undefined, ceiling = DEFAULT_COSINE_CALIBRATION.ceiling): number {
+	if (cosine >= ceiling || !stats || stats.count < SALIENCE_MIN_SCOPE || stats.std < 1e-6) return 1;
 	const z = (cosine - stats.mean) / stats.std;
 	const t = Math.max(0, Math.min(1, (z - SALIENCE_Z_LOW) / (SALIENCE_Z_HIGH - SALIENCE_Z_LOW)));
 	return t * t * (3 - 2 * t);

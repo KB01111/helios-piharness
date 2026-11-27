@@ -39,6 +39,7 @@ export class GeminiBackend implements EmbeddingBackend {
 		if (!options.apiKey.trim()) throw new EmbeddingError("MISCONFIGURED", `backend ${options.id}: Gemini API key is required`);
 		this.id = options.id;
 		this.model = (options.model ?? "gemini-embedding-001").replace(/^models\//, "");
+		if (/^gemini-embedding-2(?:-|$)/.test(this.model)) throw new EmbeddingError("MISCONFIGURED", "gemini-embedding-2 is unsupported; use gemini-embedding-001");
 		const info = resolveModelInfo(this.model, options.space ? { space: options.space } : undefined);
 		this.space = info.space;
 		this.nativeDimensions = info.nativeDimensions;

@@ -52,7 +52,7 @@ export const SELF_TEST_DISTRACTORS: readonly string[] = [
 ];
 
 export interface SelfTestResult {
-	readonly calibration: SimilarityCalibration;
+	readonly calibration?: SimilarityCalibration;
 	readonly separation: number;
 	readonly top1: number;
 	readonly negativeMedian: number;
@@ -68,7 +68,7 @@ function cosine(a: ArrayLike<number>, b: ArrayLike<number>): number {
 	let s = 0;
 	let na = 0;
 	let nb = 0;
-	const n = Math.min(a.length, b.length);
+	const n = a.length;
 	for (let i = 0; i < n; i++) {
 		s += a[i]! * b[i]!;
 		na += a[i]! * a[i]!;
@@ -97,6 +97,10 @@ export async function runEmbeddingSelfTest(
 	const docs = [...SELF_TEST_PAIRS.map((p) => p[1]), ...SELF_TEST_DISTRACTORS];
 	const qv = await embed(queries, "query");
 	const dv = await embed(docs, "document");
+	const dim = qv[0]?.length;
+	if (!dim || qv.length !== queries.length || dv.length !== docs.length || [...qv, ...dv].some(row => row?.length !== dim)) {
+		throw new Error("self-test returned incompatible embedding shapes");
+	}
 	const pos: number[] = [];
 	const neg: number[] = [];
 	let top1 = 0;
@@ -117,10 +121,10 @@ export async function runEmbeddingSelfTest(
 	const positiveMedian = quantile(pos, 0.5);
 	const separation = pos.filter((p) => p > floor).length / pos.length;
 	const top1Rate = top1 / queries.length;
-	// Keep a usable span even for degenerate models (ceiling must exceed floor).
-	const ceiling = Math.max(positiveMedian, floor + 0.05);
+	// A failed quality verdict is still useful when the rounded measurement has no usable span.
+	const calibration = { floor: round3(floor), ceiling: round3(Math.min(1, positiveMedian)) };
 	return {
-		calibration: { floor: round3(floor), ceiling: round3(Math.min(1, ceiling)) },
+		...(calibration.ceiling > calibration.floor ? { calibration } : {}),
 		separation: round3(separation),
 		top1: round3(top1Rate),
 		negativeMedian: round3(quantile(neg, 0.5)),

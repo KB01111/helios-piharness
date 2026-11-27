@@ -34,9 +34,11 @@ export interface BenchMemoryEngine {
 export class CachedHttpEmbeddingProvider implements EmbeddingProvider {
 	readonly model: string;
 	private readonly endpoint: string;
+	private readonly apiKey: string | undefined;
 	private readonly cache = new Map<string, Float32Array>();
 
-	constructor(options: { readonly endpoint: string; readonly model: string }) {
+	constructor(options: { readonly endpoint: string; readonly apiKey?: string; readonly model: string }) {
+		this.apiKey = options.apiKey;
 		this.endpoint = options.endpoint.replace(/\/+$/, "");
 		this.model = options.model;
 	}
@@ -56,7 +58,7 @@ export class CachedHttpEmbeddingProvider implements EmbeddingProvider {
 				const slice = missing.slice(start, start + 64);
 				const res = await fetch(`${this.endpoint}/embeddings`, {
 					method: "POST",
-					headers: { "Content-Type": "application/json", Authorization: "Bearer local-bench" },
+					headers: { "Content-Type": "application/json", ...(this.apiKey ? { authorization: `Bearer ${this.apiKey}` } : {}) },
 					body: JSON.stringify({ model: this.model, input: slice.map((s) => s.text) }),
 				});
 				if (!res.ok) throw new Error(`Embedding HTTP ${res.status}: ${await res.text()}`);

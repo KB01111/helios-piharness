@@ -148,6 +148,32 @@ describe("EmbeddingRouter", () => {
 		expect(events).toContain("embedding_backend_recovered");
 	});
 
+	it("admits just one recovery probe and releases its slot after abort", async () => {
+		const primary = new FakeBackend("primary");
+		const router = new EmbeddingRouter({ backends: [primary, new FakeBackend("fallback")], failureThreshold: 1, cooldownMs: 0 });
+		primary.fail = new Error("offline");
+		await router.embed({ texts: ["first"] });
+		const gate = Promise.withResolvers<Float32Array[]>();
+		primary.embed = () => gate.promise;
+		const controller = new AbortController();
+		const probe = router.embed({ texts: ["probe"], signal: controller.signal });
+		expect((await router.embed({ texts: ["concurrent"] })).servedBy).toEqual(["fallback"]);
+		controller.abort();
+		gate.resolve([axis(0)]);
+		await expect(probe).rejects.toMatchObject({ code: "TIMEOUT" });
+		expect((await router.embed({ texts: ["retry"] })).servedBy).toEqual(["primary"]);
+	});
+
+	it("bounds health even while a shared load is pending", async () => {
+		const backend = new FakeBackend("slow");
+		const gate = Promise.withResolvers<{ ok: boolean }>();
+		backend.health = () => gate.promise;
+		const router = new EmbeddingRouter({ backends: [backend] });
+		expect((await router.health(10)).ok).toBe(false);
+		gate.resolve({ ok: true });
+		expect((await router.health()).ok).toBe(true);
+	});
+
 	it("does not fall back or trip the breaker on client errors", async () => {
 		const primary = new FakeBackend("a");
 		const fallback = new FakeBackend("b");
@@ -229,7 +255,7 @@ describe("runEmbeddingSelfTest", () => {
 		const result = await runEmbeddingSelfTest(async (texts) => texts.map(semanticVector));
 		expect(result.passed).toBe(true);
 		expect(result.top1).toBe(1);
-		expect(result.calibration.ceiling).toBeGreaterThan(result.calibration.floor);
+		expect(result.calibration!.ceiling).toBeGreaterThan(result.calibration!.floor);
 		expect(SELF_TEST_DISTRACTORS.length).toBeGreaterThan(0);
 	});
 });
@@ -285,6 +311,21 @@ describe("embedding HTTP server", () => {
 		expect((await post({ input: "x".repeat(4_096) })).status).toBe(413);
 	});
 
+	it("cancels an oversized stream before the sender finishes", async () => {
+		const { app } = makeServer({ maxBodyBytes: 12 });
+		let cancelled = false;
+		const body = new ReadableStream({
+			start(controller) {
+				controller.enqueue(new Uint8Array(8));
+				controller.enqueue(new Uint8Array(8));
+			},
+			cancel() { cancelled = true; },
+		});
+		const response = await app.request("/v1/embeddings", { method: "POST", body, duplex: "half" } as RequestInit);
+		expect(response.status).toBe(413);
+		expect(cancelled).toBe(true);
+	});
+
 	it("requires a bearer token on /v1 when API keys are configured, keeping /health public", async () => {
 		const { app } = makeServer({ apiKeys: ["secret-1"] });
 		expect((await app.request("/v1/models")).status).toBe(401);
@@ -301,6 +342,7 @@ describe("embedding HTTP server", () => {
 		const res = await app.request("/v1/embeddings", { method: "POST", body: JSON.stringify({ input: "x" }) });
 		expect(res.status).toBe(503);
 		expect(((await res.json()) as { error: { type: string } }).error.type).toBe("unavailable");
+		expect(await (await app.request("/health")).text()).not.toMatch(/lastError|detail|down/);
 	});
 });
 
@@ -317,6 +359,25 @@ describe("HttpEmbeddingProvider", () => {
 		const vecs = await provider.embed(["hi"], { inputType: "query" });
 		expect(vecs[0]).toHaveLength(DIM);
 		expect(backend.calls[0]?.texts).toEqual(["task: search result | query: hi"]);
+	});
+
+	it("discovers native dimensions for an unknown checkpoint before storing its identity", async () => {
+		const router = new EmbeddingRouter({ backends: [new FakeBackend("a")] });
+		const provider = await HttpEmbeddingProvider.connect({ baseUrl: "http://embed.local/v1", fetchImpl: honoFetch(createEmbedHttpServer(router)) });
+		expect(provider.model).toBe(`test/space@${DIM}`);
+		expect(await provider.embed(["second request"])).toHaveLength(1);
+	});
+
+	it("rejects malformed response indices while accepting reordered rows", async () => {
+		let indices = [1, 0];
+		const fetchImpl: typeof fetch = async url => String(url).endsWith("/models")
+			? Response.json({ data: [] })
+			: Response.json({ data: indices.map((index, i) => ({ index, embedding: [i + 1] })) });
+		const provider = await HttpEmbeddingProvider.connect({ baseUrl: "http://fixture/v1", model: "fixture", fetchImpl });
+		expect((await provider.embed(["a", "b"])).map(row => row[0])).toEqual([2, 1]);
+		for (indices of [[0, 0], [0, 2], [0, -1], [0, 0.5]]) {
+			await expect(provider.embed(["a", "b"])).rejects.toMatchObject({ code: "UPSTREAM" });
+		}
 	});
 
 	it("refuses vectors from a server that switched embedding space", async () => {
@@ -433,6 +494,25 @@ describe("embedding backends", () => {
 		await backend.embed(["d"], { inputType: "document" });
 		expect(seen[1]?.body.requests[0]).toMatchObject({ taskType: "RETRIEVAL_DOCUMENT" });
 		expect(() => new GeminiBackend({ id: "g", apiKey: " " })).toThrow(/API key/);
+	});
+
+	it("applies the configured family to an unknown ONNX checkpoint during serving and self-test", async () => {
+		const seen: string[] = [];
+		const backend = new OnnxBackend({
+			id: "custom", model: "custom/checkpoint", promptFamily: "e5",
+			loadTransformers: async () => ({
+				env: {}, pipeline: async () => async texts => {
+					seen.push(...texts);
+					return { tolist: () => texts.map(() => [1, 0]) };
+				},
+			}),
+		});
+		const router = new EmbeddingRouter({ backends: [backend], promptFamily: "e5" });
+		await router.embed({ texts: ["example"] });
+		await router.selfTest();
+		expect(seen).toContain("passage: example");
+		expect(seen).toContain(`query: ${SELF_TEST_PAIRS[0]![0]}`);
+		expect(seen).toContain(`passage: ${SELF_TEST_PAIRS[0]![1]}`);
 	});
 
 	it("ONNX backend loads lazily once, serializes inference, and explains a missing optional dependency", async () => {
@@ -574,6 +654,29 @@ describe("query-relative vector salience", () => {
 		expect(calibrateCosine(0.5, 0.618, 0.773)).toBe(0);
 	});
 
+	it("returns a group of strong semantic matches without other evidence", async () => {
+		const db = AppDatabase.open({ dbPath: ":memory:" });
+		try {
+			const service = new SqliteMemoryService(db, { embeddingProvider: {
+				model: "group-test",
+				async embed(texts, options) {
+					return texts.map(text => {
+						if (options?.inputType === "query") return [1, 0];
+						const cosine = text.includes("amber") ? 0.8 : 0.4;
+						return [cosine, Math.sqrt(1 - cosine ** 2)];
+					});
+				},
+			} });
+			for (let i = 0; i < 20; i++) {
+				await service.pinMemory("t", "u", { key: `item.${i}`, content: `${i < 10 ? "amber" : "blue"} sample ${i}` });
+			}
+			const hits = await service.search("t", "u", "opaque inquiry", { limit: 20, useGraph: false, temporalMode: "off" });
+			expect(hits.map(h => h.memory.key).sort()).toEqual(Array.from({ length: 10 }, (_, i) => `item.${i}`));
+		} finally {
+			db.close();
+		}
+	});
+
 	it("SqliteMemoryService honours the provider's declared calibration and embeds queries/documents separately", async () => {
 		const appDb = AppDatabase.open({ dbPath: ":memory:" });
 		try {
@@ -617,6 +720,14 @@ describe("query-relative vector salience", () => {
 });
 
 describe("harness embedding config", () => {
+	it("selects implicit server credentials only for exact provider hosts", () => {
+		const config = (url: string) => loadEmbedServerConfig({ EMBED_OPENAI_URL: url, OPENAI_API_KEY: "oa", OPENROUTER_API_KEY: "or" }).openai;
+		expect(config("https://api.openai.com/v1").apiKey).toBe("oa");
+		expect(config("https://openrouter.ai/v1").apiKey).toBe("or");
+		expect(config("https://openrouter.ai.example/v1").apiKey).toBeUndefined();
+		expect(config("https://example.org/api.openai.com").apiKey).toBeUndefined();
+	});
+
 	it("is off by default and parses EMBEDDINGS_* (OpenAI key fallback only for api.openai.com)", () => {
 		expect(loadConfig({}).embeddingsUrl).toBeUndefined();
 		const local = loadConfig({ EMBEDDINGS_URL: "http://127.0.0.1:18765/v1", EMBEDDINGS_DIMENSIONS: "256", OPENAI_API_KEY: "sk" });

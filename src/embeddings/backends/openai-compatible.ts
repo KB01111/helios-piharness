@@ -90,8 +90,8 @@ export class OpenAICompatibleBackend implements EmbeddingBackend {
 		}
 		const out: Array<Float32Array | undefined> = new Array(texts.length);
 		data.forEach((item, position) => {
-			const index = typeof item.index === "number" ? item.index : position;
-			if (index < 0 || index >= texts.length || out[index]) {
+			const index = item.index === undefined ? position : item.index;
+			if (!Number.isInteger(index) || index < 0 || index >= texts.length || out[index]) {
 				throw new EmbeddingError("UPSTREAM", `backend ${this.id}: invalid or duplicate embedding index ${index}`);
 			}
 			out[index] =

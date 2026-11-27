@@ -26,11 +26,12 @@ export function buildEmbeddingService(
 			case "npu": {
 				if (config.npu.autostart) {
 					const url = new URL(config.npu.url);
+					if (url.protocol !== "http:") throw new EmbeddingError("MISCONFIGURED", "FastFlowLM autostart requires an http URL");
 					supervisor = new FlmSupervisor({
 						command: config.npu.flmCommand,
 						chatModel: config.npu.chatModel,
 						host: url.hostname,
-						port: Number(url.port || 52625),
+						port: Number(url.port || 80),
 						powerMode: config.npu.powerMode,
 						log: (event, fields) => options.onEvent?.(event, fields ?? {}),
 					});
@@ -50,6 +51,7 @@ export function buildEmbeddingService(
 			case "onnx":
 				return new OnnxBackend({
 					id: "onnx",
+					...(config.promptFamily ? { promptFamily: config.promptFamily } : {}),
 					model: config.onnx.model,
 					device: config.onnx.device,
 					dtype: config.onnx.dtype,

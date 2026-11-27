@@ -799,6 +799,8 @@ async function main(): Promise<void> {
 	const gatePath = gateIdx >= 0 ? args[gateIdx + 1] : undefined;
 	const inProcIdx = args.indexOf("--in-process");
 	const inProcessProfile = inProcIdx >= 0 ? args[inProcIdx + 1] : undefined;
+	const keyIndex = args.indexOf("--api-key");
+	const apiKey = keyIndex >= 0 ? args[keyIndex + 1] : undefined;
 	const lexicalOnly = args.includes("--lexical-only");
 
 	// Embedder resolution: in-process router (--in-process <profile>) > Helios embedding server > legacy MiniLM server.
@@ -818,18 +820,18 @@ async function main(): Promise<void> {
 		console.error(`[bench] In-process embedding router (${inProcessProfile}): ${embedder.model}`);
 	} else {
 		try {
-			const helios = await HttpEmbeddingProvider.connect({ baseUrl: endpoint, timeoutMs: 120_000 });
+			const helios = await HttpEmbeddingProvider.connect({ baseUrl: endpoint, ...(apiKey ? { apiKey } : {}), timeoutMs: 120_000 });
 			embedder = helios;
 			console.error(`[bench] Connected to Helios embedding server at ${endpoint}: ${helios.model}`);
 			if (args.includes("--rerank")) {
-				reranker = await HttpReranker.connect({ baseUrl: endpoint, timeoutMs: 120_000 });
+				reranker = await HttpReranker.connect({ baseUrl: endpoint, ...(apiKey ? { apiKey } : {}), timeoutMs: 120_000 });
 				console.error(`[bench] Reranker: ${reranker.model} (answer threshold ${reranker.answerThreshold ?? "default"})`);
 			}
 		} catch {
 			try {
-				const health = await fetch(endpoint.replace(/\/v1$/, "/health"));
+				const health = await fetch(endpoint.replace(/\/v1$/, "/health"), { headers: apiKey ? { authorization: `Bearer ${apiKey}` } : {} });
 				if (health.ok) {
-					embedder = new CachedHttpEmbeddingProvider({ endpoint, model: "sentence-transformers/all-MiniLM-L6-v2" });
+					embedder = new CachedHttpEmbeddingProvider({ endpoint, ...(apiKey ? { apiKey } : {}), model: "sentence-transformers/all-MiniLM-L6-v2" });
 					console.error(`[bench] Connected to legacy embedding server at ${endpoint}`);
 				}
 			} catch {

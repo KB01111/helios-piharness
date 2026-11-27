@@ -10,8 +10,9 @@
  * then degrades to lexical ranking) instead of silently mixing incomparable vectors.
  */
 
+import { setTimeout as delay } from "node:timers/promises";
 import type { EmbeddingProvider, Reranker } from "../contracts/app-capabilities.js";
-import { errorText, postJson, redactUrl, toFloat32, base64ToFloat32, withTimeout } from "./backends/http-util.js";
+import { errorText, postJson, redactUrl, toFloat32, base64ToFloat32, waitWithSignal, withTimeout } from "./backends/http-util.js";
 import { resolveModelInfo } from "./models.js";
 import type { EmbeddingRouter } from "./router.js";
 import { EmbeddingError, type SimilarityCalibration } from "./types.js";
@@ -34,7 +35,7 @@ export interface HttpEmbeddingProviderOptions {
 	/** Overrides the calibration announced by the server or derived from the model. */
 	readonly similarity?: SimilarityCalibration;
 	readonly fetchImpl?: typeof fetch;
-	readonly sleep?: (ms: number) => Promise<void>;
+	readonly sleep?: (ms: number, signal?: AbortSignal) => Promise<void>;
 }
 
 interface HeliosModelEntry {
@@ -63,7 +64,7 @@ export class HttpEmbeddingProvider implements EmbeddingProvider {
 	private readonly retries: number;
 	private readonly maxBatchSize: number;
 	private readonly fetchImpl: typeof fetch | undefined;
-	private readonly sleep: (ms: number) => Promise<void>;
+	private readonly sleep: HttpEmbeddingProviderOptions["sleep"];
 
 	private constructor(init: {
 		readonly options: HttpEmbeddingProviderOptions;
@@ -84,7 +85,7 @@ export class HttpEmbeddingProvider implements EmbeddingProvider {
 		this.retries = Math.max(0, options.retries ?? 2);
 		this.maxBatchSize = Math.max(1, options.maxBatchSize ?? 128);
 		this.fetchImpl = options.fetchImpl;
-		this.sleep = options.sleep ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
+		this.sleep = options.sleep;
 	}
 
 	/**
@@ -139,7 +140,7 @@ export class HttpEmbeddingProvider implements EmbeddingProvider {
 		const info = resolveModelInfo(options.model);
 		return new HttpEmbeddingProvider({
 			options,
-			model: `${info.space}@${options.dimensions ?? info.nativeDimensions ?? "native"}`,
+			model: `${info.space}${info.promptFamily === "none" ? "" : ":prompt=none"}@${options.dimensions ?? info.nativeDimensions ?? "native"}`,
 			upstreamModel: options.model,
 			helios: false,
 			similarity: options.similarity ?? info.calibration,
@@ -168,7 +169,14 @@ export class HttpEmbeddingProvider implements EmbeddingProvider {
 
 		let lastError: unknown;
 		for (let attempt = 0; attempt <= this.retries; attempt++) {
-			if (attempt > 0) await this.sleep(Math.min(2_000, 150 * 2 ** (attempt - 1)));
+			const signal = options?.signal;
+			signal?.throwIfAborted();
+			if (attempt > 0) {
+				const ms = Math.min(2_000, 150 * 2 ** (attempt - 1));
+				if (this.sleep) await waitWithSignal(this.sleep(ms, signal), signal);
+				else await delay(ms, undefined, { signal });
+				signal?.throwIfAborted();
+			}
 			try {
 				const json = (await postJson(`${this.baseUrl}/embeddings`, body, {
 					headers: this.headers,
@@ -188,11 +196,12 @@ export class HttpEmbeddingProvider implements EmbeddingProvider {
 				}
 				const vectors: Float32Array[] = new Array(texts.length);
 				data.forEach((item, pos) => {
-					const idx = typeof item.index === "number" ? item.index : pos;
+					const idx = item.index === undefined ? pos : item.index;
+					if (!Number.isInteger(idx) || idx < 0 || idx >= vectors.length || vectors[idx]) throw new EmbeddingError("UPSTREAM", "invalid or duplicate embedding index");
 					vectors[idx] =
 						typeof item.embedding === "string" ? base64ToFloat32(item.embedding, "embeddings") : toFloat32(item.embedding, "embeddings");
 				});
-				if (vectors.some((v) => !v)) throw new EmbeddingError("UPSTREAM", "embedding response is missing indices");
+				// Count, range and uniqueness above guarantee complete coverage.
 				return vectors;
 			} catch (error) {
 				lastError = error;

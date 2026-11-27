@@ -47,11 +47,27 @@ export function createEmbedHttpServer(router: EmbeddingRouter, options: EmbedHtt
 	const reranker = options.reranker;
 
 	/** Shared body reader: size limit + JSON object check. */
-	const readJsonObject = async (c: { req: { header(name: string): string | undefined; text(): Promise<string> } }): Promise<Record<string, unknown> | "too_large"> => {
+	const readJsonObject = async (c: { req: { header(name: string): string | undefined; raw: Request } }): Promise<Record<string, unknown> | "too_large"> => {
 		const declared = Number(c.req.header("content-length") ?? "0");
 		if (declared > maxBodyBytes) return "too_large";
-		const raw = await c.req.text();
-		if (Buffer.byteLength(raw) > maxBodyBytes) return "too_large";
+		const reader = c.req.raw.body?.getReader();
+		const chunks: Uint8Array[] = [];
+		let bytes = 0;
+		try {
+			while (reader) {
+				const { done, value } = await reader.read();
+				if (done) break;
+				bytes += value.byteLength;
+				if (bytes > maxBodyBytes) {
+					void reader.cancel().catch(() => undefined);
+					return "too_large";
+				}
+				chunks.push(value);
+			}
+		} finally {
+			reader?.releaseLock();
+		}
+		const raw = Buffer.concat(chunks, bytes).toString("utf8");
 		try {
 			const parsed = JSON.parse(raw) as unknown;
 			if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("not an object");
@@ -90,16 +106,17 @@ export function createEmbedHttpServer(router: EmbeddingRouter, options: EmbedHtt
 				status: health.ok ? (rerankHealth && !rerankHealth.ok ? "degraded" : "ok") : "unavailable",
 				space: router.space,
 				model: router.modelId(),
-				dimensions: router.defaultDimensions ?? router.info.nativeDimensions ?? null,
-				backends: health.backends,
-				...(rerankHealth ? { reranker: rerankHealth } : {}),
+				dimensions: router.publishedDimensions ?? null,
+				backends: health.backends.map(({ id, kind, model, circuit, ok, quarantined }) => ({ id, kind, model, circuit, ok, quarantined: Boolean(quarantined) })),
+				...(rerankHealth ? { reranker: { model: rerankHealth.model, ok: rerankHealth.ok, quarantined: Boolean(rerankHealth.quarantined) } } : {}),
 			},
 			health.ok ? 200 : 503,
 		);
 	});
 
-	app.get("/v1/models", (c) =>
-		c.json({
+	app.get("/v1/models", async (c) => {
+		if (router.publishedDimensions === undefined) await router.embed({ texts: ["dimension probe"], signal: c.req.raw.signal });
+		return c.json({
 			object: "list",
 			data: [
 				{
@@ -107,7 +124,7 @@ export function createEmbedHttpServer(router: EmbeddingRouter, options: EmbedHtt
 					object: "model",
 					owned_by: "helios-embed",
 					space: router.space,
-					dimensions: router.defaultDimensions ?? router.info.nativeDimensions ?? null,
+					dimensions: router.publishedDimensions ?? null,
 					native_dimensions: router.info.nativeDimensions ?? null,
 					matryoshka_dimensions: router.info.matryoshkaDimensions,
 					calibration: router.calibration ?? null,
@@ -125,8 +142,8 @@ export function createEmbedHttpServer(router: EmbeddingRouter, options: EmbedHtt
 						]
 					: []),
 			],
-		}),
-	);
+		});
+	});
 
 	app.post("/v1/rerank", async (c) => {
 		if (!reranker) return c.json(errorBody("this server has no reranker (EMBED_RERANK=off)", "not_found"), 404);
@@ -156,18 +173,8 @@ export function createEmbedHttpServer(router: EmbeddingRouter, options: EmbedHtt
 	});
 
 	app.post("/v1/embeddings", async (c) => {
-		const declared = Number(c.req.header("content-length") ?? "0");
-		if (declared > maxBodyBytes) return c.json(errorBody(`request body exceeds ${maxBodyBytes} bytes`, "bad_request"), 413);
-		const raw = await c.req.text();
-		if (Buffer.byteLength(raw) > maxBodyBytes) return c.json(errorBody(`request body exceeds ${maxBodyBytes} bytes`, "bad_request"), 413);
-		let body: Record<string, unknown>;
-		try {
-			const parsed = JSON.parse(raw) as unknown;
-			if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("not an object");
-			body = parsed as Record<string, unknown>;
-		} catch {
-			throw new EmbeddingError("BAD_REQUEST", "request body must be a JSON object");
-		}
+		const body = await readJsonObject(c);
+		if (body === "too_large") return c.json(errorBody(`request body exceeds ${maxBodyBytes} bytes`, "bad_request"), 413);
 
 		const input = body.input;
 		const texts = typeof input === "string" ? [input] : Array.isArray(input) ? input : undefined;

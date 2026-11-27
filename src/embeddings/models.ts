@@ -25,7 +25,7 @@ export interface ModelSpaceInfo {
 const GEMMA_MRL = [768, 512, 256, 128] as const;
 
 /** Ordered: first matching pattern wins. Patterns match the lowercased backend model id. */
-const KNOWN_MODELS: ReadonlyArray<{ readonly pattern: RegExp; readonly info: ModelSpaceInfo }> = [
+const KNOWN_MODELS: ReadonlyArray<{ readonly pattern: RegExp; readonly info: Omit<ModelSpaceInfo, "space"> & { readonly space?: string } }> = [
 	{
 		pattern: /embedding-?gemma-?2|embed-gemma-?2|embeddinggemma2/,
 		info: {
@@ -74,7 +74,6 @@ const KNOWN_MODELS: ReadonlyArray<{ readonly pattern: RegExp; readonly info: Mod
 	{
 		pattern: /nomic-embed-text/,
 		info: {
-			space: "nomic-ai/nomic-embed-text",
 			promptFamily: "nomic",
 			nativeDimensions: 768,
 			matryoshkaDimensions: [768, 512, 256, 128, 64],
@@ -83,11 +82,11 @@ const KNOWN_MODELS: ReadonlyArray<{ readonly pattern: RegExp; readonly info: Mod
 	},
 	{
 		pattern: /(^|\/)(multilingual-)?e5-/,
-		info: { space: "intfloat/e5", promptFamily: "e5", nativeDimensions: undefined, matryoshkaDimensions: [], calibration: { floor: 0.72, ceiling: 0.9 } },
+		info: { promptFamily: "e5", nativeDimensions: undefined, matryoshkaDimensions: [], calibration: { floor: 0.72, ceiling: 0.9 } },
 	},
 	{
 		pattern: /bge-(small|base|large)/,
-		info: { space: "BAAI/bge", promptFamily: "bge", nativeDimensions: undefined, matryoshkaDimensions: [], calibration: { floor: 0.45, ceiling: 0.85 } },
+		info: { promptFamily: "bge", nativeDimensions: undefined, matryoshkaDimensions: [], calibration: { floor: 0.45, ceiling: 0.85 } },
 	},
 	{
 		pattern: /text-embedding-3-small/,
@@ -112,7 +111,6 @@ const KNOWN_MODELS: ReadonlyArray<{ readonly pattern: RegExp; readonly info: Mod
 	{
 		pattern: /gemini-embedding/,
 		info: {
-			space: "google/gemini-embedding",
 			promptFamily: "none",
 			nativeDimensions: 3072,
 			matryoshkaDimensions: [3072, 1536, 768],
@@ -125,7 +123,7 @@ const KNOWN_MODELS: ReadonlyArray<{ readonly pattern: RegExp; readonly info: Mod
 export function resolveModelInfo(model: string, overrides?: { readonly space?: string; readonly promptFamily?: PromptFamily }): ModelSpaceInfo {
 	const lower = model.trim().toLowerCase();
 	const known = KNOWN_MODELS.find((entry) => entry.pattern.test(lower))?.info;
-	const base: ModelSpaceInfo = known ?? {
+	const base = known ?? {
 		space: model.trim(),
 		promptFamily: "none",
 		nativeDimensions: undefined,
@@ -134,6 +132,7 @@ export function resolveModelInfo(model: string, overrides?: { readonly space?: s
 	};
 	return {
 		...base,
+		space: base.space ?? model.trim(),
 		...(overrides?.space ? { space: overrides.space } : {}),
 		...(overrides?.promptFamily ? { promptFamily: overrides.promptFamily } : {}),
 	};

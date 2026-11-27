@@ -589,7 +589,7 @@ export class SqliteMemoryService implements MemoryService {
 		const vectorRelevance = (id: string): number => {
 			if (!cosines) return 0;
 			const cos = cosines.get(id) ?? 0;
-			return this.calibrate(cos) * vectorSalience(cos, cosStats);
+			return this.calibrate(cos) * vectorSalience(cos, cosStats, this.cosineCalibration.ceiling);
 		};
 		if (this.embeddingProvider && query.trim().length > 0) {
 			try {
@@ -806,7 +806,7 @@ export class SqliteMemoryService implements MemoryService {
 					temporalConflict: cand.temporalConflict,
 					historicalMultiplier,
 					cosineCalibration: this.cosineCalibration,
-					...(hasVector ? { vectorSalience: vectorSalience(rawCosine ?? 0, cosStats) } : {}),
+					...(hasVector ? { vectorSalience: vectorSalience(rawCosine ?? 0, cosStats, this.cosineCalibration.ceiling) } : {}),
 				},
 				memory,
 				nowMs,

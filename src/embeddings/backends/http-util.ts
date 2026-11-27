@@ -18,6 +18,22 @@ export function withTimeout(signal: AbortSignal | undefined, timeoutMs: number):
 	};
 }
 
+/** Stops waiting on an operation that may ignore cancellation (e.g. a shared model load). */
+export async function waitWithSignal<T>(operation: Promise<T>, signal?: AbortSignal): Promise<T> {
+	if (!signal) return operation;
+	let onAbort!: () => void;
+	const aborted = new Promise<never>((_, reject) => {
+		onAbort = () => reject(signal.reason);
+		if (signal.aborted) onAbort();
+		else signal.addEventListener("abort", onAbort, { once: true });
+	});
+	try {
+		return await Promise.race([operation, aborted]);
+	} finally {
+		signal.removeEventListener("abort", onAbort);
+	}
+}
+
 /** POSTs JSON and returns the parsed body, mapping network/HTTP failures onto `EmbeddingError`. Never logs secrets. */
 export async function postJson(
 	url: string,

@@ -10,7 +10,7 @@
  * pays for it unless this backend is configured.
  */
 
-import { resolveModelInfo } from "../models.js";
+import { type PromptFamily, resolveModelInfo } from "../models.js";
 import { EmbeddingError, type BackendEmbedOptions, type BackendHealth, type EmbeddingBackend } from "../types.js";
 import { errorText } from "./http-util.js";
 
@@ -28,6 +28,8 @@ export interface OnnxBackendOptions {
 	readonly offline?: boolean;
 	readonly maxBatchSize?: number;
 	readonly space?: string;
+	readonly promptFamily?: PromptFamily;
+	readonly wantsPrompts?: boolean;
 	/** Test seam: replaces the dynamic `import("@huggingface/transformers")`. */
 	readonly loadTransformers?: () => Promise<TransformersModule>;
 }
@@ -70,7 +72,7 @@ export class OnnxBackend implements EmbeddingBackend {
 		const info = resolveModelInfo(this.model, options.space ? { space: options.space } : undefined);
 		this.space = info.space;
 		this.nativeDimensions = info.nativeDimensions;
-		this.wantsPrompts = info.promptFamily !== "none";
+		this.wantsPrompts = options.wantsPrompts ?? (options.promptFamily ?? info.promptFamily) !== "none";
 		this.device = options.device ?? "cpu";
 		this.dtype = options.dtype ?? "q4";
 		this.maxBatchSize = Math.max(1, options.maxBatchSize ?? 128);
@@ -122,7 +124,9 @@ export class OnnxBackend implements EmbeddingBackend {
 		if (texts.length === 0) return [];
 		if (options.signal?.aborted) throw new EmbeddingError("TIMEOUT", `backend ${this.id}: request aborted`);
 		const run = async (): Promise<Float32Array[]> => {
+			options.signal?.throwIfAborted();
 			const extractor = await this.getExtractor();
+			options.signal?.throwIfAborted();
 			// Each micro-batch is padded to its longest text, so length-sorted micro-batches waste far less compute
 			// on mixed-length input. Results are restored to input order.
 			const order = texts.map((t, i) => ({ i, len: t.length })).sort((a, b) => a.len - b.len);

@@ -76,6 +76,7 @@ export class FlmSupervisor {
 		});
 		child.once("error", (error) => {
 			exited = true;
+			if (this.child === child) this.child = undefined;
 			log("flm_spawn_failed", { error: error.message });
 		});
 

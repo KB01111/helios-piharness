@@ -146,7 +146,10 @@ async function connectEmbeddings(
 	config: ReturnType<typeof loadConfig>,
 	logger: ReturnType<typeof createLogger>,
 ): Promise<EmbeddingProvider | undefined> {
-	if (!config.embeddingsUrl) return undefined;
+	if (!config.embeddingsUrl) {
+		if (config.embeddingsRequired) throw new Error("EMBEDDINGS_REQUIRED needs EMBEDDINGS_URL");
+		return undefined;
+	}
 	try {
 		const provider = await HttpEmbeddingProvider.connect({
 			baseUrl: config.embeddingsUrl,
@@ -155,6 +158,7 @@ async function connectEmbeddings(
 			...(config.embeddingsDimensions ? { dimensions: config.embeddingsDimensions } : {}),
 			timeoutMs: config.embeddingsTimeoutMs,
 		});
+		if (config.embeddingsRequired) await provider.embed(["startup probe"], { signal: AbortSignal.timeout(config.embeddingsTimeoutMs) });
 		logger.info("embeddings_connected", {
 			model: provider.model,
 			heliosServer: provider.helios,

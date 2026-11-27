@@ -179,7 +179,7 @@ export function loadEmbedServerConfig(env: Env = process.env): EmbedServerConfig
 	}
 
 	const openaiUrl = str(env, "EMBED_OPENAI_URL") ?? "https://api.openai.com/v1";
-	const isOpenRouter = /openrouter\.ai/i.test(openaiUrl);
+	const hostname = new URL(openaiUrl).hostname;
 	const device = (str(env, "EMBED_ONNX_DEVICE") ?? "cpu").toLowerCase();
 	if (!["cpu", "dml", "cuda", "webgpu", "auto"].includes(device)) {
 		throw new EmbeddingError("MISCONFIGURED", `EMBED_ONNX_DEVICE=${device} is unknown (cpu, dml, cuda, webgpu, auto)`);
@@ -237,8 +237,8 @@ export function loadEmbedServerConfig(env: Env = process.env): EmbedServerConfig
 		openai: {
 			url: openaiUrl,
 			model: str(env, "EMBED_OPENAI_MODEL") ?? "text-embedding-3-small",
-			apiKey: str(env, "EMBED_OPENAI_API_KEY") ?? (isOpenRouter ? str(env, "OPENROUTER_API_KEY") : str(env, "OPENAI_API_KEY")),
-			sendDimensions: bool(env, "EMBED_OPENAI_SEND_DIMENSIONS", /api\.openai\.com/i.test(openaiUrl)),
+			apiKey: str(env, "EMBED_OPENAI_API_KEY") ?? (hostname === "openrouter.ai" ? str(env, "OPENROUTER_API_KEY") : hostname === "api.openai.com" ? str(env, "OPENAI_API_KEY") : undefined),
+			sendDimensions: bool(env, "EMBED_OPENAI_SEND_DIMENSIONS", hostname === "api.openai.com"),
 			timeoutMs: int(env, "EMBED_OPENAI_TIMEOUT_MS", 30_000, 1),
 		},
 		gemini: {

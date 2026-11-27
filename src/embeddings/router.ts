@@ -12,7 +12,7 @@
 
 import crypto from "node:crypto";
 import { applyTaskPrompt, resolveModelInfo, truncateAndNormalize, type ModelSpaceInfo, type PromptFamily } from "./models.js";
-import { errorText } from "./backends/http-util.js";
+import { errorText, waitWithSignal } from "./backends/http-util.js";
 import { runEmbeddingSelfTest, type SelfTestResult } from "./self-test.js";
 import {
 	EmbeddingError,
@@ -59,6 +59,7 @@ export interface RouterEmbedResult {
 interface BreakerState {
 	failures: number;
 	openUntil: number;
+	probing?: boolean;
 	lastError: string | undefined;
 }
 
@@ -74,6 +75,14 @@ export interface BackendStatus {
 	/** Set when the startup self-test found this backend unable to separate related from unrelated text. */
 	readonly quarantined?: string;
 	readonly selfTest?: SelfTestResult;
+}
+
+function validatedRows(rows: Float32Array[], count: number, dimensions?: number): Float32Array[] {
+	if (rows.length !== count) throw new EmbeddingError("UPSTREAM", `expected ${count} vectors, got ${rows.length}`);
+	for (const row of rows) {
+		if (!row || row.length < (dimensions ?? 1)) throw new EmbeddingError("UPSTREAM", "backend returned undersized vector");
+	}
+	return rows.map(row => truncateAndNormalize(row, dimensions));
 }
 
 export class EmbeddingRouter {
@@ -114,9 +123,15 @@ export class EmbeddingRouter {
 			);
 		}
 		this.backends = options.backends;
-		this.space = primary.space;
+
 		this.info = resolveModelInfo(primary.model, { space: primary.space });
 		this.promptFamily = options.promptFamily ?? this.info.promptFamily;
+		const effectiveFamily = primary.wantsPrompts ? this.promptFamily : "none";
+		if (this.backends.some(b => (b.wantsPrompts ? this.promptFamily : "none") !== effectiveFamily)) {
+			throw new EmbeddingError("MISCONFIGURED", "fallback backends must use the same effective prompt family");
+		}
+		this.space = effectiveFamily === resolveModelInfo(primary.space).promptFamily
+			? primary.space : `${primary.space}:prompt=${effectiveFamily}`;
 		const native = primary.nativeDimensions ?? this.info.nativeDimensions;
 		if (options.dimensions !== undefined) {
 			if (!Number.isInteger(options.dimensions) || options.dimensions < 8) {
@@ -136,6 +151,10 @@ export class EmbeddingRouter {
 		this.now = options.now ?? (() => Date.now());
 		this.onEvent = options.onEvent ?? (() => undefined);
 		for (const b of this.backends) this.breakers.set(b.id, { failures: 0, openUntil: 0, lastError: undefined });
+	}
+
+	get publishedDimensions(): number | undefined {
+		return this.defaultDimensions ?? this.info.nativeDimensions ?? this.observedDimensions;
 	}
 
 	/** Model id clients should store vectors under: changes whenever vectors would stop being comparable. */
@@ -164,9 +183,11 @@ export class EmbeddingRouter {
 					const vecs: Float32Array[] = [];
 					for (let start = 0; start < formatted.length; start += backend.maxBatchSize) {
 						const batch = formatted.slice(start, start + backend.maxBatchSize);
-						vecs.push(...(await backend.embed(batch, { inputType })));
+						const dimensions = this.defaultDimensions;
+						const rows = await backend.embed(batch, { inputType, ...(dimensions !== undefined ? { dimensions } : {}) });
+						vecs.push(...validatedRows(rows, batch.length, dimensions));
 					}
-					return vecs.map((v) => truncateAndNormalize(v, this.defaultDimensions));
+					return vecs;
 				});
 				this.selfTests.set(backend.id, result);
 				if (!result.passed && enforce) {
@@ -244,8 +265,7 @@ export class EmbeddingRouter {
 				request.signal,
 				servedBy,
 			);
-			raw.forEach((vec, n) => {
-				const out = truncateAndNormalize(vec, dimensions);
+			raw.forEach((out, n) => {
 				const key = keys[uniqueIdx[n]!]!;
 				for (const idx of uniqueByKey.get(key)!) vectors[idx] = out;
 				this.remember(key, out);
@@ -275,7 +295,6 @@ export class EmbeddingRouter {
 		servedBy: Set<string>,
 	): Promise<Float32Array[]> {
 		const errors: string[] = [];
-		const nowMs = this.now();
 		let attempted = 0;
 		for (const backend of this.backends) {
 			const breaker = this.breakers.get(backend.id)!;
@@ -284,13 +303,16 @@ export class EmbeddingRouter {
 				errors.push(`${backend.id}: quarantined, ${quarantined}`);
 				continue;
 			}
-			if (breaker.failures >= this.failureThreshold && nowMs < breaker.openUntil) {
+			if (breaker.probing || (breaker.failures >= this.failureThreshold && this.now() < breaker.openUntil)) {
 				errors.push(`${backend.id}: circuit open`);
 				continue;
 			}
+			const probe = breaker.failures >= this.failureThreshold;
+			if (probe) breaker.probing = true;
 			attempted += 1;
-			const formatted = backend.wantsPrompts ? texts.map((t) => applyTaskPrompt(this.promptFamily, inputType, t)) : texts;
 			try {
+				signal?.throwIfAborted();
+				const formatted = backend.wantsPrompts ? texts.map((t) => applyTaskPrompt(this.promptFamily, inputType, t)) : texts;
 				const out: Float32Array[] = [];
 				for (let start = 0; start < formatted.length; start += backend.maxBatchSize) {
 					const batch = formatted.slice(start, start + backend.maxBatchSize);
@@ -299,14 +321,12 @@ export class EmbeddingRouter {
 						...(dimensions !== undefined ? { dimensions } : {}),
 						...(signal ? { signal } : {}),
 					});
-					if (vecs.length !== batch.length) {
-						throw new EmbeddingError("UPSTREAM", `expected ${batch.length} vectors, got ${vecs.length}`);
-					}
-					out.push(...vecs);
+					signal?.throwIfAborted();
+					out.push(...validatedRows(vecs, batch.length, dimensions));
 				}
-				const dim = out[0]?.length ?? 0;
-				if (dimensions !== undefined && dim < dimensions) {
-					throw new EmbeddingError("UPSTREAM", `backend returned ${dim}d vectors, fewer than the requested ${dimensions}`);
+				const expected = dimensions ?? this.observedDimensions ?? out[0]?.length;
+				if (out.some(row => row.length !== expected)) {
+					throw new EmbeddingError("UPSTREAM", "embedding backend returned inconsistent vector dimensions");
 				}
 				if (breaker.failures > 0) this.onEvent("embedding_backend_recovered", { backend: backend.id });
 				breaker.failures = 0;
@@ -328,6 +348,8 @@ export class EmbeddingRouter {
 					circuitOpen: breaker.failures >= this.failureThreshold,
 					error: breaker.lastError,
 				});
+			} finally {
+				if (probe) breaker.probing = false;
 			}
 		}
 		throw new EmbeddingError(
@@ -371,20 +393,19 @@ export class EmbeddingRouter {
 
 	/** Probes every backend (bounded by `timeoutMs`). */
 	async health(timeoutMs = 5_000): Promise<{ ok: boolean; backends: BackendStatus[] }> {
-		const statuses = this.status();
 		const checks = await Promise.all(
 			this.backends.map(async (b) => {
 				try {
-					return await b.health(AbortSignal.timeout(timeoutMs));
+					const signal = AbortSignal.timeout(timeoutMs);
+					return await waitWithSignal(b.health(), signal);
 				} catch (error) {
 					return { ok: false, detail: errorText(error) };
 				}
 			}),
 		);
-		const backends = statuses.map((s, i) => ({
+		const backends = this.status().map((s, i) => ({
 			...s,
 			ok: checks[i]!.ok && s.circuit !== "open" && !s.quarantined,
-			...(checks[i]!.detail ? { detail: checks[i]!.detail } : {}),
 		}));
 		return { ok: backends.some((b) => b.ok), backends };
 	}
