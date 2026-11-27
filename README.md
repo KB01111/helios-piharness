@@ -43,6 +43,7 @@ By default, when no provider API keys are configured (or `USE_MOCK_MODELS=true`)
 - `npm run bench:memory` — Memory quality + scalability benchmark (uses the embedding server when it is running)
 - `npm run bench:memory:gate` / `bench:memory:gate:heldout` — Same, failing on regressions against `benchmarks/thresholds*.json` (CI runs both lexical-only)
 - `npm run bench:public -- --dataset locomo|longmemeval` — Public long-term-memory benchmarks (downloaded on first use, never committed)
+- `npm run bench:files` — File-finding & symbol-definition benchmark over `src/` (benchmarks live XERJ when `XERJ_URL` is set; details: [`docs/file-search.md`](docs/file-search.md))
 
 ## Embeddings & Memory Benchmark
 
@@ -194,6 +195,20 @@ Forgetting a memory (`forgetMemory`) also scrubs the raw episodes that evidenced
 | `RERANK_CANDIDATES` | `20` | Fused candidates reranked per search (latency ~20 ms per candidate on CPU) |
 
 Embedding-server variables (`EMBED_*`) are documented in [`docs/embeddings.md`](docs/embeddings.md) and `.env.example`.
+
+### Indexed File Search (XERJ / local workspace)
+
+Optional AST-aware file discovery, definition-first code/passage search, and symbol lookup behind `FileSearchService` (`file_find`, `file_search`, `file_symbol_def`, `file_index_map`; details: [`docs/file-search.md`](docs/file-search.md)):
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `XERJ_URL` | _(unset: disabled)_ | XERJ ES-compatible REST URL (`http://127.0.0.1:9200`). Never logs credentials; refuses redirects |
+| `XERJ_API_KEY` | _(unset)_ | Optional API key (`<xerj-data-dir>/admin.key`) sent as `Authorization: ApiKey <key>` |
+| `XERJ_INDEX_PREFIX` | `ax` | Autoindex prefix (matching `xerj autoindex`) |
+| `XERJ_SCOPE_MODE` | `tenant` | Index isolation: `tenant` (`<prefix>-<tenantId>-*`), `workspace`, or `shared` (`<prefix>-*`) |
+| `XERJ_TIMEOUT_MS` / `XERJ_REQUIRED` | `10000` / `false` | Per-request timeout; abort startup when unreachable instead of degrading/falling back |
+| `FILE_SEARCH_WORKSPACE_ROOT` | _(unset)_ | Optional local workspace root (standalone or automatic fallback when XERJ is unavailable) |
+| `FILE_SEARCH_DEFERRED` | `false` | Register `file-search` tools as `deferred: true` for on-demand `tool_search` discovery |
 
 ### HTTP API
 

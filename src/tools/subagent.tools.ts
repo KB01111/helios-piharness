@@ -58,6 +58,7 @@ const READ_ONLY_SUBAGENT_PERMISSIONS: readonly string[] = [
 	"memory:read",
 	"artifacts:read",
 	"skills:read",
+	"files:read",
 	"domain:read",
 	"mcp:read",
 ];
