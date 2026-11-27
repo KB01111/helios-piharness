@@ -15,6 +15,7 @@ The embedding server in `src/embeddings/` provides that model.
                           ├─ npu     FastFlowLM on the AMD Ryzen AI NPU (OpenAI-compatible, port 52625)
                           ├─ openai  any OpenAI-compatible API (OpenAI, OpenRouter, Lemonade, Ollama, TEI, vLLM)
                           └─ gemini  Google Gemini batchEmbedContents (taskType RETRIEVAL_QUERY/DOCUMENT)
+                       RerankService (POST /v1/rerank): bge-reranker-v2-m3 in-process, or Jina/Cohere/Voyage
 ```
 
 ## Quick start
@@ -102,8 +103,52 @@ flooding results.
 - ONNX Runtime's VitisAI execution provider (the other route onto the NPU) is not shipped in `onnxruntime-node`,
   so in-process ONNX runs on CPU or, with DirectML, the Radeon iGPU.
 
+## Reranker (`POST /v1/rerank`)
+
+The server also hosts a cross-encoder reranker (`EMBED_RERANK=onnx`, default for the local profiles:
+`onnx-community/bge-reranker-v2-m3-ONNX`, q8, ~20 ms per pair on CPU). The API is Cohere/Jina-compatible:
+`{query, documents, top_n}` returns `{results: [{index, relevance_score}]}`. The `http` backend proxies cloud rerankers
+(Jina `https://api.jina.ai/v1`, Cohere `https://api.cohere.com/v2`, Voyage `https://api.voyageai.com/v1`). The
+harness can also call those directly with `RERANK_URL` + `RERANK_MODEL`. When `EMBEDDINGS_URL` points to a Helios
+server that serves a reranker, the harness picks it up automatically (`RERANK_ENABLED=false` opts out).
+
+**How memory search uses it: as positive evidence only.** We measured several CPU cross-encoders (bge-reranker-v2-m3
+at q8 and fp16, Qwen3-Reranker-0.6B, gte-reranker-modernbert, jina-turbo) on neutral pairs and on the dev set:
+
+| | reranker score |
+| --- | --- |
+| keyword-overlapping answers (single-hop, updates, dates) | mostly 0.6–0.999 |
+| keyword-free paraphrased answers (semantic gap) | 0.000–0.045 |
+| second hop of a 2-hop chain (does not mention the query entity) | ~0.001 |
+| same-topic non-answers ("serial number of my espresso grinder") | ~0.000 |
+
+A high score reliably means "this answers the query"; a low score means nothing, because true paraphrases score as low
+as non-answers. Using the reranker as a gate would destroy semantic and multi-hop recall without fixing abstention.
+So the top 20 fused candidates (`RERANK_CANDIDATES`) are reranked. A confident score lifts a candidate by noisy-OR,
+ramping from the model's measured non-answer level (the self-test `answer_threshold`, 0.078 for bge-v2-m3) to 0.5. A
+low score never demotes or removes anything. Recall and abstention stay exactly as fused retrieval had them; only the
+order among plausible candidates improves.
+
+The reranker self-test checks what that role needs: non-answers (near-misses and unrelated text) must stay low and
+typical answers must clear them. A reranker that scores near-misses like answers (e.g. gte-modernbert at q8) is
+quarantined.
+
+**Abstention is not solved by retrieval.** Neither bi-encoders nor CPU cross-encoders can tell "on topic but doesn't
+contain the asked detail" from "a paraphrased answer". Deciding that needs a reader: an LLM answerability check over
+the retrieved context.
+
 ## Benchmark
 
 `npm run bench:memory` uses the embedding server when one is reachable on `127.0.0.1:18765`. Alternatively use
-`--in-process <profile>` (no server) or `--lexical-only`. `--gate benchmarks/thresholds.json` exits non-zero on
-regressions; CI runs the lexical gate on every push. Measured results are in the README.
+`--in-process <profile>` (no server) or `--lexical-only`; add `--rerank` for the reranked engine.
+
+| Dataset | Command | Purpose |
+| --- | --- | --- |
+| core (78 queries) | `npm run bench:memory` | development set: tuning happens here |
+| held-out (48 queries) | `npm run bench:memory -- --dataset heldout` | report-only generalisation check (new memories; abstention = topical near-misses) |
+| LoCoMo (1,535 scored QA, 10 conversations) | `npm run bench:public -- --dataset locomo` | public long-conversation benchmark; turn-level evidence recall |
+| LongMemEval_S (500 Q) | `npm run bench:public -- --dataset longmemeval --limit N` | public chat-history benchmark; session-level recall + real abstention questions |
+
+The public datasets are downloaded on first use into `data/benchmarks/` (gitignored) and verified by SHA-256; they
+are never committed. `--gate` exits non-zero on regressions against `benchmarks/thresholds*.json`; CI runs the
+lexical gates for core and held-out on every push. Measured results are in the README.

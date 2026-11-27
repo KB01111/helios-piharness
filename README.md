@@ -41,7 +41,8 @@ By default, when no provider API keys are configured (or `USE_MOCK_MODELS=true`)
 - `npm test` — Run all Vitest integration suites
 - `npm run embed:server` — OpenAI-compatible embedding server (EmbeddingGemma 2 by default; `embed:server:npu`, `embed:server:cloud`)
 - `npm run bench:memory` — Memory quality + scalability benchmark (uses the embedding server when it is running)
-- `npm run bench:memory:gate` — Same, failing on regressions against `benchmarks/thresholds.json` (CI runs it lexical-only)
+- `npm run bench:memory:gate` / `bench:memory:gate:heldout` — Same, failing on regressions against `benchmarks/thresholds*.json` (CI runs both lexical-only)
+- `npm run bench:public -- --dataset locomo|longmemeval` — Public long-term-memory benchmarks (downloaded on first use, never committed)
 
 ## Embeddings & Memory Benchmark
 
@@ -61,16 +62,41 @@ EMBEDDINGS_URL=http://127.0.0.1:18765/v1 npm run dev
 
 The server applies EmbeddingGemma's asymmetric query/document prompts, Matryoshka truncation (`EMBED_DIMENSIONS`), caching, circuit breaking and same-space fallback, and runs a **quality self-test at startup** that measures the model's cosine calibration (published to the harness) and quarantines any backend whose vectors cannot separate related from unrelated text.
 
-**Benchmark** (`npm run bench:memory`, 78 queries / 8 categories, deterministic):
+It also serves a **cross-encoder reranker** (`POST /v1/rerank`, bge-reranker-v2-m3 in-process, or Jina/Cohere/Voyage), which the harness discovers automatically. Memory search uses it as *positive evidence only*: confident "this answers the query" scores lift candidates, low scores never demote. Measured CPU cross-encoders score keyword-free paraphrases as low as non-answers, so gating on them would destroy recall ([details](docs/embeddings.md#reranker-post-v1rerank)).
 
-| Engine | R@1 | R@5 | MRR | nDCG@5 | Semantic R@5 | Multi-hop both@5 | Update fresh@1 | Historical R@5 | Abstain | Recent-episode R@5 |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| helios (lexical, no model) | 66.2% | 88.2% | 0.770 | 0.800 | 33.3% | 100% | 90% | 100% | 100% | 100% |
-| **helios (hybrid, EmbeddingGemma 2)** | **85.3%** | **100%** | **0.926** | **0.945** | **100%** | 100% | 100% | 100% | 60% | 100% |
-| graphiti-ref (same embeddings) | 69.1% | 94.1% | 0.806 | 0.840 | 100% | 100% | 90% | 100% | 0% | 0% |
-| hipporag-ref (same embeddings) | 47.1% | 86.8% | 0.657 | 0.706 | 100% | 100% | 50% | 0% | 0% | 0% |
+**Benchmarks** (deterministic; tuning happens only on the core set):
 
-Hybrid search p50 ≈ 2.5 ms with warm query cache (≈ 30 ms cold on CPU); 2,000-memory oldest-needle recall 100%.
+*Core dev set* (`npm run bench:memory`, 78 queries / 8 categories):
+
+| Engine | R@1 | R@5 | MRR | Semantic R@5 | Multi-hop both@5 | Update fresh@1 | Historical R@5 | Abstain |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| helios (lexical, no model) | 66.2% | 88.2% | 0.770 | 33.3% | 100% | 90% | 100% | 100% |
+| **helios (hybrid, EmbeddingGemma 2)** | **85.3%** | **100%** | **0.926** | **100%** | 100% | 100% | 100% | 60% |
+| helios (hybrid + rerank) | 85.3% | 100% | 0.926 | 100% | 100% | 100% | 100% | 60% |
+| graphiti-ref (same embeddings) | 69.1% | 94.1% | 0.806 | 100% | 100% | 90% | 100% | 0% |
+| hipporag-ref (same embeddings) | 47.1% | 86.8% | 0.657 | 100% | 100% | 50% | 0% | 0% |
+
+*Held-out set* (`-- --dataset heldout`, 48 new queries; report-only, abstention = topical near-misses):
+
+| Engine | R@1 | R@5 | MRR | Abstain |
+| --- | ---: | ---: | ---: | ---: |
+| helios (lexical) | 50.0% | 65.6% | 0.578 | 43.8% |
+| helios (hybrid) | 78.1% | 96.9% | 0.875 | 25.0% |
+| **helios (hybrid + rerank)** | **81.3%** | **96.9%** | **0.891** | 25.0% |
+| graphiti-ref | 71.9% | 93.8% | 0.818 | 0% |
+| hipporag-ref | 62.5% | 87.5% | 0.732 | 0% |
+
+*LoCoMo* (`npm run bench:public -- --dataset locomo`, 1,535 scored questions, turn-level evidence recall):
+
+| Engine | R@1 | R@5 | R@10 | MRR@10 | Multi-hop R@1 | Search p50 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| helios (lexical) | 37.6% | 62.7% | 70.6% | 0.482 | 21.6% | 3 ms |
+| helios (hybrid) | 34.7% | 70.9% | 80.8% | 0.499 | 22.3% | 36 ms |
+| **helios (hybrid + rerank)** | **48.2%** | **76.9%** | **83.5%** | **0.604** | **35.5%** | 750 ms |
+
+*LongMemEval_S* (`-- --dataset longmemeval --limit 20`, stratified subset): answerable session recall R@5 100% for lexical and hybrid (MRR 0.95 / 0.97); abstention 0/4.
+
+**Known limits:** abstention generalises poorly (60% dev vs 25% held-out vs 0/4 LongMemEval). Rejecting "on topic, but the asked detail isn't stored" needs a reader (an LLM answerability check), not a better retriever. The reranker adds ~0.7 s per search on CPU; lower `RERANK_CANDIDATES` or set `RERANK_ENABLED=false` for latency-critical paths.
 
 ## Configuration Reference
 
@@ -163,6 +189,9 @@ Forgetting a memory (`forgetMemory`) also scrubs the raw episodes that evidenced
 | `EMBEDDINGS_MODEL` | _(from server)_ | Upstream model; required for non-Helios endpoints |
 | `EMBEDDINGS_DIMENSIONS` | _(native)_ | Matryoshka output size requested from the endpoint |
 | `EMBEDDINGS_TIMEOUT_MS` / `EMBEDDINGS_REQUIRED` | `15000` / `false` | Request timeout; abort startup when unreachable instead of running lexical-only |
+| `RERANK_ENABLED` | `true` | Use a cross-encoder reranker for memory search when one is available (auto-discovered from a Helios `EMBEDDINGS_URL`) |
+| `RERANK_URL` / `RERANK_MODEL` / `RERANK_API_KEY` | _(unset)_ | Cloud rerank API (Jina, Cohere, Voyage) instead of the embedding server's reranker |
+| `RERANK_CANDIDATES` | `20` | Fused candidates reranked per search (latency ~20 ms per candidate on CPU) |
 
 Embedding-server variables (`EMBED_*`) are documented in [`docs/embeddings.md`](docs/embeddings.md) and `.env.example`.
 

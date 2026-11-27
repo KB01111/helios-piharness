@@ -45,6 +45,8 @@ export interface TransformersModule {
 }
 
 const DEFAULT_MODEL = "onnx-community/embeddinggemma-2-ONNX";
+/** Texts per ONNX forward pass inside one (length-sorted) backend call. */
+const ONNX_MICRO_BATCH = 8;
 
 export class OnnxBackend implements EmbeddingBackend {
 	readonly id: string;
@@ -71,7 +73,7 @@ export class OnnxBackend implements EmbeddingBackend {
 		this.wantsPrompts = info.promptFamily !== "none";
 		this.device = options.device ?? "cpu";
 		this.dtype = options.dtype ?? "q4";
-		this.maxBatchSize = Math.max(1, options.maxBatchSize ?? 16);
+		this.maxBatchSize = Math.max(1, options.maxBatchSize ?? 128);
 		this.options = options;
 	}
 
@@ -121,16 +123,29 @@ export class OnnxBackend implements EmbeddingBackend {
 		if (options.signal?.aborted) throw new EmbeddingError("TIMEOUT", `backend ${this.id}: request aborted`);
 		const run = async (): Promise<Float32Array[]> => {
 			const extractor = await this.getExtractor();
-			const tensor = await extractor([...texts], { pooling: "mean", normalize: true });
-			try {
-				const rows = tensor.tolist();
-				if (rows.length !== texts.length) {
-					throw new EmbeddingError("UPSTREAM", `backend ${this.id}: expected ${texts.length} embeddings, got ${rows.length}`);
+			// Each micro-batch is padded to its longest text, so length-sorted micro-batches waste far less compute
+			// on mixed-length input. Results are restored to input order.
+			const order = texts.map((t, i) => ({ i, len: t.length })).sort((a, b) => a.len - b.len);
+			const out = new Array<Float32Array>(texts.length);
+			for (let start = 0; start < order.length; start += ONNX_MICRO_BATCH) {
+				const slice = order.slice(start, start + ONNX_MICRO_BATCH);
+				const tensor = await extractor(
+					slice.map((o) => texts[o.i]!),
+					{ pooling: "mean", normalize: true },
+				);
+				try {
+					const rows = tensor.tolist();
+					if (rows.length !== slice.length) {
+						throw new EmbeddingError("UPSTREAM", `backend ${this.id}: expected ${slice.length} embeddings, got ${rows.length}`);
+					}
+					rows.forEach((row, n) => {
+						out[slice[n]!.i] = Float32Array.from(row);
+					});
+				} finally {
+					tensor.dispose?.();
 				}
-				return rows.map((row) => Float32Array.from(row));
-			} finally {
-				tensor.dispose?.();
 			}
+			return out;
 		};
 		const result = this.queue.then(run, run);
 		this.queue = result.catch(() => undefined);

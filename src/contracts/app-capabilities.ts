@@ -100,6 +100,8 @@ export interface MemorySearchResult {
 		readonly vector?: number;
 		readonly graph?: number;
 		readonly temporal?: number;
+		/** Cross-encoder answer relevance in [0, 1] when a reranker scored this result. */
+		readonly rerank?: number;
 	};
 }
 
@@ -124,6 +126,22 @@ export interface EmbeddingProvider {
 		texts: readonly string[],
 		options?: { readonly signal?: AbortSignal; readonly inputType?: "query" | "document" },
 	): Promise<ReadonlyArray<ArrayLike<number>>>;
+}
+
+/**
+ * Optional cross-encoder reranker. Unlike an embedding (which scores how *similar* two texts are), a reranker
+ * reads query and document together and scores whether the document *answers* the query.
+ */
+export interface Reranker {
+	/** Stable model identifier. */
+	readonly model: string;
+	/**
+	 * Probability-like relevance below which a document does not answer the query (measured by the reranker's
+	 * self-test). Memory search treats candidates under it as non-answers, which is what makes abstention work.
+	 */
+	readonly answerThreshold?: number;
+	/** Relevance in [0, 1] for each document, in input order. */
+	rerank(query: string, documents: readonly string[], options?: { readonly signal?: AbortSignal }): Promise<readonly number[]>;
 }
 
 export type MemoryMutationOp =
@@ -218,6 +236,8 @@ export interface MemoryService {
 			readonly temporalMode?: "auto" | "off";
 			/** Minimum calibrated relevance score required to return a hit (0 disables abstention filtering). */
 			readonly minScore?: number;
+			/** Rerank the top candidates with the configured cross-encoder (default true when one is configured). */
+			readonly rerank?: boolean;
 		},
 	): Promise<MemorySearchResult[]>;
 

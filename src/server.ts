@@ -1,8 +1,8 @@
 import type { Server } from "node:http";
 import { serve, type ServerType } from "@hono/node-server";
 import { loadConfig } from "./config.js";
-import type { EmbeddingProvider } from "./contracts/app-capabilities.js";
-import { HttpEmbeddingProvider } from "./embeddings/provider.js";
+import type { EmbeddingProvider, Reranker } from "./contracts/app-capabilities.js";
+import { HttpEmbeddingProvider, HttpReranker } from "./embeddings/provider.js";
 import { createHealthChecker, createReadinessHandler } from "./health.js";
 import { bootstrapHarness, type BootstrappedHarness } from "./index.js";
 import { createLogger, serializeError } from "./logger.js";
@@ -87,7 +87,12 @@ async function main(): Promise<void> {
 	});
 
 	const embeddingProvider = await connectEmbeddings(config, logger);
-	bootstrapping = bootstrapHarness({ config, ...(embeddingProvider ? { embeddingProvider } : {}) });
+	const reranker = await connectReranker(config, logger, embeddingProvider);
+	bootstrapping = bootstrapHarness({
+		config,
+		...(embeddingProvider ? { embeddingProvider } : {}),
+		...(reranker ? { reranker } : {}),
+	});
 	runtime = await bootstrapping;
 	if (shutdownStarted) {
 		// Shutdown began while bootstrapping; it is closing the runtime, so do not start serving.
@@ -162,6 +167,38 @@ async function connectEmbeddings(
 			message: "memory search runs lexical-only until restart",
 			error: serializeError(error),
 		});
+		return undefined;
+	}
+}
+
+/**
+ * Connects the optional reranker: an explicit RERANK_URL (cloud: needs RERANK_MODEL), otherwise the Helios embedding
+ * server's own reranker when it serves one. Failures only log: memory search works without a reranker.
+ */
+async function connectReranker(
+	config: ReturnType<typeof loadConfig>,
+	logger: ReturnType<typeof createLogger>,
+	embeddings: EmbeddingProvider | undefined,
+): Promise<Reranker | undefined> {
+	if (!config.rerankEnabled) return undefined;
+	const explicit = config.rerankUrl;
+	const heliosServer = embeddings instanceof HttpEmbeddingProvider && embeddings.helios;
+	const baseUrl = explicit ?? (heliosServer ? config.embeddingsUrl : undefined);
+	if (!baseUrl) return undefined;
+	try {
+		const apiKey = config.rerankApiKey ?? (explicit ? undefined : config.embeddingsApiKey);
+		const reranker = await HttpReranker.connect({
+			baseUrl,
+			...(apiKey ? { apiKey } : {}),
+			...(config.rerankModel ? { model: config.rerankModel } : {}),
+			timeoutMs: config.embeddingsTimeoutMs,
+		});
+		logger.info("reranker_connected", { model: reranker.model, answerThreshold: reranker.answerThreshold ?? null });
+		return reranker;
+	} catch (error) {
+		// A Helios server running with EMBED_RERANK=off is a normal setup, not a warning.
+		const log = explicit ? logger.warn.bind(logger) : logger.info.bind(logger);
+		log("reranker_unavailable", { error: serializeError(error) });
 		return undefined;
 	}
 }

@@ -12,6 +12,7 @@
 
 import { createHash, timingSafeEqual } from "node:crypto";
 import { Hono } from "hono";
+import type { RerankService } from "./rerank.js";
 import { EmbeddingRouter } from "./router.js";
 import { EmbeddingError, type EmbeddingInputType } from "./types.js";
 
@@ -20,6 +21,8 @@ export interface EmbedHttpServerOptions {
 	readonly maxInputs?: number;
 	readonly maxBodyBytes?: number;
 	readonly onEvent?: (event: string, fields: Record<string, unknown>) => void;
+	/** Enables `POST /v1/rerank`. */
+	readonly reranker?: RerankService;
 }
 
 function parseInputType(raw: unknown): EmbeddingInputType | undefined {
@@ -41,6 +44,22 @@ export function createEmbedHttpServer(router: EmbeddingRouter, options: EmbedHtt
 	const maxInputs = options.maxInputs ?? 256;
 	const maxBodyBytes = options.maxBodyBytes ?? 4 * 1024 * 1024;
 	const onEvent = options.onEvent ?? (() => undefined);
+	const reranker = options.reranker;
+
+	/** Shared body reader: size limit + JSON object check. */
+	const readJsonObject = async (c: { req: { header(name: string): string | undefined; text(): Promise<string> } }): Promise<Record<string, unknown> | "too_large"> => {
+		const declared = Number(c.req.header("content-length") ?? "0");
+		if (declared > maxBodyBytes) return "too_large";
+		const raw = await c.req.text();
+		if (Buffer.byteLength(raw) > maxBodyBytes) return "too_large";
+		try {
+			const parsed = JSON.parse(raw) as unknown;
+			if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("not an object");
+			return parsed as Record<string, unknown>;
+		} catch {
+			throw new EmbeddingError("BAD_REQUEST", "request body must be a JSON object");
+		}
+	};
 
 	const errorBody = (message: string, type: string) => ({ error: { message, type } });
 
@@ -65,14 +84,15 @@ export function createEmbedHttpServer(router: EmbeddingRouter, options: EmbedHtt
 	});
 
 	app.get("/health", async (c) => {
-		const health = await router.health();
+		const [health, rerankHealth] = await Promise.all([router.health(), reranker?.health()]);
 		return c.json(
 			{
-				status: health.ok ? "ok" : "unavailable",
+				status: health.ok ? (rerankHealth && !rerankHealth.ok ? "degraded" : "ok") : "unavailable",
 				space: router.space,
 				model: router.modelId(),
 				dimensions: router.defaultDimensions ?? router.info.nativeDimensions ?? null,
 				backends: health.backends,
+				...(rerankHealth ? { reranker: rerankHealth } : {}),
 			},
 			health.ok ? 200 : 503,
 		);
@@ -93,9 +113,47 @@ export function createEmbedHttpServer(router: EmbeddingRouter, options: EmbedHtt
 					calibration: router.calibration ?? null,
 					backends: router.backendIds,
 				},
+				...(reranker
+					? [
+							{
+								id: reranker.model,
+								object: "model",
+								type: "rerank",
+								owned_by: "helios-embed",
+								answer_threshold: reranker.answerThreshold ?? null,
+							},
+						]
+					: []),
 			],
 		}),
 	);
+
+	app.post("/v1/rerank", async (c) => {
+		if (!reranker) return c.json(errorBody("this server has no reranker (EMBED_RERANK=off)", "not_found"), 404);
+		const body = await readJsonObject(c);
+		if (body === "too_large") return c.json(errorBody(`request body exceeds ${maxBodyBytes} bytes`, "bad_request"), 413);
+		const query = body.query;
+		if (typeof query !== "string" || !query.trim()) throw new EmbeddingError("BAD_REQUEST", "query must be a non-empty string");
+		const rawDocs = body.documents;
+		if (!Array.isArray(rawDocs) || rawDocs.length === 0) throw new EmbeddingError("BAD_REQUEST", "documents must be a non-empty array");
+		const documents = rawDocs.map((d) => {
+			if (typeof d === "string") return d;
+			if (d && typeof d === "object" && typeof (d as { text?: unknown }).text === "string") return (d as { text: string }).text;
+			throw new EmbeddingError("BAD_REQUEST", "documents must be strings or {text} objects");
+		});
+		const topN = body.top_n;
+		if (topN !== undefined && (typeof topN !== "number" || !Number.isInteger(topN) || topN < 1)) {
+			throw new EmbeddingError("BAD_REQUEST", "top_n must be a positive integer");
+		}
+		const started = performance.now();
+		const scores = await reranker.rerank(query, documents, { signal: c.req.raw.signal });
+		const results = scores
+			.map((relevance_score, index) => ({ index, relevance_score, ...(body.return_documents === true ? { document: { text: documents[index] } } : {}) }))
+			.sort((a, b) => b.relevance_score - a.relevance_score || a.index - b.index)
+			.slice(0, typeof topN === "number" ? topN : scores.length);
+		onEvent("rerank_request", { documents: documents.length, ms: Math.round(performance.now() - started) });
+		return c.json({ model: reranker.model, results, usage: { total_tokens: Math.ceil((query.length * documents.length + documents.join("").length) / 4) } });
+	});
 
 	app.post("/v1/embeddings", async (c) => {
 		const declared = Number(c.req.header("content-length") ?? "0");

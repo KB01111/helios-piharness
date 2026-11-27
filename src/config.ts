@@ -159,6 +159,16 @@ export interface AppConfig {
 	readonly embeddingsTimeoutMs: number;
 	/** EMBEDDINGS_REQUIRED: abort startup when the endpoint is unreachable instead of running lexical-only (default false). */
 	readonly embeddingsRequired: boolean;
+	/** RERANK_ENABLED: use a cross-encoder reranker for memory search when one is available (default true). */
+	readonly rerankEnabled: boolean;
+	/** RERANK_URL: rerank endpoint (default: EMBEDDINGS_URL when it is a Helios server serving a reranker). */
+	readonly rerankUrl: string | undefined;
+	/** RERANK_API_KEY (falls back to EMBEDDINGS_API_KEY when RERANK_URL is unset). */
+	readonly rerankApiKey: string | undefined;
+	/** RERANK_MODEL: upstream model for cloud rerank APIs (Jina, Cohere, Voyage). */
+	readonly rerankModel: string | undefined;
+	/** RERANK_CANDIDATES: fused candidates reranked per memory search (default 20). */
+	readonly rerankCandidates: number;
 }
 
 export function parseModelSpec(raw: string, fallback: ModelSpec): ModelSpec {
@@ -307,6 +317,11 @@ export function loadConfig(env: Readonly<Record<string, string | undefined>> = p
 			env.EMBEDDINGS_DIMENSIONS?.trim() ? parsePositiveInt(env.EMBEDDINGS_DIMENSIONS, 0) || undefined : undefined,
 		embeddingsTimeoutMs: parsePositiveInt(env.EMBEDDINGS_TIMEOUT_MS, 15_000),
 		embeddingsRequired: parseBoolean(env.EMBEDDINGS_REQUIRED, false),
+		rerankEnabled: parseBoolean(env.RERANK_ENABLED, true),
+		rerankUrl: env.RERANK_URL?.trim() || undefined,
+		rerankApiKey: env.RERANK_API_KEY?.trim() || undefined,
+		rerankModel: env.RERANK_MODEL?.trim() || undefined,
+		rerankCandidates: Math.min(128, parsePositiveInt(env.RERANK_CANDIDATES, 20)),
 	};
 }
 

@@ -29,6 +29,14 @@
  *                      EMBED_OPENAI_API_KEY (falls back to OPENAI_API_KEY; OPENROUTER_API_KEY for openrouter.ai URLs),
  *                      EMBED_OPENAI_SEND_DIMENSIONS (true for api.openai.com), EMBED_OPENAI_TIMEOUT_MS
  *   Gemini:            EMBED_GEMINI_MODEL (gemini-embedding-001), EMBED_GEMINI_API_KEY (falls back to GEMINI_API_KEY)
+ *
+ *   Reranker (POST /v1/rerank):
+ *                      EMBED_RERANK            onnx | http | off (default onnx for gemma2/npu, off for cloud profiles)
+ *                      EMBED_RERANK_MODEL      onnx default onnx-community/bge-reranker-v2-m3-ONNX
+ *                      EMBED_RERANK_DTYPE (q8), EMBED_RERANK_DEVICE (cpu|dml|...)
+ *                      EMBED_RERANK_URL / EMBED_RERANK_API_KEY   http: Jina https://api.jina.ai/v1,
+ *                                              Cohere https://api.cohere.com/v2, Voyage https://api.voyageai.com/v1
+ *                      EMBED_RERANK_MAX_DOCS (128), EMBED_RERANK_ANSWER_THRESHOLD (measured by the self-test)
  */
 
 import { isPromptFamily, type PromptFamily } from "./models.js";
@@ -69,6 +77,17 @@ export interface GeminiBackendConfig {
 	readonly timeoutMs: number;
 }
 
+export interface RerankConfig {
+	readonly backend: "onnx" | "http" | "off";
+	readonly model: string;
+	readonly dtype: string;
+	readonly device: string;
+	readonly url: string | undefined;
+	readonly apiKey: string | undefined;
+	readonly maxDocuments: number;
+	readonly answerThreshold: number | undefined;
+}
+
 export interface EmbedServerConfig {
 	readonly host: string;
 	readonly port: number;
@@ -89,15 +108,16 @@ export interface EmbedServerConfig {
 	readonly onnx: OnnxBackendConfig;
 	readonly openai: OpenAIBackendConfig;
 	readonly gemini: GeminiBackendConfig;
+	readonly rerank: RerankConfig;
 }
 
 type Env = Readonly<Record<string, string | undefined>>;
 
-const PROFILES: Record<string, { backends: BackendName[]; onnxModel?: string; npuModel?: string }> = {
-	gemma2: { backends: ["onnx"], onnxModel: "onnx-community/embeddinggemma-2-ONNX" },
-	npu: { backends: ["npu"], npuModel: "embed-gemma:300m" },
-	openai: { backends: ["openai"] },
-	gemini: { backends: ["gemini"] },
+const PROFILES: Record<string, { backends: BackendName[]; onnxModel?: string; npuModel?: string; rerank: "onnx" | "off" }> = {
+	gemma2: { backends: ["onnx"], onnxModel: "onnx-community/embeddinggemma-2-ONNX", rerank: "onnx" },
+	npu: { backends: ["npu"], npuModel: "embed-gemma:300m", rerank: "onnx" },
+	openai: { backends: ["openai"], rerank: "off" },
+	gemini: { backends: ["gemini"], rerank: "off" },
 };
 
 function str(env: Env, name: string): string | undefined {
@@ -169,6 +189,19 @@ export function loadEmbedServerConfig(env: Env = process.env): EmbedServerConfig
 		throw new EmbeddingError("MISCONFIGURED", `EMBED_ONNX_DTYPE=${dtype} is unknown`);
 	}
 
+	const rerankBackend = (str(env, "EMBED_RERANK") ?? profile.rerank).toLowerCase();
+	if (rerankBackend !== "onnx" && rerankBackend !== "http" && rerankBackend !== "off") {
+		throw new EmbeddingError("MISCONFIGURED", `EMBED_RERANK=${rerankBackend} is unknown (onnx, http, off)`);
+	}
+	const rerankThreshold = num(env, "EMBED_RERANK_ANSWER_THRESHOLD");
+	if (rerankThreshold !== undefined && !(rerankThreshold > 0 && rerankThreshold < 1)) {
+		throw new EmbeddingError("MISCONFIGURED", "EMBED_RERANK_ANSWER_THRESHOLD must be in (0, 1)");
+	}
+	const rerankUrl = str(env, "EMBED_RERANK_URL");
+	if (rerankBackend === "http" && (!rerankUrl || !str(env, "EMBED_RERANK_MODEL"))) {
+		throw new EmbeddingError("MISCONFIGURED", "EMBED_RERANK=http needs EMBED_RERANK_URL and EMBED_RERANK_MODEL");
+	}
+
 	return {
 		host: str(env, "EMBED_HOST") ?? "127.0.0.1",
 		port: int(env, "EMBED_PORT", 18765, 1),
@@ -212,6 +245,16 @@ export function loadEmbedServerConfig(env: Env = process.env): EmbedServerConfig
 			model: str(env, "EMBED_GEMINI_MODEL") ?? "gemini-embedding-001",
 			apiKey: str(env, "EMBED_GEMINI_API_KEY") ?? str(env, "GEMINI_API_KEY"),
 			timeoutMs: int(env, "EMBED_GEMINI_TIMEOUT_MS", 30_000, 1),
+		},
+		rerank: {
+			backend: rerankBackend,
+			model: str(env, "EMBED_RERANK_MODEL") ?? "onnx-community/bge-reranker-v2-m3-ONNX",
+			dtype: (str(env, "EMBED_RERANK_DTYPE") ?? "q8").toLowerCase(),
+			device: (str(env, "EMBED_RERANK_DEVICE") ?? "cpu").toLowerCase(),
+			url: rerankUrl,
+			apiKey: str(env, "EMBED_RERANK_API_KEY"),
+			maxDocuments: int(env, "EMBED_RERANK_MAX_DOCS", 128, 1),
+			answerThreshold: rerankThreshold,
 		},
 	};
 }

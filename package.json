@@ -26,7 +26,9 @@
     "embed:server": "tsx src/embeddings/main.ts",
     "embed:server:npu": "tsx src/embeddings/main.ts --profile npu --npu-autostart",
     "bench:memory:gate": "tsx benchmarks/run-memory-bench.ts --gate benchmarks/thresholds.json",
-    "embed:server:cloud": "tsx src/embeddings/main.ts --profile openai"
+    "embed:server:cloud": "tsx src/embeddings/main.ts --profile openai",
+    "bench:memory:gate:heldout": "tsx benchmarks/run-memory-bench.ts --dataset heldout --gate benchmarks/thresholds-heldout.json",
+    "bench:public": "tsx benchmarks/run-public-bench.ts"
   },
   "dependencies": {
     "@earendil-works/chord": "1.6.0",

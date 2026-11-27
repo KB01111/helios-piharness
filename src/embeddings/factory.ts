@@ -3,12 +3,14 @@ import { OnnxBackend } from "./backends/onnx.js";
 import { OpenAICompatibleBackend } from "./backends/openai-compatible.js";
 import type { EmbedServerConfig } from "./config.js";
 import { FlmSupervisor } from "./flm-supervisor.js";
+import { HttpRerankBackend, OnnxRerankBackend, RerankService } from "./rerank.js";
 import { EmbeddingRouter } from "./router.js";
 import { EmbeddingError, type EmbeddingBackend } from "./types.js";
 
 export interface BuiltEmbeddingService {
 	readonly router: EmbeddingRouter;
 	readonly supervisor: FlmSupervisor | undefined;
+	readonly reranker: RerankService | undefined;
 	close(): Promise<void>;
 }
 
@@ -89,11 +91,32 @@ export function buildEmbeddingService(
 		...(options.onEvent ? { onEvent: options.onEvent } : {}),
 	});
 
+	const r = config.rerank;
+	const reranker =
+		r.backend === "off"
+			? undefined
+			: new RerankService({
+					backend:
+						r.backend === "http"
+							? new HttpRerankBackend({ baseUrl: r.url!, model: r.model, ...(r.apiKey ? { apiKey: r.apiKey } : {}) })
+							: new OnnxRerankBackend({
+									model: r.model,
+									dtype: r.dtype,
+									device: r.device,
+									offline: config.onnx.offline,
+									...(config.onnx.cacheDir ? { cacheDir: config.onnx.cacheDir } : {}),
+								}),
+					maxDocuments: r.maxDocuments,
+					...(r.answerThreshold !== undefined ? { answerThreshold: r.answerThreshold } : {}),
+				});
+
 	return {
 		router,
 		supervisor,
+		reranker,
 		async close() {
 			await router.close();
+			await reranker?.close();
 			await supervisor?.stop();
 		},
 	};

@@ -3,6 +3,7 @@ import fs from "node:fs";
 import path from "node:path";
 import type { StatementSync } from "node:sqlite";
 import type {
+	Reranker,
 	ArtifactMetadata,
 	ArtifactReadResult,
 	ArtifactStore,
@@ -38,6 +39,7 @@ import {
 	calibrateCosine,
 	cosineStats,
 	DEFAULT_COSINE_CALIBRATION,
+	softCap,
 	vectorSalience,
 	type CosineStats,
 	calibrateLexicalScore,
@@ -53,6 +55,9 @@ import {
 	type ResolvedRankingOptions,
 } from "./retrieval.js";
 import { sanitizeMemoryKey, sanitizeMemoryText } from "./sanitize.js";
+
+/** Noisy-OR weight of a confident cross-encoder "this answers the query" signal (positive evidence only). */
+export const RERANK_WEIGHT = 0.5;
 import {
 	detectHistoricalIntent,
 	extractTemporalAnchors,
@@ -222,6 +227,9 @@ export class SqliteMemoryService implements MemoryService {
 	private readonly embeddingProvider: EmbeddingProvider | undefined;
 	/** Cosine calibration of the active embedding model (provider-declared, else the MiniLM-tuned default). */
 	private readonly cosineCalibration: { readonly floor: number; readonly ceiling: number };
+	private readonly reranker: Reranker | undefined;
+	private readonly rerankCandidates: number;
+	private readonly rerankWeight: number;
 	private readonly ranking: ResolvedRankingOptions;
 	private readonly maxVectorCandidates: number;
 	private readonly maxBackfillPerSearch: number;
@@ -241,11 +249,20 @@ export class SqliteMemoryService implements MemoryService {
 			readonly maxVectorCandidates?: number;
 			/** Max stale/missing vectors embedded lazily per search. Default 64. */
 			readonly maxBackfillPerSearch?: number;
+			/** Optional cross-encoder reranker applied to the top fused candidates (answers vs merely similar). */
+			readonly reranker?: Reranker;
+			/** Candidates reranked per search (default 20; at least `limit`). */
+			readonly rerankCandidates?: number;
+			/** Noisy-OR weight of confident reranker evidence (default `RERANK_WEIGHT`). */
+			readonly rerankWeight?: number;
 		},
 	) {
 		this.appDb = appDb;
 		this.now = options?.now ?? (() => Date.now());
 		this.embeddingProvider = options?.embeddingProvider;
+		this.reranker = options?.reranker;
+		this.rerankCandidates = Math.max(1, Math.min(128, options?.rerankCandidates ?? 20));
+		this.rerankWeight = Math.max(0, Math.min(1, options?.rerankWeight ?? RERANK_WEIGHT));
 		const declared = options?.embeddingProvider?.similarity;
 		this.cosineCalibration =
 			declared && Number.isFinite(declared.floor) && Number.isFinite(declared.ceiling) && declared.ceiling > declared.floor
@@ -441,6 +458,7 @@ export class SqliteMemoryService implements MemoryService {
 			readonly useGraph?: boolean;
 			readonly temporalMode?: "auto" | "off";
 			readonly minScore?: number;
+			readonly rerank?: boolean;
 		},
 	): Promise<MemorySearchResult[]> {
 		const limit = Math.max(1, Math.min(options?.limit ?? 10, 100));
@@ -876,7 +894,12 @@ export class SqliteMemoryService implements MemoryService {
 				(a.memory.id < b.memory.id ? -1 : a.memory.id > b.memory.id ? 1 : 0),
 		);
 
-		return scored.slice(0, limit).map((entry) => ({
+		let ranked = scored;
+		if (this.reranker && options?.rerank !== false && scored.length > 0 && query.trim().length > 0) {
+			ranked = await this.applyRerank(query, scored, Math.max(limit, this.rerankCandidates));
+		}
+
+		return ranked.slice(0, limit).map((entry) => ({
 			memory: entry.memory,
 			rank: -entry.score,
 			score: entry.score,
@@ -884,6 +907,51 @@ export class SqliteMemoryService implements MemoryService {
 			source: entry.source,
 			matchSignals: entry.matchSignals,
 		}));
+	}
+
+	/**
+	 * Cross-encoder stage over the top `k` fused candidates, used as POSITIVE evidence only.
+	 *
+	 * Measured behaviour of CPU cross-encoders (bge-reranker-v2-m3, Qwen3-Reranker-0.6B): a high score reliably
+	 * means "this answers the query", but a low score does not mean "this does not": keyword-free paraphrases and
+	 * the second hop of a multi-hop chain score ~0 just like genuine non-answers. So a confident reranker score
+	 * lifts a candidate by noisy-OR (`s + w * r * (1 - s)`, with `r` ramping from the reranker's measured
+	 * near-miss level to 0.5) and a low score never demotes anything. Recall, abstention and chain context therefore
+	 * stay exactly as the fused ranking had them; only the ORDER among plausible candidates improves.
+	 * On reranker failure the fused order is returned unchanged.
+	 */
+	private async applyRerank<T extends { memory: LongTermMemory; score: number; matchSignals: NonNullable<MemorySearchResult["matchSignals"]> }>(
+		query: string,
+		scored: T[],
+		k: number,
+	): Promise<T[]> {
+		const reranker = this.reranker!;
+		const headSize = Math.min(scored.length, k, 128);
+		const head = scored.slice(0, headSize);
+		let probs: readonly number[];
+		try {
+			probs = await reranker.rerank(
+				query,
+				head.map((e) => `${e.memory.key}: ${e.memory.content}`.slice(0, 2_000)),
+			);
+			if (probs.length !== head.length || probs.some((p) => !Number.isFinite(p))) return scored;
+		} catch {
+			return scored;
+		}
+		const floor = reranker.answerThreshold !== undefined && reranker.answerThreshold > 0 && reranker.answerThreshold < 0.5 ? reranker.answerThreshold : 0.1;
+		const boosted = head.map((e, i) => {
+			const p = Math.max(0, Math.min(1, probs[i]!));
+			const t = Math.max(0, Math.min(1, (p - floor) / (0.5 - floor)));
+			const r = t * t * (3 - 2 * t);
+			return { ...e, score: softCap(e.score + this.rerankWeight * r * (1 - e.score)), matchSignals: { ...e.matchSignals, rerank: p } };
+		});
+		return [...boosted, ...scored.slice(headSize)].sort(
+			(a, b) =>
+				b.score - a.score ||
+				Number(b.memory.pinned) - Number(a.memory.pinned) ||
+				b.memory.updatedAt - a.memory.updatedAt ||
+				(a.memory.id < b.memory.id ? -1 : a.memory.id > b.memory.id ? 1 : 0),
+		);
 	}
 
 	/**

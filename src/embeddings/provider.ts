@@ -10,7 +10,7 @@
  * then degrades to lexical ranking) instead of silently mixing incomparable vectors.
  */
 
-import type { EmbeddingProvider } from "../contracts/app-capabilities.js";
+import type { EmbeddingProvider, Reranker } from "../contracts/app-capabilities.js";
 import { errorText, postJson, redactUrl, toFloat32, base64ToFloat32, withTimeout } from "./backends/http-util.js";
 import { resolveModelInfo } from "./models.js";
 import type { EmbeddingRouter } from "./router.js";
@@ -230,5 +230,96 @@ export class RouterEmbeddingProvider implements EmbeddingProvider {
 			...(options?.signal ? { signal: options.signal } : {}),
 		});
 		return result.vectors;
+	}
+}
+
+export interface HttpRerankerOptions {
+	/** Base URL including `/v1` (Helios embedding server, Jina `https://api.jina.ai/v1`, Cohere `https://api.cohere.com/v2`). */
+	readonly baseUrl: string;
+	readonly apiKey?: string;
+	/** Upstream model; required for non-Helios endpoints (e.g. `rerank-v3.5`, `jina-reranker-v2-base-multilingual`). */
+	readonly model?: string;
+	/** Overrides the threshold announced by the server. */
+	readonly answerThreshold?: number;
+	readonly timeoutMs?: number;
+	readonly fetchImpl?: typeof fetch;
+}
+
+/**
+ * `Reranker` over the Cohere/Jina-style `POST /rerank` protocol (`{model, query, documents}` ->
+ * `{results: [{index, relevance_score}]}`), served by the Helios embedding server and by most cloud rerankers.
+ */
+export class HttpReranker implements Reranker {
+	readonly model: string;
+	readonly answerThreshold?: number;
+	readonly helios: boolean;
+	private readonly baseUrl: string;
+	private readonly headers: Record<string, string>;
+	private readonly timeoutMs: number;
+	private readonly fetchImpl: typeof fetch | undefined;
+
+	private constructor(options: HttpRerankerOptions, model: string, helios: boolean, answerThreshold: number | undefined) {
+		this.baseUrl = options.baseUrl.replace(/\/+$/, "");
+		this.model = model;
+		this.helios = helios;
+		if (answerThreshold !== undefined) this.answerThreshold = answerThreshold;
+		this.headers = options.apiKey ? { authorization: `Bearer ${options.apiKey}` } : {};
+		this.timeoutMs = options.timeoutMs ?? 30_000;
+		this.fetchImpl = options.fetchImpl;
+	}
+
+	/** Discovers the Helios server's reranker via `/v1/models`; plain endpoints need `options.model`. */
+	static async connect(options: HttpRerankerOptions): Promise<HttpReranker> {
+		const baseUrl = options.baseUrl.replace(/\/+$/, "");
+		let entry: { id?: unknown; answer_threshold?: unknown } | undefined;
+		const { signal, dispose } = withTimeout(undefined, Math.min(options.timeoutMs ?? 30_000, 10_000));
+		try {
+			const res = await (options.fetchImpl ?? fetch)(`${baseUrl}/models`, {
+				headers: options.apiKey ? { authorization: `Bearer ${options.apiKey}` } : {},
+				signal,
+			});
+			if (res.ok) {
+				const json = (await res.json()) as { data?: Array<{ id?: unknown; type?: unknown; answer_threshold?: unknown }> };
+				entry = Array.isArray(json?.data) ? json.data.find((m) => m?.type === "rerank") : undefined;
+			} else {
+				await res.body?.cancel().catch(() => undefined);
+			}
+		} catch (error) {
+			if (!options.model) {
+				throw new EmbeddingError("UNAVAILABLE", `rerank endpoint ${redactUrl(baseUrl)} unreachable: ${errorText(error)}`, { cause: error });
+			}
+		} finally {
+			dispose();
+		}
+		if (entry && typeof entry.id === "string") {
+			const threshold = options.answerThreshold ?? (typeof entry.answer_threshold === "number" ? entry.answer_threshold : undefined);
+			return new HttpReranker(options, entry.id, true, threshold);
+		}
+		if (!options.model) {
+			throw new EmbeddingError("MISCONFIGURED", `${redactUrl(baseUrl)} serves no reranker; set RERANK_MODEL for a cloud rerank API`);
+		}
+		return new HttpReranker(options, options.model, false, options.answerThreshold);
+	}
+
+	async rerank(query: string, documents: readonly string[], options?: { readonly signal?: AbortSignal }): Promise<readonly number[]> {
+		if (documents.length === 0) return [];
+		const json = (await postJson(
+			`${this.baseUrl}/rerank`,
+			{ model: this.model, query, documents: [...documents], top_n: documents.length, return_documents: false },
+			{
+				headers: this.headers,
+				timeoutMs: this.timeoutMs,
+				...(options?.signal ? { signal: options.signal } : {}),
+				...(this.fetchImpl ? { fetchImpl: this.fetchImpl } : {}),
+			},
+		)) as { results?: Array<{ index?: unknown; relevance_score?: unknown }> };
+		const scores = new Array<number>(documents.length).fill(Number.NaN);
+		for (const r of json.results ?? []) {
+			if (typeof r.index === "number" && typeof r.relevance_score === "number" && r.index >= 0 && r.index < documents.length) {
+				scores[r.index] = r.relevance_score;
+			}
+		}
+		if (scores.some((s) => !Number.isFinite(s))) throw new EmbeddingError("UPSTREAM", "rerank response is missing documents");
+		return scores;
 	}
 }

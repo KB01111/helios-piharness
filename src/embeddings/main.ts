@@ -52,11 +52,20 @@ async function main(): Promise<void> {
 			else logger.error("embedding_self_test", { backend: entry.id, ...entry.result });
 		}
 		logger.info("embedding_calibration", { space: service.router.space, calibration: service.router.calibration ?? null });
+		if (service.reranker) {
+			try {
+				const rr = await service.reranker.selfTest({ enforce: config.selfTestEnforce });
+				logger[rr.passed ? "info" : "error"]("rerank_self_test", { model: service.reranker.model, ...rr });
+			} catch (error) {
+				logger.warn("rerank_self_test_skipped", { model: service.reranker.model, error: serializeError(error) });
+			}
+		}
 	}
 	const app = createEmbedHttpServer(service.router, {
 		apiKeys: config.apiKeys,
 		maxInputs: config.maxInputs,
 		maxBodyBytes: config.maxBodyBytes,
+		...(service.reranker ? { reranker: service.reranker } : {}),
 		onEvent: (event, fields) => (event === "embedding_request" ? logger.debug(event, fields) : logger.warn(event, fields)),
 	});
 
@@ -66,6 +75,7 @@ async function main(): Promise<void> {
 			space: service.router.space,
 			model: service.router.modelId(),
 			backends: service.router.backendIds,
+			reranker: service.reranker?.model ?? null,
 			auth: config.apiKeys.length > 0 ? "bearer" : "none",
 		});
 	});
