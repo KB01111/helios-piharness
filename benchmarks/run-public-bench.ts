@@ -152,6 +152,9 @@ async function main(): Promise<void> {
 		if (profile) {
 			const service = buildEmbeddingService(loadEmbedServerConfig({ ...process.env, EMBED_PROFILE: profile, EMBED_CACHE_SIZE: "200000" }));
 			close = () => service.close();
+			if (service.supervisor && !(await service.supervisor.ensureRunning())) {
+				console.error("[bench] FastFlowLM did not start; NPU requests will fall back to the next backend or fail");
+			}
 			const quality = await service.router.selfTest({ quarantineOnError: true });
 			console.error("[bench] embedding self-test:", JSON.stringify(quality));
 			if (quality.some((entry) => entry.result?.passed)) {

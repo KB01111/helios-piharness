@@ -669,6 +669,22 @@ describe("C. Retrieval quality", () => {
 			}
 		});
 
+		it("backfill limit counts stale documents, so repeated calls reach older memories", async () => {
+			const appDb = AppDatabase.open({ dbPath: ":memory:" });
+			try {
+				const memory = new SqliteMemoryService(appDb, { embeddingProvider: fakeProvider() });
+				for (const [key, content] of [["a.one", "Uses neovim"], ["a.two", "Uses postgres"], ["a.three", "Likes jazz"]] as const) {
+					await memory.pinMemory(T, U, { key, content });
+				}
+				expect(await memory.backfillEmbeddings(T, U, { limit: 1 })).toBe(1);
+				expect(await memory.backfillEmbeddings(T, U, { limit: 1 })).toBe(1);
+				expect(await memory.backfillEmbeddings(T, U, { limit: 1 })).toBe(1);
+				expect(await memory.backfillEmbeddings(T, U, { limit: 1 })).toBe(0);
+			} finally {
+				appDb.close();
+			}
+		});
+
 		it("degrades to lexical ranking when the provider throws, and re-embeds when the model id changes", async () => {
 			const appDb = AppDatabase.open({ dbPath: ":memory:" });
 			try {

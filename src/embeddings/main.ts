@@ -39,6 +39,22 @@ async function main(): Promise<void> {
 	}
 	const service = buildEmbeddingService(config, { onEvent: (event, fields) => logger.info(event, fields) });
 
+	// Registered before the (slow) NPU start and self-test so a signal during startup still stops the FastFlowLM child.
+	let server: ReturnType<typeof serve> | undefined;
+	let stopping = false;
+	const stop = (signal: string): void => {
+		if (stopping) return;
+		stopping = true;
+		logger.info("embed_server_stopping", { signal });
+		const force = setTimeout(() => process.exit(1), 10_000);
+		force.unref();
+		const finish = (): void => void service.close().finally(() => process.exit(0));
+		if (server) server.close(finish);
+		else finish();
+	};
+	process.once("SIGINT", () => stop("SIGINT"));
+	process.once("SIGTERM", () => stop("SIGTERM"));
+
 	if (service.supervisor) {
 		const up = await service.supervisor.ensureRunning();
 		if (!up) logger.warn("npu_backend_unavailable", { message: "FastFlowLM did not start; requests fall back to the next backend" });
@@ -61,6 +77,15 @@ async function main(): Promise<void> {
 			}
 		}
 	}
+	// Models without a declared size (E5, BGE, custom) publish `<space>@<dims>` only once a vector has been seen.
+	// Learn it before serving so discovery and later embedding replies carry the same model identity.
+	if (service.router.publishedDimensions === undefined) {
+		try {
+			await service.router.embed({ texts: ["dimension probe"], inputType: "query" });
+		} catch (error) {
+			logger.warn("embedding_dimension_probe_failed", { error: serializeError(error) });
+		}
+	}
 	const app = createEmbedHttpServer(service.router, {
 		apiKeys: config.apiKeys,
 		maxInputs: config.maxInputs,
@@ -69,7 +94,7 @@ async function main(): Promise<void> {
 		onEvent: (event, fields) => (event === "embedding_request" ? logger.debug(event, fields) : logger.warn(event, fields)),
 	});
 
-	const server = serve({ fetch: app.fetch, hostname: config.host, port: config.port }, (info) => {
+	server = serve({ fetch: app.fetch, hostname: config.host, port: config.port }, (info) => {
 		logger.info("embed_server_started", {
 			url: `http://${info.address}:${info.port}/v1`,
 			space: service.router.space,
@@ -79,20 +104,6 @@ async function main(): Promise<void> {
 			auth: config.apiKeys.length > 0 ? "bearer" : "none",
 		});
 	});
-
-	let stopping = false;
-	const stop = (signal: string): void => {
-		if (stopping) return;
-		stopping = true;
-		logger.info("embed_server_stopping", { signal });
-		const force = setTimeout(() => process.exit(1), 10_000);
-		force.unref();
-		server.close(() => {
-			void service.close().finally(() => process.exit(0));
-		});
-	};
-	process.once("SIGINT", () => stop("SIGINT"));
-	process.once("SIGTERM", () => stop("SIGTERM"));
 }
 
 main().catch((error: unknown) => {

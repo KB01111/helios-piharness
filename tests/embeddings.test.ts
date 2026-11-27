@@ -1,6 +1,7 @@
 import { EventEmitter } from "node:events";
 import { describe, expect, it } from "vitest";
 import { GeminiBackend } from "../src/embeddings/backends/gemini.js";
+import { base64ToFloat32 } from "../src/embeddings/backends/http-util.js";
 import { OnnxBackend, type TransformersModule } from "../src/embeddings/backends/onnx.js";
 import { OpenAICompatibleBackend } from "../src/embeddings/backends/openai-compatible.js";
 import { isLoopbackHost, loadEmbedServerConfig } from "../src/embeddings/config.js";
@@ -17,7 +18,7 @@ import { AppDatabase } from "../src/memory/db.js";
 import { calibrateCosine, cosineStats, vectorSalience } from "../src/memory/retrieval.js";
 import { SqliteMemoryService } from "../src/memory/sqlite-memory.js";
 
-const DIM = 64;
+const DIM = 768;
 
 /** Strips the task prompts the router adds so fakes can recognise their inputs. */
 function stripPrompt(text: string): string {
@@ -196,7 +197,8 @@ describe("EmbeddingRouter", () => {
 		const router = new EmbeddingRouter({ backends: [backend] });
 		const first = await router.embed({ texts: ["x", "y", "x", "z"], inputType: "document" });
 		expect(first.vectors).toHaveLength(4);
-		expect(first.vectors[0]).toBe(first.vectors[2]);
+	expect(first.vectors[0]).toEqual(first.vectors[2]);
+	expect(first.vectors[0]).not.toBe(first.vectors[2]);
 		expect(backend.calls.map((c) => c.texts)).toEqual([["x", "y"], ["z"]]);
 
 		const second = await router.embed({ texts: ["x", "y"], inputType: "document" });
@@ -262,6 +264,30 @@ describe("EmbeddingRouter", () => {
 		const router = new EmbeddingRouter({ backends: [new FakeBackend("a")], calibration: { floor: 0.1, ceiling: 0.9 } });
 		await router.selfTest();
 		expect(router.calibration).toEqual({ floor: 0.1, ceiling: 0.9 });
+	});
+});
+
+describe("router cache isolation and base64 validation", () => {
+	it("returns copies so caller writes cannot change cached vectors", async () => {
+		const router = new EmbeddingRouter({ backends: [new FakeBackend("a")] });
+		const first = await router.embed({ texts: ["same", "same"], inputType: "document" });
+		first.vectors[0]![0] = 99;
+		expect(first.vectors[1]![0]).not.toBe(99);
+		const again = await router.embed({ texts: ["same"], inputType: "document" });
+		expect(again.vectors[0]![0]).not.toBe(99);
+		again.vectors[0]![0] = 7;
+		expect((await router.embed({ texts: ["same"], inputType: "document" })).vectors[0]![0]).not.toBe(7);
+	});
+
+	it("rejects base64 vectors containing NaN or Infinity", () => {
+		const bad = Buffer.alloc(8);
+		bad.writeFloatLE(1, 0);
+		bad.writeFloatLE(Number.NaN, 4);
+		expect(() => base64ToFloat32(bad.toString("base64"), "test")).toThrow(/non-finite/);
+		const ok = Buffer.alloc(8);
+		ok.writeFloatLE(0.5, 0);
+		ok.writeFloatLE(-1, 4);
+		expect(Array.from(base64ToFloat32(ok.toString("base64"), "test"))).toEqual([0.5, -1]);
 	});
 });
 
@@ -381,6 +407,23 @@ describe("HttpEmbeddingProvider", () => {
 		const provider = await HttpEmbeddingProvider.connect({ baseUrl: "http://embed.local/v1", fetchImpl: honoFetch(createEmbedHttpServer(router)) });
 		expect(provider.model).toBe(`test/space@${DIM}`);
 		expect(await provider.embed(["second request"])).toHaveLength(1);
+	});
+
+	it("reports a 5xx during discovery as UNAVAILABLE (not a configuration error) and requires the Helios model id on replies", async () => {
+		const down: typeof fetch = async () => new Response("overloaded", { status: 503 });
+		await expect(HttpEmbeddingProvider.connect({ baseUrl: "http://fixture/v1", fetchImpl: down })).rejects.toMatchObject({ code: "UNAVAILABLE" });
+		await expect(HttpEmbeddingProvider.connect({ baseUrl: "http://fixture/v1", model: "fixture", fetchImpl: down })).resolves.toBeDefined();
+
+		const router = new EmbeddingRouter({ backends: [new FakeBackend("a")] });
+		const app = createEmbedHttpServer(router);
+		const stripModel: typeof fetch = async (url, init) => {
+			const res = await honoFetch(app)(url, init);
+			if (!String(url).endsWith("/embeddings")) return res;
+			const { model: _model, ...rest } = (await res.json()) as Record<string, unknown>;
+			return Response.json(rest);
+		};
+		const provider = await HttpEmbeddingProvider.connect({ baseUrl: "http://embed.local/v1", fetchImpl: stripModel });
+		await expect(provider.embed(["x"])).rejects.toMatchObject({ code: "MISCONFIGURED" });
 	});
 
 	it("rejects malformed response indices while accepting reordered rows", async () => {
@@ -750,5 +793,12 @@ describe("harness embedding config", () => {
 		expect(local.embeddingsApiKey).toBeUndefined(); // never leak the OpenAI key to a third-party endpoint
 		const cloud = loadConfig({ EMBEDDINGS_URL: "https://api.openai.com/v1", EMBEDDINGS_MODEL: "text-embedding-3-small", OPENAI_API_KEY: "sk", EMBEDDINGS_REQUIRED: "true" });
 		expect(cloud).toMatchObject({ embeddingsApiKey: "sk", embeddingsModel: "text-embedding-3-small", embeddingsRequired: true });
+	});
+
+	it("never hands OPENAI_API_KEY to a lookalike host or a URL that merely mentions api.openai.com", () => {
+		for (const url of ["https://api.openai.com.attacker.example/v1", "https://proxy.example/api.openai.com/v1", "https://proxy.example/v1?u=api.openai.com", "not a url"]) {
+			expect(loadConfig({ EMBEDDINGS_URL: url, OPENAI_API_KEY: "sk" }).embeddingsApiKey).toBeUndefined();
+		}
+		expect(loadConfig({ EMBEDDINGS_URL: "https://proxy.example/v1", EMBEDDINGS_API_KEY: "explicit", OPENAI_API_KEY: "sk" }).embeddingsApiKey).toBe("explicit");
 	});
 });

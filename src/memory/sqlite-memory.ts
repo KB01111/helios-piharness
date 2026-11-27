@@ -1090,7 +1090,7 @@ export class SqliteMemoryService implements MemoryService {
 				const cos = dotProductOffset(normQuery, matrix, i * dim);
 				const row = rows[i]!;
 				allCosines.set(row.id, cos);
-				if (cos > this.cosineCalibration.floor * 0.5) {
+				if (cos > Math.min(this.cosineCalibration.floor, this.cosineCalibration.floor * 0.5)) {
 					hits.push({ row, cosine: cos });
 				}
 			}
@@ -1114,20 +1114,26 @@ export class SqliteMemoryService implements MemoryService {
 		const limit = Math.max(1, Math.min(options?.limit ?? 500, 10_000));
 		const statusClause =
 			options?.includeSuperseded === false ? "m.status = 'active'" : "m.status IN ('active', 'superseded')";
-		const rows = this.stmt(
-			`SELECT m.*, e.content_hash AS e_hash
-			 FROM longterm_memories m
-			 LEFT JOIN memory_embeddings e ON e.memory_id = m.id AND e.model = ?
-			 WHERE m.tenant_id = ? AND m.user_id = ? AND ${statusClause}
-			 ORDER BY m.pinned DESC, m.updated_at DESC, m.id ASC
-			 LIMIT ?`,
-		).all(provider.model, tenantId, userId, limit) as Array<MemoryRow & { e_hash: string | null }>;
-		const todo = rows
-			.map((row) => {
+		// The limit counts stale documents, not scanned rows: page through the ordered memories, skipping the ones that
+		// already have a current vector, so repeated calls reach the older memories instead of re-reading the newest page.
+		const pageSize = 500;
+		const todo: Array<{ row: MemoryRow; text: string; hash: string }> = [];
+		for (let offset = 0; todo.length < limit; offset += pageSize) {
+			const rows = this.stmt(
+				`SELECT m.*, e.content_hash AS e_hash
+				 FROM longterm_memories m
+				 LEFT JOIN memory_embeddings e ON e.memory_id = m.id AND e.model = ?
+				 WHERE m.tenant_id = ? AND m.user_id = ? AND ${statusClause}
+				 ORDER BY m.pinned DESC, m.updated_at DESC, m.id ASC
+				 LIMIT ? OFFSET ?`,
+			).all(provider.model, tenantId, userId, pageSize, offset) as Array<MemoryRow & { e_hash: string | null }>;
+			for (const row of rows) {
 				const text = embeddingText(row.mem_key, row.content);
-				return { row, text, hash: hashText(text) };
-			})
-			.filter((entry) => entry.row.e_hash !== entry.hash);
+				const hash = hashText(text);
+				if (row.e_hash !== hash && todo.length < limit) todo.push({ row, text, hash });
+			}
+			if (rows.length < pageSize) break;
+		}
 		if (todo.length === 0) return 0;
 		const embedded = await provider.embed(
 			todo.map((entry) => entry.text),

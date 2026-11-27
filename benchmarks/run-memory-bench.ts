@@ -146,11 +146,15 @@ async function buildHeliosEngine(
 	const tWarm0 = performance.now();
 	const appDb = AppDatabase.open({ dbPath: ":memory:" });
 	let currentNow = BENCHMARK_NOW_MS;
+	const rerankWeightArg = process.argv.includes("--rerank-weight") ? Number(process.argv[process.argv.indexOf("--rerank-weight") + 1]) : Number.NaN;
+	if (process.argv.includes("--rerank-weight") && !(rerankWeightArg >= 0 && rerankWeightArg <= 1)) {
+		throw new Error("--rerank-weight needs a number between 0 and 1");
+	}
 	const memory = new SqliteMemoryService(appDb, {
 		now: () => currentNow,
 		...(embedder ? { embeddingProvider: embedder } : {}),
 		...(reranker ? { reranker } : {}),
-		...(process.argv.includes("--rerank-weight") ? { rerankWeight: Number(process.argv[process.argv.indexOf("--rerank-weight") + 1]) } : {}),
+		...(Number.isFinite(rerankWeightArg) ? { rerankWeight: rerankWeightArg } : {}),
 	});
 	const warmMs = performance.now() - tWarm0;
 
@@ -811,6 +815,9 @@ async function main(): Promise<void> {
 		console.error("[bench] --lexical-only: skipping embedding providers");
 	} else if (inProcessProfile) {
 		const service = buildEmbeddingService(loadEmbedServerConfig({ ...process.env, EMBED_PROFILE: inProcessProfile }));
+		if (service.supervisor && !(await service.supervisor.ensureRunning())) {
+			console.error("[bench] FastFlowLM did not start; NPU requests will fall back to the next backend or fail");
+		}
 		embedder = new RouterEmbeddingProvider(service.router);
 		if (args.includes("--rerank") && service.reranker) {
 			await service.reranker.selfTest();

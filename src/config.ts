@@ -199,6 +199,15 @@ function parseNonNegativeInt(raw: string | undefined, fallback: number): number 
 	return Number.isFinite(parsed) && parsed >= 0 ? parsed : fallback;
 }
 
+/** Parsed hostname of a URL ("" when absent or invalid); credentials are only ever matched against exact hosts. */
+function hostnameOf(url: string | undefined): string {
+	try {
+		return url ? new URL(url).hostname.toLowerCase() : "";
+	} catch {
+		return "";
+	}
+}
+
 function parseBoolean(raw: string | undefined, fallback: boolean): boolean {
 	if (raw === undefined || raw.trim() === "") return fallback;
 	const normalized = raw.trim().toLowerCase();
@@ -311,7 +320,7 @@ export function loadConfig(env: Readonly<Record<string, string | undefined>> = p
 		embeddingsUrl: env.EMBEDDINGS_URL?.trim() || undefined,
 		embeddingsApiKey:
 			env.EMBEDDINGS_API_KEY?.trim() ||
-			(/api\.openai\.com/i.test(env.EMBEDDINGS_URL ?? "") ? env.OPENAI_API_KEY?.trim() || undefined : undefined),
+			(hostnameOf(env.EMBEDDINGS_URL) === "api.openai.com" ? env.OPENAI_API_KEY?.trim() || undefined : undefined),
 		embeddingsModel: env.EMBEDDINGS_MODEL?.trim() || undefined,
 		embeddingsDimensions:
 			env.EMBEDDINGS_DIMENSIONS?.trim() ? parsePositiveInt(env.EMBEDDINGS_DIMENSIONS, 0) || undefined : undefined,

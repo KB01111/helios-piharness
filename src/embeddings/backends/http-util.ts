@@ -123,6 +123,10 @@ export function base64ToFloat32(b64: string, where: string): Float32Array {
 	const buf = Buffer.from(b64, "base64");
 	if (buf.byteLength === 0 || buf.byteLength % 4 !== 0) throw new EmbeddingError("UPSTREAM", `${where}: malformed base64 embedding`);
 	const out = new Float32Array(buf.byteLength / 4);
-	for (let i = 0; i < out.length; i++) out[i] = buf.readFloatLE(i * 4);
+	for (let i = 0; i < out.length; i++) {
+		const v = buf.readFloatLE(i * 4);
+		if (!Number.isFinite(v)) throw new EmbeddingError("UPSTREAM", `${where}: non-finite value at index ${i}`);
+		out[i] = v;
+	}
 	return out;
 }

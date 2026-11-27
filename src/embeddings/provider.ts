@@ -109,6 +109,9 @@ export class HttpEmbeddingProvider implements EmbeddingProvider {
 				if (res.status === 401 || res.status === 403) {
 					throw new EmbeddingError("MISCONFIGURED", `embedding endpoint ${redactUrl(baseUrl)} rejected the API key (HTTP ${res.status})`);
 				}
+				if ((res.status >= 500 || res.status === 429) && !options.model) {
+					throw new EmbeddingError("UNAVAILABLE", `embedding endpoint ${redactUrl(baseUrl)} returned HTTP ${res.status} during model discovery`);
+				}
 			}
 		} catch (error) {
 			if (error instanceof EmbeddingError) throw error;
@@ -184,10 +187,10 @@ export class HttpEmbeddingProvider implements EmbeddingProvider {
 					...(options?.signal ? { signal: options.signal } : {}),
 					...(this.fetchImpl ? { fetchImpl: this.fetchImpl } : {}),
 				})) as { model?: unknown; data?: Array<{ index?: number; embedding?: unknown }> };
-				if (this.helios && typeof json.model === "string" && json.model !== this.model) {
+				if (this.helios && json.model !== this.model) {
 					throw new EmbeddingError(
 						"MISCONFIGURED",
-						`embedding server now serves ${json.model} but stored vectors use ${this.model}; restart the harness to re-embed`,
+						`embedding server reply model ${String(json.model)} does not match stored model ${this.model}; restart the harness to re-embed`,
 					);
 				}
 				const data = Array.isArray(json.data) ? json.data : [];

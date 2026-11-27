@@ -243,7 +243,7 @@ export class EmbeddingRouter {
 				// refresh LRU position
 				this.cache.delete(keys[i]!);
 				this.cache.set(keys[i]!, hit);
-				vectors[i] = hit;
+				vectors[i] = hit.slice();
 				cacheHits += 1;
 			} else {
 				missing.push(i);
@@ -270,8 +270,9 @@ export class EmbeddingRouter {
 			);
 			raw.forEach((out, n) => {
 				const key = keys[uniqueIdx[n]!]!;
-				for (const idx of uniqueByKey.get(key)!) vectors[idx] = out;
-				this.remember(key, out);
+				// The cache keeps a private copy and every result slot gets its own, so caller writes cannot alter cached vectors.
+				this.remember(key, out.slice());
+				for (const idx of uniqueByKey.get(key)!) vectors[idx] = out.slice();
 			});
 		}
 
