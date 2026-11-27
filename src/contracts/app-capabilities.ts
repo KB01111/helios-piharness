@@ -100,6 +100,8 @@ export interface MemorySearchResult {
 		readonly vector?: number;
 		readonly graph?: number;
 		readonly temporal?: number;
+		/** Cross-encoder answer relevance in [0, 1] when a reranker scored this result. */
+		readonly rerank?: number;
 	};
 }
 
@@ -110,7 +112,36 @@ export interface MemorySearchResult {
 export interface EmbeddingProvider {
 	/** Stable model identifier. Stored with vectors; vectors from a different model id are ignored. */
 	readonly model: string;
-	embed(texts: readonly string[], options?: { readonly signal?: AbortSignal }): Promise<ReadonlyArray<ArrayLike<number>>>;
+	/**
+	 * Optional cosine calibration of this model's embedding space: `floor` ~ similarity of unrelated texts,
+	 * `ceiling` ~ similarity of close paraphrases. Retrieval maps cosine onto relevance over `[floor, ceiling]`;
+	 * without it a conservative default tuned for small sentence-transformers (floor 0.24, ceiling 0.74) is used.
+	 */
+	readonly similarity?: { readonly floor: number; readonly ceiling: number };
+	/**
+	 * `inputType` tells asymmetric (instruction-tuned) models whether the texts are search queries or stored
+	 * documents. Memory search embeds queries and documents in separate calls. Providers may ignore it.
+	 */
+	embed(
+		texts: readonly string[],
+		options?: { readonly signal?: AbortSignal; readonly inputType?: "query" | "document" },
+	): Promise<ReadonlyArray<ArrayLike<number>>>;
+}
+
+/**
+ * Optional cross-encoder reranker. Unlike an embedding (which scores how *similar* two texts are), a reranker
+ * reads query and document together and scores whether the document *answers* the query.
+ */
+export interface Reranker {
+	/** Stable model identifier. */
+	readonly model: string;
+	/**
+	 * Probability-like relevance below which a document does not answer the query (measured by the reranker's
+	 * self-test). Memory search treats candidates under it as non-answers, which is what makes abstention work.
+	 */
+	readonly answerThreshold?: number;
+	/** Relevance in [0, 1] for each document, in input order. */
+	rerank(query: string, documents: readonly string[], options?: { readonly signal?: AbortSignal }): Promise<readonly number[]>;
 }
 
 export type MemoryMutationOp =
@@ -176,6 +207,12 @@ export interface MemoryService {
 		readonly minEpisodes?: number;
 	}): Promise<PendingEpisodeScope[]>;
 
+	/**
+	 * Optional: embed memories that lack a fresh vector (hybrid retrieval). Called by the sleep cycle after
+	 * consolidation so new memories are embedded off the request path. Returns the number of vectors written.
+	 */
+	backfillEmbeddings?(tenantId: string, userId: string, options?: { readonly limit?: number }): Promise<number>;
+
 	recordEpisode(
 		episode: Omit<MidTermEpisode, "id" | "consolidated" | "createdAt"> & { readonly createdAt?: number },
 	): Promise<MidTermEpisode>;
@@ -199,6 +236,8 @@ export interface MemoryService {
 			readonly temporalMode?: "auto" | "off";
 			/** Minimum calibrated relevance score required to return a hit (0 disables abstention filtering). */
 			readonly minScore?: number;
+			/** Rerank the top candidates with the configured cross-encoder (default true when one is configured). */
+			readonly rerank?: boolean;
 		},
 	): Promise<MemorySearchResult[]>;
 

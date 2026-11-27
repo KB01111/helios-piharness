@@ -34,9 +34,11 @@ export interface BenchMemoryEngine {
 export class CachedHttpEmbeddingProvider implements EmbeddingProvider {
 	readonly model: string;
 	private readonly endpoint: string;
+	private readonly apiKey: string | undefined;
 	private readonly cache = new Map<string, Float32Array>();
 
-	constructor(options: { readonly endpoint: string; readonly model: string }) {
+	constructor(options: { readonly endpoint: string; readonly apiKey?: string; readonly model: string }) {
+		this.apiKey = options.apiKey;
 		this.endpoint = options.endpoint.replace(/\/+$/, "");
 		this.model = options.model;
 	}
@@ -56,7 +58,7 @@ export class CachedHttpEmbeddingProvider implements EmbeddingProvider {
 				const slice = missing.slice(start, start + 64);
 				const res = await fetch(`${this.endpoint}/embeddings`, {
 					method: "POST",
-					headers: { "Content-Type": "application/json", Authorization: "Bearer local-bench" },
+					headers: { "Content-Type": "application/json", ...(this.apiKey ? { authorization: `Bearer ${this.apiKey}` } : {}) },
 					body: JSON.stringify({ model: this.model, input: slice.map((s) => s.text) }),
 				});
 				if (!res.ok) throw new Error(`Embedding HTTP ${res.status}: ${await res.text()}`);
@@ -195,7 +197,7 @@ export class GraphitiRefEngine implements BenchMemoryEngine {
 	static async build(memories: readonly BenchmarkMemory[], embedder: EmbeddingProvider): Promise<GraphitiRefEngine> {
 		const engine = new GraphitiRefEngine(embedder);
 		const texts = memories.map((m) => `${m.key}: ${m.content}`);
-		const vecs = await embedder.embed(texts);
+		const vecs = await embedder.embed(texts, { inputType: "document" });
 		const byId = new Map<string, GraphitiNode>();
 
 		for (let i = 0; i < memories.length; i++) {
@@ -232,7 +234,7 @@ export class GraphitiRefEngine implements BenchMemoryEngine {
 	async search(query: string, topK: number): Promise<RankedHit[]> {
 		const isHistorical = /\b(before|previously|prior to|originally|used to|earlier)\b/i.test(query);
 		const activeNodes = isHistorical ? this.nodes : this.nodes.filter((n) => n.validUntil === null);
-		const [qVec] = await this.embedder.embed([query]);
+		const [qVec] = await this.embedder.embed([query], { inputType: "query" });
 		const qTokens = tokenize(query);
 		const qEntities = extractSimpleEntities(query);
 		const qYears = extractYears(query);
@@ -326,7 +328,7 @@ export class HippoRagRefEngine implements BenchMemoryEngine {
 		const engine = new HippoRagRefEngine(embedder);
 		const superseded = new Set(memories.map((m) => m.supersedesId).filter(Boolean));
 		const texts = memories.map((m) => `${m.key}: ${m.content}`);
-		const vecs = await embedder.embed(texts);
+		const vecs = await embedder.embed(texts, { inputType: "document" });
 
 		for (let i = 0; i < memories.length; i++) {
 			const m = memories[i]!;
@@ -357,7 +359,7 @@ export class HippoRagRefEngine implements BenchMemoryEngine {
 
 	async search(query: string, topK: number): Promise<RankedHit[]> {
 		const activeDocs = this.docs.filter((d) => d.active);
-		const [qVec] = await this.embedder.embed([query]);
+		const [qVec] = await this.embedder.embed([query], { inputType: "query" });
 		const qEntities = extractSimpleEntities(query);
 
 		// 1) Initial dense passage similarities
@@ -388,7 +390,7 @@ export class HippoRagRefEngine implements BenchMemoryEngine {
 		const docPpr = new Map<string, number>();
 		const seedDocMass = new Map<string, number>();
 		for (const r of ranked.slice(0, 5)) {
-			if (r.cos >= 0.3) seedDocMass.set(r.id, r.cos);
+			if (r.cos >= 0.3) seedDocMass.set(r.doc.id, r.cos);
 		}
 
 		let curEnt = new Map(entScore);

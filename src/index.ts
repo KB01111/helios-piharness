@@ -6,6 +6,7 @@ import type {
 	ArtifactStore,
 	EmbeddingProvider,
 	FastModelClient,
+	Reranker,
 	FrictionSignal,
 	FrictionSignalKind,
 	LongTermMemory,
@@ -181,7 +182,21 @@ import {
 import { AppDatabase, type AppDatabaseOptions } from "./memory/db.js";
 import { detectFrictionSignals, type FrictionAnalysisInput, type FrictionAnalysisResult } from "./memory/friction-signals.js";
 import { SqliteArtifactStore, SqliteMemoryService, SqliteTelemetryStore } from "./memory/sqlite-memory.js";
-export type { EmbeddingProvider } from "./contracts/app-capabilities.js";
+export type { EmbeddingProvider, Reranker } from "./contracts/app-capabilities.js";
+export {
+	HttpEmbeddingProvider,
+	HttpReranker,
+	RouterEmbeddingProvider,
+	type HttpEmbeddingProviderOptions,
+	type HttpRerankerOptions,
+} from "./embeddings/provider.js";
+export { HttpRerankBackend, OnnxRerankBackend, RerankService, runRerankSelfTest, type RerankSelfTestResult } from "./embeddings/rerank.js";
+export { EmbeddingRouter, type EmbeddingRouterOptions } from "./embeddings/router.js";
+export { createEmbedHttpServer, type EmbedHttpServerOptions } from "./embeddings/server.js";
+export { loadEmbedServerConfig, type EmbedServerConfig } from "./embeddings/config.js";
+export { buildEmbeddingService, type BuiltEmbeddingService } from "./embeddings/factory.js";
+export { runEmbeddingSelfTest, type SelfTestResult } from "./embeddings/self-test.js";
+export { EmbeddingError, type EmbeddingBackend, type EmbeddingInputType, type SimilarityCalibration } from "./embeddings/types.js";
 export {
 	DEFAULT_SEVERITY_WEIGHTS,
 	type FrictionOptions,
@@ -292,6 +307,8 @@ export interface BootstrapHarnessOptions {
 	 * Ignored when `capabilities.memory` is supplied (configure that service directly).
 	 */
 	readonly embeddingProvider?: EmbeddingProvider;
+	/** Optional cross-encoder reranker for memory search (positive evidence on the top fused candidates). */
+	readonly reranker?: Reranker;
 	readonly domainStore?: DomainStore;
 	readonly wakeScheduler?: WakeScheduler;
 	readonly now?: () => number;
@@ -422,6 +439,7 @@ export async function bootstrapHarness(options: BootstrapHarnessOptions = {}): P
 		new SqliteMemoryService(appDb, {
 			now,
 			...(options.embeddingProvider ? { embeddingProvider: options.embeddingProvider } : {}),
+			...(options.reranker ? { reranker: options.reranker, rerankCandidates: config.rerankCandidates } : {}),
 		});
 	const artifacts =
 		options.capabilities?.artifacts ??

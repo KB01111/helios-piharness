@@ -143,6 +143,32 @@ export interface AppConfig {
 	readonly retentionBudgetDailyDays: number;
 	/** RETENTION_ARTIFACT_DAYS: offloaded tool-output artifacts incl. files; opt-in because transcripts hold recall handles (default 0). */
 	readonly retentionArtifactDays: number;
+	// ── Embeddings (hybrid memory retrieval) ──
+	/**
+	 * EMBEDDINGS_URL: OpenAI-compatible embeddings base URL incl. `/v1` — the Helios embedding server
+	 * (`npm run embed:server`, default `http://127.0.0.1:18765/v1`) or a cloud endpoint. Unset = lexical-only memory.
+	 */
+	readonly embeddingsUrl: string | undefined;
+	/** EMBEDDINGS_API_KEY: bearer token for the endpoint (falls back to OPENAI_API_KEY for api.openai.com). */
+	readonly embeddingsApiKey: string | undefined;
+	/** EMBEDDINGS_MODEL: upstream model; required for non-Helios endpoints (e.g. `text-embedding-3-small`). */
+	readonly embeddingsModel: string | undefined;
+	/** EMBEDDINGS_DIMENSIONS: Matryoshka output size requested from the endpoint (native when unset). */
+	readonly embeddingsDimensions: number | undefined;
+	/** EMBEDDINGS_TIMEOUT_MS: per-request timeout (default 15000). */
+	readonly embeddingsTimeoutMs: number;
+	/** EMBEDDINGS_REQUIRED: abort startup when the endpoint is unreachable instead of running lexical-only (default false). */
+	readonly embeddingsRequired: boolean;
+	/** RERANK_ENABLED: use a cross-encoder reranker for memory search when one is available (default true). */
+	readonly rerankEnabled: boolean;
+	/** RERANK_URL: rerank endpoint (default: EMBEDDINGS_URL when it is a Helios server serving a reranker). */
+	readonly rerankUrl: string | undefined;
+	/** RERANK_API_KEY (falls back to EMBEDDINGS_API_KEY when RERANK_URL is unset). */
+	readonly rerankApiKey: string | undefined;
+	/** RERANK_MODEL: upstream model for cloud rerank APIs (Jina, Cohere, Voyage). */
+	readonly rerankModel: string | undefined;
+	/** RERANK_CANDIDATES: fused candidates reranked per memory search (default 20). */
+	readonly rerankCandidates: number;
 }
 
 export function parseModelSpec(raw: string, fallback: ModelSpec): ModelSpec {
@@ -171,6 +197,15 @@ function parseNonNegativeInt(raw: string | undefined, fallback: number): number 
 	if (raw === undefined || raw.trim() === "") return fallback;
 	const parsed = Number.parseInt(raw, 10);
 	return Number.isFinite(parsed) && parsed >= 0 ? parsed : fallback;
+}
+
+/** Parsed hostname of a URL ("" when absent or invalid); credentials are only ever matched against exact hosts. */
+function hostnameOf(url: string | undefined): string {
+	try {
+		return url ? new URL(url).hostname.toLowerCase() : "";
+	} catch {
+		return "";
+	}
 }
 
 function parseBoolean(raw: string | undefined, fallback: boolean): boolean {
@@ -282,6 +317,20 @@ export function loadConfig(env: Readonly<Record<string, string | undefined>> = p
 		retentionBudgetEventDays: parseNonNegativeInt(env.RETENTION_BUDGET_EVENT_DAYS, DEFAULT_RETENTION_POLICY.budgetEventDays),
 		retentionBudgetDailyDays: parseNonNegativeInt(env.RETENTION_BUDGET_DAILY_DAYS, DEFAULT_RETENTION_POLICY.budgetDailyDays),
 		retentionArtifactDays: parseNonNegativeInt(env.RETENTION_ARTIFACT_DAYS, DEFAULT_RETENTION_POLICY.artifactDays),
+		embeddingsUrl: env.EMBEDDINGS_URL?.trim() || undefined,
+		embeddingsApiKey:
+			env.EMBEDDINGS_API_KEY?.trim() ||
+			(hostnameOf(env.EMBEDDINGS_URL) === "api.openai.com" ? env.OPENAI_API_KEY?.trim() || undefined : undefined),
+		embeddingsModel: env.EMBEDDINGS_MODEL?.trim() || undefined,
+		embeddingsDimensions:
+			env.EMBEDDINGS_DIMENSIONS?.trim() ? parsePositiveInt(env.EMBEDDINGS_DIMENSIONS, 0) || undefined : undefined,
+		embeddingsTimeoutMs: parsePositiveInt(env.EMBEDDINGS_TIMEOUT_MS, 15_000),
+		embeddingsRequired: parseBoolean(env.EMBEDDINGS_REQUIRED, false),
+		rerankEnabled: parseBoolean(env.RERANK_ENABLED, true),
+		rerankUrl: env.RERANK_URL?.trim() || undefined,
+		rerankApiKey: env.RERANK_API_KEY?.trim() || undefined,
+		rerankModel: env.RERANK_MODEL?.trim() || undefined,
+		rerankCandidates: Math.min(128, parsePositiveInt(env.RERANK_CANDIDATES, 20)),
 	};
 }
 

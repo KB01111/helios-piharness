@@ -658,11 +658,28 @@ describe("C. Retrieval quality", () => {
 				await hybrid.applyMemoryMutation(T, U, { op: "UPDATE", targetId: tool.id, content: "Now cooks recipes", confidence: 0.9 });
 				provider.calls.length = 0;
 				expect(await hybrid.search(T, U, "text editor")).toHaveLength(0);
-				expect(provider.calls[0]).toHaveLength(2);
+				// the query and the stale document are embedded in separate calls (asymmetric query/document prompts)
+				expect(provider.calls).toEqual([["text editor"], ["user.tool: Now cooks recipes"]]);
 
 				// forgetting removes the vector
 				expect(await hybrid.forgetMemory(T, U, tool.id)).toBe(true);
 				expect((appDb.db.prepare("SELECT COUNT(*) AS c FROM memory_embeddings WHERE memory_id = ?").get(tool.id) as { c: number }).c).toBe(0);
+			} finally {
+				appDb.close();
+			}
+		});
+
+		it("backfill limit counts stale documents, so repeated calls reach older memories", async () => {
+			const appDb = AppDatabase.open({ dbPath: ":memory:" });
+			try {
+				const memory = new SqliteMemoryService(appDb, { embeddingProvider: fakeProvider() });
+				for (const [key, content] of [["a.one", "Uses neovim"], ["a.two", "Uses postgres"], ["a.three", "Likes jazz"]] as const) {
+					await memory.pinMemory(T, U, { key, content });
+				}
+				expect(await memory.backfillEmbeddings(T, U, { limit: 1 })).toBe(1);
+				expect(await memory.backfillEmbeddings(T, U, { limit: 1 })).toBe(1);
+				expect(await memory.backfillEmbeddings(T, U, { limit: 1 })).toBe(1);
+				expect(await memory.backfillEmbeddings(T, U, { limit: 1 })).toBe(0);
 			} finally {
 				appDb.close();
 			}

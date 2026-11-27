@@ -1,6 +1,8 @@
 import type { Server } from "node:http";
 import { serve, type ServerType } from "@hono/node-server";
 import { loadConfig } from "./config.js";
+import type { EmbeddingProvider, Reranker } from "./contracts/app-capabilities.js";
+import { HttpEmbeddingProvider, HttpReranker } from "./embeddings/provider.js";
 import { createHealthChecker, createReadinessHandler } from "./health.js";
 import { bootstrapHarness, type BootstrappedHarness } from "./index.js";
 import { createLogger, serializeError } from "./logger.js";
@@ -84,7 +86,13 @@ async function main(): Promise<void> {
 		shutdown("uncaughtException", 1);
 	});
 
-	bootstrapping = bootstrapHarness({ config });
+	const embeddingProvider = await connectEmbeddings(config, logger);
+	const reranker = await connectReranker(config, logger, embeddingProvider);
+	bootstrapping = bootstrapHarness({
+		config,
+		...(embeddingProvider ? { embeddingProvider } : {}),
+		...(reranker ? { reranker } : {}),
+	});
 	runtime = await bootstrapping;
 	if (shutdownStarted) {
 		// Shutdown began while bootstrapping; it is closing the runtime, so do not start serving.
@@ -131,6 +139,72 @@ async function main(): Promise<void> {
 			});
 		},
 	);
+}
+
+/** Connects the optional embedding endpoint. Unreachable + not required => lexical-only memory with a warning. */
+async function connectEmbeddings(
+	config: ReturnType<typeof loadConfig>,
+	logger: ReturnType<typeof createLogger>,
+): Promise<EmbeddingProvider | undefined> {
+	if (!config.embeddingsUrl) {
+		if (config.embeddingsRequired) throw new Error("EMBEDDINGS_REQUIRED needs EMBEDDINGS_URL");
+		return undefined;
+	}
+	try {
+		const provider = await HttpEmbeddingProvider.connect({
+			baseUrl: config.embeddingsUrl,
+			...(config.embeddingsApiKey ? { apiKey: config.embeddingsApiKey } : {}),
+			...(config.embeddingsModel ? { model: config.embeddingsModel } : {}),
+			...(config.embeddingsDimensions ? { dimensions: config.embeddingsDimensions } : {}),
+			timeoutMs: config.embeddingsTimeoutMs,
+		});
+		if (config.embeddingsRequired) await provider.embed(["startup probe"], { signal: AbortSignal.timeout(config.embeddingsTimeoutMs) });
+		logger.info("embeddings_connected", {
+			model: provider.model,
+			heliosServer: provider.helios,
+			...(provider.similarity ? { similarity: provider.similarity } : {}),
+		});
+		return provider;
+	} catch (error) {
+		if (config.embeddingsRequired) throw error;
+		logger.warn("embeddings_unavailable", {
+			message: "memory search runs lexical-only until restart",
+			error: serializeError(error),
+		});
+		return undefined;
+	}
+}
+
+/**
+ * Connects the optional reranker: an explicit RERANK_URL (cloud: needs RERANK_MODEL), otherwise the Helios embedding
+ * server's own reranker when it serves one. Failures only log: memory search works without a reranker.
+ */
+async function connectReranker(
+	config: ReturnType<typeof loadConfig>,
+	logger: ReturnType<typeof createLogger>,
+	embeddings: EmbeddingProvider | undefined,
+): Promise<Reranker | undefined> {
+	if (!config.rerankEnabled) return undefined;
+	const explicit = config.rerankUrl;
+	const heliosServer = embeddings instanceof HttpEmbeddingProvider && embeddings.helios;
+	const baseUrl = explicit ?? (heliosServer ? config.embeddingsUrl : undefined);
+	if (!baseUrl) return undefined;
+	try {
+		const apiKey = config.rerankApiKey ?? (explicit ? undefined : config.embeddingsApiKey);
+		const reranker = await HttpReranker.connect({
+			baseUrl,
+			...(apiKey ? { apiKey } : {}),
+			...(config.rerankModel ? { model: config.rerankModel } : {}),
+			timeoutMs: config.embeddingsTimeoutMs,
+		});
+		logger.info("reranker_connected", { model: reranker.model, answerThreshold: reranker.answerThreshold ?? null });
+		return reranker;
+	} catch (error) {
+		// A Helios server running with EMBED_RERANK=off is a normal setup, not a warning.
+		const log = explicit ? logger.warn.bind(logger) : logger.info.bind(logger);
+		log("reranker_unavailable", { error: serializeError(error) });
+		return undefined;
+	}
 }
 
 main().catch((error: unknown) => {

@@ -3,6 +3,7 @@ import fs from "node:fs";
 import path from "node:path";
 import type { StatementSync } from "node:sqlite";
 import type {
+	Reranker,
 	ArtifactMetadata,
 	ArtifactReadResult,
 	ArtifactStore,
@@ -36,6 +37,11 @@ import {
 import {
 	buildFtsQuery,
 	calibrateCosine,
+	cosineStats,
+	DEFAULT_COSINE_CALIBRATION,
+	softCap,
+	vectorSalience,
+	type CosineStats,
 	calibrateLexicalScore,
 	decodeVector,
 	dotProductOffset,
@@ -49,6 +55,9 @@ import {
 	type ResolvedRankingOptions,
 } from "./retrieval.js";
 import { sanitizeMemoryKey, sanitizeMemoryText } from "./sanitize.js";
+
+/** Noisy-OR weight of a confident cross-encoder "this answers the query" signal (positive evidence only). */
+export const RERANK_WEIGHT = 0.5;
 import {
 	detectHistoricalIntent,
 	extractTemporalAnchors,
@@ -216,6 +225,11 @@ export class SqliteMemoryService implements MemoryService {
 	private readonly appDb: AppDatabase;
 	private readonly now: () => number;
 	private readonly embeddingProvider: EmbeddingProvider | undefined;
+	/** Cosine calibration of the active embedding model (provider-declared, else the MiniLM-tuned default). */
+	private readonly cosineCalibration: { readonly floor: number; readonly ceiling: number };
+	private readonly reranker: Reranker | undefined;
+	private readonly rerankCandidates: number;
+	private readonly rerankWeight: number;
 	private readonly ranking: ResolvedRankingOptions;
 	private readonly maxVectorCandidates: number;
 	private readonly maxBackfillPerSearch: number;
@@ -235,14 +249,32 @@ export class SqliteMemoryService implements MemoryService {
 			readonly maxVectorCandidates?: number;
 			/** Max stale/missing vectors embedded lazily per search. Default 64. */
 			readonly maxBackfillPerSearch?: number;
+			/** Optional cross-encoder reranker applied to the top fused candidates (answers vs merely similar). */
+			readonly reranker?: Reranker;
+			/** Candidates reranked per search (default 20; at least `limit`). */
+			readonly rerankCandidates?: number;
+			/** Noisy-OR weight of confident reranker evidence (default `RERANK_WEIGHT`). */
+			readonly rerankWeight?: number;
 		},
 	) {
 		this.appDb = appDb;
 		this.now = options?.now ?? (() => Date.now());
 		this.embeddingProvider = options?.embeddingProvider;
+		this.reranker = options?.reranker;
+		this.rerankCandidates = Math.max(1, Math.min(128, options?.rerankCandidates ?? 20));
+		this.rerankWeight = Math.max(0, Math.min(1, options?.rerankWeight ?? RERANK_WEIGHT));
+		const declared = options?.embeddingProvider?.similarity;
+		this.cosineCalibration =
+			declared && Number.isFinite(declared.floor) && Number.isFinite(declared.ceiling) && declared.ceiling > declared.floor
+				? { floor: declared.floor, ceiling: declared.ceiling }
+				: DEFAULT_COSINE_CALIBRATION;
 		this.ranking = resolveRankingOptions(options?.ranking);
 		this.maxVectorCandidates = Math.max(1, options?.maxVectorCandidates ?? 10_000);
 		this.maxBackfillPerSearch = Math.max(1, options?.maxBackfillPerSearch ?? 64);
+	}
+
+	private calibrate(cosine: number): number {
+		return calibrateCosine(cosine, this.cosineCalibration.floor, this.cosineCalibration.ceiling);
 	}
 
 	private stmt(sql: string): StatementSync {
@@ -426,6 +458,7 @@ export class SqliteMemoryService implements MemoryService {
 			readonly useGraph?: boolean;
 			readonly temporalMode?: "auto" | "off";
 			readonly minScore?: number;
+			readonly rerank?: boolean;
 		},
 	): Promise<MemorySearchResult[]> {
 		const limit = Math.max(1, Math.min(options?.limit ?? 10, 100));
@@ -551,6 +584,13 @@ export class SqliteMemoryService implements MemoryService {
 
 		// ── Lane 2: Cached Packed-Float32 Vector Similarity Search (scans 100% up to maxVectorCandidates) ──
 		let cosines: Map<string, number> | undefined;
+		let cosStats: CosineStats | undefined;
+		/** Calibrated, query-salience-gated vector relevance of one memory (0 without a vector lane). */
+		const vectorRelevance = (id: string): number => {
+			if (!cosines) return 0;
+			const cos = cosines.get(id) ?? 0;
+			return this.calibrate(cos) * vectorSalience(cos, cosStats, this.cosineCalibration.ceiling);
+		};
 		if (this.embeddingProvider && query.trim().length > 0) {
 			try {
 				const vecResult = await this.vectorCandidates(
@@ -562,9 +602,10 @@ export class SqliteMemoryService implements MemoryService {
 					poolSize,
 				);
 				cosines = vecResult.allCosines;
+				cosStats = cosineStats(cosines.values());
 				for (const hit of vecResult.topHits) {
 					// Only add vector-only candidates above background cosine floor
-					if (hit.cosine > 0.24 || candidates.has(hit.row.id)) {
+					if (hit.cosine > this.cosineCalibration.floor || candidates.has(hit.row.id)) {
 						upsertCandidate(hit.row);
 					}
 				}
@@ -641,7 +682,7 @@ export class SqliteMemoryService implements MemoryService {
 				// Rank current candidates by base relevance to pick high-confidence seeds for 2-hop bridging
 				const seedPool: Array<{ memoryId: string; seedScore: number }> = [];
 				for (const cand of candidates.values()) {
-					const vecCal = cosines ? calibrateCosine(cosines.get(cand.row.id) ?? 0) : 0;
+					const vecCal = vectorRelevance(cand.row.id);
 					const baseRel = Math.max(cand.lexical, vecCal, cand.temporal * 0.72);
 					if (baseRel >= seedFloor) {
 						seedPool.push({ memoryId: cand.row.id, seedScore: baseRel });
@@ -655,11 +696,20 @@ export class SqliteMemoryService implements MemoryService {
 					allowedMemoryIds: graphScope.allowedIds,
 				});
 
-				if (ppr.scores.size > 0) {
+				// Graph evidence is only as trustworthy as what seeded it: an explicit query entity is full confidence,
+				// otherwise confidence ramps with the best seed's own relevance. Weak, near-noise seeds (typical of
+				// unanswerable queries) can then no longer lift their associations above genuine hits.
+				const topSeed = seedPool[0]?.seedScore ?? 0;
+				const seedRamp = Math.max(0, Math.min(1, (topSeed - seedFloor) / (0.75 - seedFloor)));
+				const graphConfidence =
+					ppr.matchedQueryEntityCount > 0 ? 1 : seedRamp * seedRamp * (3 - 2 * seedRamp);
+
+				if (ppr.scores.size > 0 && graphConfidence > 0) {
 					const rowByIdStmt = this.stmt(
 						`SELECT * FROM longterm_memories WHERE id = ? AND tenant_id = ? AND user_id = ?`,
 					);
-					for (const [memId, pprScore] of ppr.scores.entries()) {
+					for (const [memId, rawPpr] of ppr.scores.entries()) {
+						const pprScore = rawPpr * graphConfidence;
 						const existing = candidates.get(memId);
 						if (existing) {
 							existing.graph = pprScore;
@@ -683,7 +733,7 @@ export class SqliteMemoryService implements MemoryService {
 			);
 			const seedActive = Array.from(candidates.values())
 				.map((c) => {
-					const vecCal = cosines ? calibrateCosine(cosines.get(c.row.id) ?? 0) : 0;
+					const vecCal = vectorRelevance(c.row.id);
 					return { cand: c, rel: Math.max(c.lexical, vecCal, c.graph * 0.8) };
 				})
 				.filter((x) => x.rel >= 0.25)
@@ -755,6 +805,8 @@ export class SqliteMemoryService implements MemoryService {
 					temporal: cand.temporal,
 					temporalConflict: cand.temporalConflict,
 					historicalMultiplier,
+					cosineCalibration: this.cosineCalibration,
+					...(hasVector ? { vectorSalience: vectorSalience(rawCosine ?? 0, cosStats, this.cosineCalibration.ceiling) } : {}),
 				},
 				memory,
 				nowMs,
@@ -842,7 +894,12 @@ export class SqliteMemoryService implements MemoryService {
 				(a.memory.id < b.memory.id ? -1 : a.memory.id > b.memory.id ? 1 : 0),
 		);
 
-		return scored.slice(0, limit).map((entry) => ({
+		let ranked = scored;
+		if (this.reranker && options?.rerank !== false && scored.length > 0 && query.trim().length > 0) {
+			ranked = await this.applyRerank(query, scored, Math.max(limit, this.rerankCandidates));
+		}
+
+		return ranked.slice(0, limit).map((entry) => ({
 			memory: entry.memory,
 			rank: -entry.score,
 			score: entry.score,
@@ -850,6 +907,54 @@ export class SqliteMemoryService implements MemoryService {
 			source: entry.source,
 			matchSignals: entry.matchSignals,
 		}));
+	}
+
+	/**
+	 * Cross-encoder stage over the top `k` fused candidates, used as POSITIVE evidence only.
+	 *
+	 * Measured behaviour of CPU cross-encoders (bge-reranker-v2-m3, Qwen3-Reranker-0.6B): a high score reliably
+	 * means "this answers the query", but a low score does not mean "this does not": keyword-free paraphrases and
+	 * the second hop of a multi-hop chain score ~0 just like genuine non-answers. So a confident reranker score
+	 * lifts a candidate by noisy-OR (`s + w * r * (1 - s)`, with `r` ramping from the reranker's measured
+	 * near-miss level to 0.5, or to 1 if the threshold is at least 0.5) and a low score never demotes anything. Recall, abstention and chain context therefore
+	 * stay exactly as the fused ranking had them; only the ORDER among plausible candidates improves.
+	 * On reranker failure the fused order is returned unchanged.
+	 */
+	private async applyRerank<T extends { memory: LongTermMemory; score: number; matchSignals: NonNullable<MemorySearchResult["matchSignals"]> }>(
+		query: string,
+		scored: T[],
+		k: number,
+	): Promise<T[]> {
+		const reranker = this.reranker!;
+		const headSize = Math.min(scored.length, k, 128);
+		const head = scored.slice(0, headSize);
+		let probs: readonly number[];
+		try {
+			probs = await reranker.rerank(
+				query,
+				head.map((e) => `${e.memory.key}: ${e.memory.content}`.slice(0, 2_000)),
+			);
+			if (probs.length !== head.length || probs.some((p) => !Number.isFinite(p))) return scored;
+		} catch {
+			return scored;
+		}
+		const threshold = reranker.answerThreshold;
+		const floor = threshold !== undefined && threshold > 0 && threshold < 1 ? threshold : 0.1;
+		const ceiling = floor < 0.5 ? 0.5 : 1;
+		const boosted = head.map((e, i) => {
+			const p = Math.max(0, Math.min(1, probs[i]!));
+			const t = Math.max(0, Math.min(1, (p - floor) / (ceiling - floor)));
+			const r = t * t * (3 - 2 * t);
+			const score = Math.max(e.score, softCap(e.score + this.rerankWeight * r * (1 - e.score)));
+			return { ...e, score, matchSignals: { ...e.matchSignals, rerank: p } };
+		});
+		return [...boosted, ...scored.slice(headSize)].sort(
+			(a, b) =>
+				b.score - a.score ||
+				Number(b.memory.pinned) - Number(a.memory.pinned) ||
+				b.memory.updatedAt - a.memory.updatedAt ||
+				(a.memory.id < b.memory.id ? -1 : a.memory.id > b.memory.id ? 1 : 0),
+		);
 	}
 
 	/**
@@ -939,9 +1044,20 @@ export class SqliteMemoryService implements MemoryService {
 
 		const scope = this.getCachedVectorScope(tenantId, userId, provider.model, includeSuperseded, kind);
 		const toEmbed = scope.stale.slice(0, this.maxBackfillPerSearch);
-		const texts = [query, ...toEmbed.map((entry) => entry.text)];
-		const embedded = await provider.embed(texts);
-		if (embedded.length !== texts.length) throw new Error("EmbeddingProvider returned a mismatched vector count");
+		// Queries and documents are embedded separately so asymmetric models get the right task prompt.
+		const [queryEmbedded, docEmbedded] = await Promise.all([
+			provider.embed([query], { inputType: "query" }),
+			toEmbed.length > 0
+				? provider.embed(
+						toEmbed.map((entry) => entry.text),
+						{ inputType: "document" },
+					)
+				: Promise.resolve([] as ReadonlyArray<ArrayLike<number>>),
+		]);
+		if (queryEmbedded.length !== 1 || docEmbedded.length !== toEmbed.length) {
+			throw new Error("EmbeddingProvider returned a mismatched vector count");
+		}
+		const embedded = [queryEmbedded[0], ...docEmbedded];
 		const queryVector = embedded[0];
 		if (!isUsableVector(queryVector)) throw new Error("EmbeddingProvider returned an unusable (empty/non-finite) query vector");
 		const normQuery = l2Normalize(queryVector);
@@ -974,7 +1090,7 @@ export class SqliteMemoryService implements MemoryService {
 				const cos = dotProductOffset(normQuery, matrix, i * dim);
 				const row = rows[i]!;
 				allCosines.set(row.id, cos);
-				if (cos > 0.12) {
+				if (cos > Math.min(this.cosineCalibration.floor, this.cosineCalibration.floor * 0.5)) {
 					hits.push({ row, cosine: cos });
 				}
 			}
@@ -998,22 +1114,31 @@ export class SqliteMemoryService implements MemoryService {
 		const limit = Math.max(1, Math.min(options?.limit ?? 500, 10_000));
 		const statusClause =
 			options?.includeSuperseded === false ? "m.status = 'active'" : "m.status IN ('active', 'superseded')";
-		const rows = this.stmt(
-			`SELECT m.*, e.content_hash AS e_hash
-			 FROM longterm_memories m
-			 LEFT JOIN memory_embeddings e ON e.memory_id = m.id AND e.model = ?
-			 WHERE m.tenant_id = ? AND m.user_id = ? AND ${statusClause}
-			 ORDER BY m.pinned DESC, m.updated_at DESC, m.id ASC
-			 LIMIT ?`,
-		).all(provider.model, tenantId, userId, limit) as Array<MemoryRow & { e_hash: string | null }>;
-		const todo = rows
-			.map((row) => {
+		// The limit counts stale documents, not scanned rows: page through the ordered memories, skipping the ones that
+		// already have a current vector, so repeated calls reach the older memories instead of re-reading the newest page.
+		const pageSize = 500;
+		const todo: Array<{ row: MemoryRow; text: string; hash: string }> = [];
+		for (let offset = 0; todo.length < limit; offset += pageSize) {
+			const rows = this.stmt(
+				`SELECT m.*, e.content_hash AS e_hash
+				 FROM longterm_memories m
+				 LEFT JOIN memory_embeddings e ON e.memory_id = m.id AND e.model = ?
+				 WHERE m.tenant_id = ? AND m.user_id = ? AND ${statusClause}
+				 ORDER BY m.pinned DESC, m.updated_at DESC, m.id ASC
+				 LIMIT ? OFFSET ?`,
+			).all(provider.model, tenantId, userId, pageSize, offset) as Array<MemoryRow & { e_hash: string | null }>;
+			for (const row of rows) {
 				const text = embeddingText(row.mem_key, row.content);
-				return { row, text, hash: hashText(text) };
-			})
-			.filter((entry) => entry.row.e_hash !== entry.hash);
+				const hash = hashText(text);
+				if (row.e_hash !== hash && todo.length < limit) todo.push({ row, text, hash });
+			}
+			if (rows.length < pageSize) break;
+		}
 		if (todo.length === 0) return 0;
-		const embedded = await provider.embed(todo.map((entry) => entry.text));
+		const embedded = await provider.embed(
+			todo.map((entry) => entry.text),
+			{ inputType: "document" },
+		);
 		if (embedded.length !== todo.length) throw new Error("EmbeddingProvider returned a mismatched vector count");
 		const fresh: Array<{ id: string; hash: string; vec: ArrayLike<number> }> = [];
 		todo.forEach((entry, idx) => {

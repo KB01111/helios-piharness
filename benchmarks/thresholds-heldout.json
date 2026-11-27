@@ -1,0 +1,12 @@
+{
+  "$comment": "Held-out memory benchmark regression gate (report-only dataset: never tune on its individual failures). npm run bench:memory:gate:heldout",
+  "helios (lexical)": {
+    "overallRecallAt1": 0.5,
+    "overallRecallAt5": 0.65,
+    "overallMrr": 0.57,
+    "singleHopR5": 1,
+    "multiHopBothAt5": 1,
+    "zeroStaleTop3": 1,
+    "sessionRecentR5": 1
+  }
+}

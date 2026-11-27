@@ -22,7 +22,13 @@
     "eval": "tsx src/evals/cli.ts",
     "eval:baseline": "tsx src/evals/cli.ts --update-baseline",
     "eval:live": "tsx src/evals/cli.ts --live",
-    "bench:memory": "tsx benchmarks/run-memory-bench.ts"
+    "bench:memory": "tsx benchmarks/run-memory-bench.ts",
+    "embed:server": "tsx src/embeddings/main.ts",
+    "embed:server:npu": "tsx src/embeddings/main.ts --profile npu --npu-autostart",
+    "bench:memory:gate": "tsx benchmarks/run-memory-bench.ts --gate benchmarks/thresholds.json",
+    "embed:server:cloud": "tsx src/embeddings/main.ts --profile openai",
+    "bench:memory:gate:heldout": "tsx benchmarks/run-memory-bench.ts --dataset heldout --gate benchmarks/thresholds-heldout.json",
+    "bench:public": "tsx benchmarks/run-public-bench.ts"
   },
   "dependencies": {
     "@earendil-works/chord": "1.6.0",
@@ -38,5 +44,8 @@
     "tsx": "4.23.15",
     "typescript": "7.0.2",
     "vitest": "5.1.1"
+  },
+  "optionalDependencies": {
+    "@huggingface/transformers": "4.3.2"
   }
 }
