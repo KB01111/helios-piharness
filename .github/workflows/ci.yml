@@ -44,6 +44,9 @@ jobs:
       - name: Memory benchmark gate (lexical)
         run: npm run bench:memory:gate -- --lexical-only
 
+      - name: Held-out memory benchmark gate (lexical)
+        run: npm run bench:memory:gate:heldout -- --lexical-only
+
       - name: Build
         run: npm run build
 
