@@ -18,18 +18,26 @@ Helios-PIHarness provides an optional, engine-agnostic **`FileSearchService`** c
    # Windows PowerShell: irm https://xerj.org/get.ps1 | iex
    xerj --insecure --data-dir ~/xerj-data &
    ```
-2. Index a tenant workspace (matching `XERJ_INDEX_PREFIX=ax` and `XERJ_SCOPE_MODE=tenant`):
+2. Index a tenant workspace using `formatXerjScopePrefix("ax", { tenantId: "acme" })` (collision-resistant, disjoint prefix `<prefix>-t-<tenantSlug>-<hash12>` so `acme` and `acme-west` can never overlap):
    ```sh
-   # For tenantId="acme" (default XERJ_SCOPE_MODE=tenant -> queries `ax-acme-*`)
-   xerj autoindex --prefix ax-acme /path/to/acme-repo
+   # Multi-tenant default (`XERJ_SCOPE_MODE=tenant`):
+   PREFIX=$(node -e "import('./dist/index.js').then(m => console.log(m.formatXerjScopePrefix('ax', { tenantId: 'acme' })))")
+   xerj autoindex --prefix "$PREFIX" /path/to/acme-repo
+   ```
+3. Start Helios pointing at XERJ (retaining default `XERJ_SCOPE_MODE=tenant`):
+   ```sh
+   XERJ_URL=http://127.0.0.1:9200 npm run dev
+   ```
 
-   # Or for single-tenant local dev (`XERJ_SCOPE_MODE=shared` -> queries `ax-*`)
-   xerj autoindex /path/to/repo
-   ```
-3. Start Helios pointing at XERJ:
-   ```sh
-   XERJ_URL=http://127.0.0.1:9200 XERJ_SCOPE_MODE=shared npm run dev
-   ```
+For **single-tenant local development** (one shared repository indexed under default `ax-*`), explicitly opt into `shared` mode:
+```sh
+xerj autoindex /path/to/repo
+XERJ_URL=http://127.0.0.1:9200 XERJ_SCOPE_MODE=shared npm run dev
+```
+
+> **Security notes:**
+> - Sending `XERJ_API_KEY` over plaintext `http://` to a non-loopback host is refused by default; use `https://` for remote XERJ nodes.
+> - Static `FILE_SEARCH_WORKSPACE_ROOT` is only mounted when `XERJ_SCOPE_MODE=shared` so failover never exposes one shared local directory across tenants. For multi-tenant local fallback, pass `new LocalWorkspaceFileSearchService({ resolveWorkspaceRoot })` programmatically via `bootstrapHarness({ fileSearch })`.
 
 ### Sharing Helios's Local Embedding Server with XERJ
 

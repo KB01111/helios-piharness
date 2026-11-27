@@ -2,7 +2,7 @@ import path from "node:path";
 import type { ModelSpec } from "./contracts/harness-port.js";
 import { DEFAULT_RETENTION_INTERVAL_MS, DEFAULT_RETENTION_POLICY } from "./runtime/retention.js";
 import { parseMcpServersEnv, type McpServerConfig } from "./mcp/mcp-client.js";
-import type { XerjScopeMode } from "./search/xerj-client.js";
+import { MAX_NODE_TIMER_MS, type XerjScopeMode } from "./search/xerj-client.js";
 
 export interface AppConfig {
 	readonly port: number;
@@ -356,7 +356,7 @@ export function loadConfig(env: Readonly<Record<string, string | undefined>> = p
 		xerjApiKey: env.XERJ_API_KEY?.trim() || undefined,
 		xerjIndexPrefix: env.XERJ_INDEX_PREFIX?.trim() || "ax",
 		xerjScopeMode: parseXerjScopeMode(env.XERJ_SCOPE_MODE),
-		xerjTimeoutMs: parsePositiveInt(env.XERJ_TIMEOUT_MS, 10_000),
+		xerjTimeoutMs: parseTimerInt(env.XERJ_TIMEOUT_MS, 10_000),
 		xerjRequired: parseBoolean(env.XERJ_REQUIRED, false),
 		fileSearchWorkspaceRoot: env.FILE_SEARCH_WORKSPACE_ROOT?.trim()
 			? path.resolve(env.FILE_SEARCH_WORKSPACE_ROOT.trim())
@@ -371,6 +371,13 @@ function parseXerjScopeMode(raw: string | undefined): XerjScopeMode {
 		return normalized;
 	}
 	return "tenant";
+}
+
+/** Positive integer within Node.js's 32-bit signed `setTimeout` ceiling (out-of-range values fall back to default). */
+function parseTimerInt(raw: string | undefined, fallback: number): number {
+	if (raw === undefined || raw.trim() === "") return fallback;
+	const parsed = Number.parseInt(raw, 10);
+	return Number.isFinite(parsed) && parsed > 0 && parsed <= MAX_NODE_TIMER_MS ? parsed : fallback;
 }
 
 function parseStringList(raw: string | undefined): string[] {

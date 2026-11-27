@@ -12,6 +12,9 @@
 import fs from "node:fs";
 import path from "node:path";
 import {
+	formatFileFindOutput,
+	formatFileSearchOutput,
+	formatFileSymbolDefOutput,
 	LocalWorkspaceFileSearchService,
 	XerjFileSearchService,
 	type FileSearchScope,
@@ -78,11 +81,15 @@ async function evaluateEngine(label: string, service: FileSearchService): Promis
 			mrrSum += 1 / (idx + 1);
 		}
 
-		// Measure compact tool payload bytes vs naive whole-file reading of the returned hits
-		const payloadBytes = Buffer.byteLength(
-			res.hits.map((h) => `${h.path}:${h.line ?? ""}\n${h.snippet ?? ""}`).join("\n"),
-			"utf8",
-		);
+		// Measure the EXACT full rendered tool response UTF-8 bytes (preamble, delimiters, headers, symbols, snippets)
+		// against Helios's 6144-byte artifact-offload threshold.
+		const renderedToolText =
+			c.kind === "find"
+				? formatFileFindOutput(res)
+				: c.kind === "def"
+					? formatFileSymbolDefOutput(c.query, res)
+					: formatFileSearchOutput(c.query, res);
+		const payloadBytes = Buffer.byteLength(renderedToolText, "utf8");
 		totalPassageBytes += payloadBytes;
 		if (payloadBytes <= 6144) underCapCount += 1;
 

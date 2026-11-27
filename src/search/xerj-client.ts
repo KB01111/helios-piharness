@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import type {
 	FileContentSearchOptions,
 	FileFindOptions,
@@ -17,9 +18,11 @@ import { readBoundedText } from "../mcp/mcp-client.js";
 /**
  * Multi-tenant scoping strategy for mapping `FileSearchScope` to a XERJ index pattern.
  *
- * - `"tenant"` (default, safest for multi-tenant deployments): `<prefix>-<tenantSlug>-*`
- *   (or `<prefix>-<tenantSlug>-<workspaceSlug>-*` when `scope.workspaceId` is set).
- * - `"workspace"`: `<prefix>-<workspaceSlug || tenantSlug>-*`.
+ * - `"tenant"` (default, safest for multi-tenant deployments): collision-resistant, unambiguously delimited
+ *   prefix `<prefix>-t-<tenantSlug>-<hash12>-*` (or `<prefix>-tw-<tenantSlug>-<workspaceSlug>-<hash12>-*`
+ *   when `scope.workspaceId` is set), preventing prefix overlap (`acme` vs `acme-west`) and slug collisions
+ *   (`acme_corp` vs `acme-corp`).
+ * - `"workspace"`: `<prefix>-w-<workspaceSlug>-<hash12>-*`.
  * - `"shared"`: `<prefix>-*` (single-tenant local development or shared reference corpora).
  */
 export type XerjScopeMode = "tenant" | "workspace" | "shared";
@@ -31,6 +34,8 @@ export interface XerjFileSearchOptions {
 	readonly apiKey?: string;
 	/** Authorization header scheme when `apiKey` is set (default `"ApiKey"`). */
 	readonly authScheme?: "ApiKey" | "Bearer";
+	/** Allow sending `apiKey` over plaintext `http://` to a non-loopback host (default `false`; requires `https://` remotely). */
+	readonly allowInsecureRemoteHttp?: boolean;
 	/** Autoindex prefix (default `"ax"`, matching `xerj autoindex`). */
 	readonly indexPrefix?: string;
 	/** Tenant/workspace isolation mode (default `"tenant"`). */
@@ -40,7 +45,7 @@ export interface XerjFileSearchOptions {
 	 * Returned patterns are still strictly validated against path/wildcard injection.
 	 */
 	readonly resolveIndexPattern?: (scope: FileSearchScope) => string;
-	/** Per-request HTTP timeout in milliseconds (default `10000`). */
+	/** Per-request HTTP timeout in milliseconds (default `10000`, clamped to Node's 32-bit timer max). */
 	readonly timeoutMs?: number;
 	/** Largest HTTP response body accepted from XERJ in bytes (default 4 MiB). */
 	readonly maxResponseBytes?: number;
@@ -56,12 +61,15 @@ export interface XerjFileSearchOptions {
 }
 
 const DEFAULT_TIMEOUT_MS = 10_000;
+/** Node.js `setTimeout` maximum delay before overflow to 1ms (2^31 - 1). */
+export const MAX_NODE_TIMER_MS = 2_147_483_647;
 const DEFAULT_MAX_RESPONSE_BYTES = 4 * 1024 * 1024;
 const DEFAULT_CACHE_TTL_MS = 10_000;
 const DEFAULT_CB_FAILURES = 3;
 const DEFAULT_CB_COOLDOWN_MS = 15_000;
 const DEFAULT_SNIPPET_CHARS = 420;
 const MAX_LIMIT = 50;
+const MAX_FIND_FETCH_SIZE = 150;
 
 /** Source projection for file finding: intentionally omits `body` so payloads stay tiny. */
 const FILE_FIND_SOURCE_FIELDS = [
@@ -99,27 +107,71 @@ const CONTENT_SEARCH_SOURCE_FIELDS = [
 	"symbol_count",
 ] as const;
 
+const SYMBOL_DEF_SOURCE_FIELDS = [...CONTENT_SEARCH_SOURCE_FIELDS, "defs"] as const;
+
 /** Safe index pattern after resolution: lowercase alnum, `-`, `_`, optional single trailing `-*`. */
 const SAFE_RESOLVED_INDEX_PATTERN = /^[a-z0-9][a-z0-9_-]{0,120}(?:-\*)?$/;
 
+function isLoopbackHost(hostname: string): boolean {
+	const bare = hostname.toLowerCase().replace(/^\[|\]$/g, "");
+	return bare === "localhost" || bare === "::1" || bare === "127.0.0.1" || bare.startsWith("127.");
+}
+
 /**
  * Normalizes a prefix or scope segment using the same rule as `xerj autoindex --prefix`:
- * lowercase `[a-z0-9]` runs joined by `-`, trailing `-*` stripped, max 64 chars.
+ * lowercase `[a-z0-9]` runs joined by `-`, trailing `-*` stripped, bounded to `maxLen` chars.
  */
-export function sanitizeXerjIndexSlug(raw: string, label = "prefix"): string {
+export function sanitizeXerjIndexSlug(raw: string, label = "prefix", maxLen = 64): string {
 	const stripped = raw.trim().replace(/-\*$/, "");
 	const runs = stripped.toLowerCase().match(/[a-z0-9]+/g);
 	if (!runs || runs.length === 0) {
 		throw new Error(`Invalid XERJ ${label} "${raw}": must contain at least one [a-z0-9] character`);
 	}
-	const slug = runs.join("-").slice(0, 64).replace(/-+$/g, "");
+	const slug = runs.join("-").slice(0, maxLen).replace(/-+$/g, "");
 	if (!slug) {
 		throw new Error(`Invalid XERJ ${label} "${raw}": empty after normalization`);
 	}
 	return slug;
 }
 
-export function validateXerjBaseUrl(raw: string): string {
+function shortScopeHash(parts: readonly string[]): string {
+	return createHash("sha256").update(JSON.stringify(parts)).digest("hex").slice(0, 12);
+}
+
+/**
+ * Computes the exact, collision-resistant `xerj autoindex --prefix <prefix>` value for a runtime scope.
+ *
+ * Distinct tenants (`acme` vs `acme-west`, `acme_corp` vs `acme-corp`) always receive disjoint prefixes
+ * bounded by a 12-hex-char SHA-256 tag so wildcard search patterns (`<prefix>-*`) can never overlap.
+ */
+export function formatXerjScopePrefix(
+	basePrefix: string,
+	scope: Pick<FileSearchScope, "tenantId" | "workspaceId">,
+	scopeMode: XerjScopeMode = "tenant",
+): string {
+	const prefix = sanitizeXerjIndexSlug(basePrefix, "indexPrefix", 32);
+	if (scopeMode === "shared") {
+		return prefix;
+	}
+	if (scopeMode === "workspace") {
+		const rawWs = scope.workspaceId?.trim() || scope.tenantId;
+		const wsSlug = sanitizeXerjIndexSlug(rawWs, "workspaceId", 24);
+		return `${prefix}-w-${wsSlug}-${shortScopeHash(["w", rawWs])}`;
+	}
+	const rawTenant = scope.tenantId;
+	const rawWs = scope.workspaceId?.trim();
+	const tenantSlug = sanitizeXerjIndexSlug(rawTenant, "tenantId", rawWs ? 16 : 24);
+	if (rawWs) {
+		const wsSlug = sanitizeXerjIndexSlug(rawWs, "workspaceId", 16);
+		return `${prefix}-tw-${tenantSlug}-${wsSlug}-${shortScopeHash(["tw", rawTenant, rawWs])}`;
+	}
+	return `${prefix}-t-${tenantSlug}-${shortScopeHash(["t", rawTenant])}`;
+}
+
+export function validateXerjBaseUrl(
+	raw: string,
+	options?: { readonly hasCredentials?: boolean; readonly allowInsecureRemoteHttp?: boolean },
+): string {
 	let parsed: URL;
 	try {
 		parsed = new URL(raw.trim());
@@ -132,12 +184,23 @@ export function validateXerjBaseUrl(raw: string): string {
 	if (parsed.username || parsed.password) {
 		throw new Error("XERJ URL must not embed credentials; use apiKey / XERJ_API_KEY instead");
 	}
+	if (
+		options?.hasCredentials &&
+		parsed.protocol === "http:" &&
+		!isLoopbackHost(parsed.hostname) &&
+		!options.allowInsecureRemoteHttp
+	) {
+		throw new Error(
+			`Refusing to send XERJ_API_KEY over plaintext HTTP to non-loopback host "${parsed.hostname}"; use https:// or a loopback address`,
+		);
+	}
 	return parsed.toString().replace(/\/+$/, "");
 }
 
 /**
- * Normalizes a relative `pathPrefix` filter (forward slashes, no leading `./` or `/`) and
- * rejects path-traversal (`..`) or control characters.
+ * Normalizes a relative directory `pathPrefix` filter (forward slashes, no leading `./` or `/`,
+ * guaranteed trailing `/` directory boundary so `"src"` never matches `"src-old/"`) and rejects
+ * path-traversal (`..`) or control characters.
  */
 export function normalizePathPrefix(raw: string | undefined): string | undefined {
 	if (raw === undefined) return undefined;
@@ -148,11 +211,12 @@ export function normalizePathPrefix(raw: string | undefined): string | undefined
 	}
 	const slashNorm = trimmed.replace(/\\+/g, "/").replace(/^(?:\.\/|\/)+/, "").replace(/\/{2,}/g, "/");
 	if (!slashNorm) return undefined;
-	const segments = slashNorm.split("/");
-	if (segments.some((seg) => seg === "..")) {
-		throw new Error('Invalid pathPrefix: parent directory traversal ("..") is not allowed');
+	const segments = slashNorm.split("/").filter((s) => s.length > 0);
+	if (segments.length === 0) return undefined;
+	if (segments.some((seg) => seg === ".." || seg === ".")) {
+		throw new Error('Invalid pathPrefix: relative path segments ("." or "..") are not allowed');
 	}
-	return slashNorm;
+	return `${segments.join("/")}/`;
 }
 
 function normalizeExtension(raw: string | undefined): string | undefined {
@@ -180,6 +244,11 @@ function clampLimit(limit: number | undefined, fallback: number): number {
 	return Math.max(1, Math.min(MAX_LIMIT, Math.trunc(limit)));
 }
 
+function clampSnippetChars(raw: number | undefined): number {
+	if (raw === undefined || !Number.isFinite(raw)) return DEFAULT_SNIPPET_CHARS;
+	return Math.max(1, Math.min(2000, Math.trunc(raw)));
+}
+
 function escapeWildcardValue(raw: string): string {
 	return raw.replace(/\\/g, "\\\\");
 }
@@ -196,18 +265,60 @@ function toWildcardPattern(query: string): string {
 function truncateSnippet(text: string, maxChars: number): string {
 	const trimmed = text.trim();
 	if (trimmed.length <= maxChars) return trimmed;
-	return `${trimmed.slice(0, Math.max(1, maxChars - 1)).trimEnd()}…`;
+	if (maxChars <= 1) return trimmed.slice(0, maxChars);
+	return `${trimmed.slice(0, maxChars - 1).trimEnd()}…`;
+}
+
+function matchesResolvedIndex(indexName: string, resolvedPattern: string): boolean {
+	if (!indexName) return false;
+	if (resolvedPattern.endsWith("*")) {
+		return indexName.startsWith(resolvedPattern.slice(0, -1));
+	}
+	return indexName === resolvedPattern;
+}
+
+function raceWithCallerAbort<T>(promise: Promise<T>, signal?: AbortSignal): Promise<T> {
+	if (!signal) return promise;
+	if (signal.aborted) {
+		return Promise.reject(signal.reason instanceof Error ? signal.reason : new Error("Aborted"));
+	}
+	return new Promise<T>((resolve, reject) => {
+		const onAbort = () => {
+			reject(signal.reason instanceof Error ? signal.reason : new Error("Aborted"));
+		};
+		signal.addEventListener("abort", onAbort, { once: true });
+		promise.then(
+			(value) => {
+				signal.removeEventListener("abort", onAbort);
+				resolve(value);
+			},
+			(err) => {
+				signal.removeEventListener("abort", onAbort);
+				reject(err);
+			},
+		);
+	});
 }
 
 export class XerjRequestError extends Error {
 	readonly status: number | undefined;
 	readonly retryable: boolean;
+	readonly errorType: string | undefined;
 
-	constructor(message: string, options?: { readonly status?: number; readonly retryable?: boolean; readonly cause?: unknown }) {
+	constructor(
+		message: string,
+		options?: {
+			readonly status?: number;
+			readonly retryable?: boolean;
+			readonly errorType?: string;
+			readonly cause?: unknown;
+		},
+	) {
 		super(message, options?.cause ? { cause: options.cause } : undefined);
 		this.name = "XerjRequestError";
 		this.status = options?.status;
 		this.retryable = options?.retryable ?? false;
+		this.errorType = options?.errorType;
 	}
 }
 
@@ -234,6 +345,20 @@ interface EsSearchResponse {
 
 function positiveInt(raw: unknown): number | undefined {
 	return typeof raw === "number" && Number.isFinite(raw) && raw > 0 ? Math.trunc(raw) : undefined;
+}
+
+function parseEsErrorType(bodyText: string): string | undefined {
+	try {
+		const parsed = JSON.parse(bodyText) as {
+			error?: { type?: unknown; root_cause?: Array<{ type?: unknown }> };
+		};
+		if (typeof parsed?.error?.type === "string") return parsed.error.type;
+		const rc = parsed?.error?.root_cause?.[0]?.type;
+		if (typeof rc === "string") return rc;
+	} catch {
+		// Non-JSON error body (e.g. reverse proxy HTML 404/502)
+	}
+	return undefined;
 }
 
 /**
@@ -284,12 +409,10 @@ function extractPassage(hit: EsHit): { text?: string; line?: number } {
 		const line = positiveInt(rec.match_line) ?? positiveInt(rec.start_line) ?? positiveInt(rec.line);
 		if (text) return { text, ...(line !== undefined ? { line } : {}) };
 	}
-	// XERJ per-symbol declaration documents carry a compact declaration signature in `_source.code`.
 	if (typeof src.code === "string" && src.code.trim()) {
 		const line = positiveInt(src.line) ?? positiveInt(src.start_line);
 		return { text: src.code.trim(), ...(line !== undefined ? { line } : {}) };
 	}
-	// Fallback to ES highlight fragments (used on `hybrid` queries where `_passage` is disallowed by XERJ).
 	if (hit.highlight && typeof hit.highlight === "object") {
 		for (const val of Object.values(hit.highlight)) {
 			if (Array.isArray(val) && typeof val[0] === "string" && val[0].trim()) {
@@ -361,6 +484,18 @@ function matchBestSymbolLine(symbols: readonly FileSymbolInfo[], query: string):
 	return undefined;
 }
 
+function hasDefsLineForSymbol(defs: unknown, symbolLower: string): boolean {
+	if (typeof defs !== "string" || !defs.trim()) return false;
+	for (const line of defs.split(/\r?\n/)) {
+		const parts = line.trim().toLowerCase().split(/\s+/);
+		const name = parts[parts.length - 1] ?? "";
+		if (name && (name === symbolLower || name.includes(symbolLower))) {
+			return true;
+		}
+	}
+	return false;
+}
+
 function isMappingOrSemanticError(status: number, bodyText: string): boolean {
 	if (status !== 400 && status !== 422) return false;
 	return /semantic|mapping|field|unsupported|query_shard_exception|parsing_exception|illegal_argument|search_phase_execution/i.test(
@@ -368,24 +503,30 @@ function isMappingOrSemanticError(status: number, bodyText: string): boolean {
 	);
 }
 
-function isIndexNotFoundError(status: number, bodyText: string): boolean {
-	if (status === 404) return true;
-	return status === 400 && /index_not_found/i.test(bodyText);
+/**
+ * Only returns true for a confirmed Elasticsearch/XERJ `index_not_found_exception` — never for a
+ * generic reverse-proxy 404 on an unavailable search route.
+ */
+function isConfirmedIndexNotFoundError(error: XerjRequestError): boolean {
+	if (error.errorType && /index_not_found/i.test(error.errorType)) return true;
+	return (error.status === 404 || error.status === 400) && /index_not_found/i.test(error.message);
 }
 
 /**
  * Zero-dependency XERJ client implementing `FileSearchService` over XERJ's Elasticsearch 8.x REST API.
  *
  * Verified live against XERJ `v1.0.0-rc.105`:
- * - Enforces tenant/workspace index scoping in code so LLM arguments can never cross tenant boundaries.
+ * - Enforces collision-resistant, unambiguously delimited tenant/workspace index scoping in code so
+ *   distinct tenants (`acme` vs `acme-west`, `acme_corp` vs `acme-corp`) can never overlap.
+ * - Refuses to transmit `apiKey` over plaintext `http://` to non-loopback hosts.
  * - Uses projected `_source` (omitting `body`) + `fields: ["_passage"]` for lexical/semantic queries,
  *   and `highlight` + `code` projection for `hybrid` queries (XERJ forbids `_passage` with `hybrid`).
  * - Handles both per-file documents (`defs`, `symbols`, `body`, `ax_locator: "code"|"file"`) and
  *   per-symbol declaration documents (`name`, `kind`, `line`, `start_line`, `code`).
- * - Matches file extensions via `wildcard` on `ax_path` (`*.ext`) because XERJ's `ax_format` holds
- *   the content family (`"code"`, `"json"`, `"txt-prose"`), not the filename extension.
- * - Refuses HTTP redirects, bounds response bytes, never logs credentials, and protects callers with a
- *   circuit breaker + single-flight health probe.
+ * - Matches file extensions via `wildcard` on `ax_path` (`*.ext`) and enforces directory boundaries
+ *   on `pathPrefix`.
+ * - Refuses HTTP redirects, bounds response bytes, never logs credentials, and protects callers with an
+ *   epoch-guarded circuit breaker + caller-isolated single-flight health probe.
  */
 export class XerjFileSearchService implements FileSearchService {
 	readonly engine = "xerj";
@@ -404,18 +545,23 @@ export class XerjFileSearchService implements FileSearchService {
 
 	private consecutiveFailures = 0;
 	private circuitOpenUntil = 0;
+	private breakerEpoch = 0;
 	private healthCache?: { readonly at: number; readonly result: FileSearchHealth };
 	private inFlightHealth?: Promise<FileSearchHealth>;
 	private readonly indexMapCache = new Map<string, { readonly at: number; readonly result: FileIndexMapResult }>();
 
 	constructor(options: XerjFileSearchOptions) {
-		this.baseUrl = validateXerjBaseUrl(options.baseUrl);
+		this.baseUrl = validateXerjBaseUrl(options.baseUrl, {
+			hasCredentials: Boolean(options.apiKey),
+			allowInsecureRemoteHttp: options.allowInsecureRemoteHttp,
+		});
 		const scheme = options.authScheme ?? "ApiKey";
 		this.headers = options.apiKey ? { authorization: `${scheme} ${options.apiKey}` } : {};
-		this.indexPrefix = sanitizeXerjIndexSlug(options.indexPrefix ?? "ax", "indexPrefix");
+		this.indexPrefix = sanitizeXerjIndexSlug(options.indexPrefix ?? "ax", "indexPrefix", 32);
 		this.scopeMode = options.scopeMode ?? "tenant";
 		this.customIndexResolver = options.resolveIndexPattern;
-		this.timeoutMs = Math.max(500, options.timeoutMs ?? DEFAULT_TIMEOUT_MS);
+		const rawTimeout = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+		this.timeoutMs = Math.max(500, Math.min(MAX_NODE_TIMER_MS, Math.trunc(rawTimeout)));
 		this.maxResponseBytes = Math.max(4096, options.maxResponseBytes ?? DEFAULT_MAX_RESPONSE_BYTES);
 		this.cacheTtlMs = Math.max(0, options.cacheTtlMs ?? DEFAULT_CACHE_TTL_MS);
 		this.cbFailureThreshold = Math.max(1, options.circuitBreaker?.failureThreshold ?? DEFAULT_CB_FAILURES);
@@ -429,26 +575,14 @@ export class XerjFileSearchService implements FileSearchService {
 		let pattern: string;
 		if (this.customIndexResolver) {
 			pattern = this.customIndexResolver(scope).trim().toLowerCase();
-		} else if (this.scopeMode === "shared") {
-			pattern = `${this.indexPrefix}-*`;
-		} else if (this.scopeMode === "workspace") {
-			const ws = sanitizeXerjIndexSlug(scope.workspaceId?.trim() || scope.tenantId, "workspaceId");
-			pattern = `${this.indexPrefix}-${ws}-*`;
 		} else {
-			const tenantSlug = sanitizeXerjIndexSlug(scope.tenantId, "tenantId");
-			const wsSlug = scope.workspaceId?.trim() ? sanitizeXerjIndexSlug(scope.workspaceId, "workspaceId") : undefined;
-			pattern = wsSlug ? `${this.indexPrefix}-${tenantSlug}-${wsSlug}-*` : `${this.indexPrefix}-${tenantSlug}-*`;
+			pattern = `${formatXerjScopePrefix(this.indexPrefix, scope, this.scopeMode)}-*`;
 		}
 
 		if (!SAFE_RESOLVED_INDEX_PATTERN.test(pattern)) {
 			throw new Error(`Unsafe resolved XERJ index pattern "${pattern}"`);
 		}
 		return pattern;
-	}
-
-	/** Returns the literal index prefix before `*` (e.g. `ax-tenant-a-` for `ax-tenant-a-*`). */
-	private resolveLiteralPrefix(indexPattern: string): string {
-		return indexPattern.endsWith("*") ? indexPattern.slice(0, -1) : indexPattern;
 	}
 
 	private buildFilters(options: {
@@ -465,8 +599,6 @@ export class XerjFileSearchService implements FileSearchService {
 			filters.push({ prefix: { ax_path: pathPrefix } });
 		}
 		if (extension) {
-			// XERJ's `ax_format` stores the content family ("code", "json", "txt-prose"), not the file extension.
-			// Match extensions reliably against the keyword `ax_path` field instead.
 			filters.push({ wildcard: { ax_path: { value: `*.${extension}`, case_insensitive: true } } });
 		}
 		if (language) {
@@ -478,12 +610,12 @@ export class XerjFileSearchService implements FileSearchService {
 	async findFiles(scope: FileSearchScope, options: FileFindOptions): Promise<FileSearchResult> {
 		const indexPattern = this.resolveIndex(scope);
 		const limit = clampLimit(options.limit, 15);
-		// Over-fetch slightly because XERJ autoindex can store both `ax_locator:"file"` and `"code"` records per file.
-		const fetchSize = Math.min(MAX_LIMIT, Math.max(limit * 3, 20));
+		// Over-fetch before path deduplication so `limit: 50` still returns up to 50 unique files
+		// even when XERJ stores both `ax_locator:"file"` and `"code"` records per file.
+		const fetchSize = Math.min(MAX_FIND_FETCH_SIZE, Math.max(limit * 3, 20));
 		const filters = this.buildFilters(options);
 		const queryText = options.query?.trim() ?? "";
 
-		// Exclude per-symbol declaration docs (`kind` exists) so file-finding returns file records only.
 		const mustNot: Array<Record<string, unknown>> = [{ exists: { field: "kind" } }];
 
 		let queryClause: Record<string, unknown>;
@@ -528,7 +660,6 @@ export class XerjFileSearchService implements FileSearchService {
 			};
 		}
 
-		// Deduplicate by path and merge metadata (e.g. `language` / `symbolCount` from `ax_locator:"code"` record).
 		const byPath = new Map<string, FileMatchHit>();
 		const order: string[] = [];
 		for (const rawHit of outcome.response.hits?.hits ?? []) {
@@ -593,13 +724,10 @@ export class XerjFileSearchService implements FileSearchService {
 
 		const indexPattern = this.resolveIndex(scope);
 		const limit = clampLimit(options.limit, 8);
-		const maxSnippetChars = Math.max(80, Math.min(2000, options.maxSnippetChars ?? DEFAULT_SNIPPET_CHARS));
+		const maxSnippetChars = clampSnippetChars(options.maxSnippetChars);
 		const requestedMode: FileSearchMode = options.mode ?? "lexical";
 		const filters = this.buildFilters(options);
 
-		// XERJ definition-first code query:
-		// multi_match over [body, defs, code, title] + match_phrase on defs (boost 4, NOT defs^N)
-		// + exact/wildcard symbol name boost for per-symbol docs.
 		const lexicalQuery: Record<string, unknown> = {
 			bool: {
 				should: [
@@ -632,8 +760,6 @@ export class XerjFileSearchService implements FileSearchService {
 			}
 
 			if (mode === "hybrid") {
-				// XERJ forbids `fields: ["_passage"]` on hybrid queries ("no single unambiguous winning passage").
-				// Use `highlight` + projected `code` instead so hybrid queries succeed without transferring `body`.
 				const semClause: Record<string, unknown> = {
 					semantic: {
 						field: "body",
@@ -672,7 +798,6 @@ export class XerjFileSearchService implements FileSearchService {
 		try {
 			outcome = await this.searchIndex(indexPattern, buildBody(requestedMode), options.signal);
 		} catch (error) {
-			// If semantic/hybrid fails because `body` is not mapped as `semantic_text`, degrade cleanly to lexical.
 			if (
 				requestedMode !== "lexical" &&
 				error instanceof XerjRequestError &&
@@ -755,8 +880,6 @@ export class XerjFileSearchService implements FileSearchService {
 		const filters = this.buildFilters({ pathPrefix: options.pathPrefix, language: options.language });
 		const kindFilter = options.kind?.trim().toLowerCase();
 
-		// Matches both XERJ per-symbol declaration documents (`name`, `kind`, `line`, `code`)
-		// and per-file symbol index documents (`defs`, `symbols.name`).
 		const body = {
 			query: {
 				bool: {
@@ -773,7 +896,7 @@ export class XerjFileSearchService implements FileSearchService {
 				},
 			},
 			size: fetchSize,
-			_source: [...CONTENT_SEARCH_SOURCE_FIELDS],
+			_source: [...SYMBOL_DEF_SOURCE_FIELDS],
 			fields: ["_passage"],
 		};
 
@@ -789,8 +912,16 @@ export class XerjFileSearchService implements FileSearchService {
 		}
 
 		const symbolLower = symbol.toLowerCase();
-		const candidates: Array<{ readonly hit: FileMatchHit; readonly rankKey: number }> = [];
-		const seenLoc = new Set<string>();
+		// Keep the highest-ranked candidate per location key so a direct declaration doc always
+		// wins over an earlier per-file record for the same `(path, line, symbol)`.
+		const bestByLoc = new Map<string, { readonly hit: FileMatchHit; readonly rankKey: number }>();
+
+		const upsertCandidate = (locKey: string, candidate: { readonly hit: FileMatchHit; readonly rankKey: number }): void => {
+			const existing = bestByLoc.get(locKey);
+			if (!existing || candidate.rankKey > existing.rankKey) {
+				bestByLoc.set(locKey, candidate);
+			}
+		};
 
 		for (const rawHit of outcome.response.hits?.hits ?? []) {
 			const src = rawHit._source ?? {};
@@ -813,9 +944,6 @@ export class XerjFileSearchService implements FileSearchService {
 			if (matchedSymbols.length > 0) {
 				for (const sym of matchedSymbols) {
 					const locKey = `${filePath}:${sym.line ?? 0}:${sym.name}`;
-					if (seenLoc.has(locKey)) continue;
-					seenLoc.add(locKey);
-
 					const nameLower = sym.name.toLowerCase();
 					const matchBonus =
 						sym.name === symbol
@@ -826,7 +954,7 @@ export class XerjFileSearchService implements FileSearchService {
 									? 40
 									: 15;
 					const directBonus = isDirectSymbolDoc ? 20 : 0;
-					candidates.push({
+					upsertCandidate(locKey, {
 						rankKey: matchBonus + directBonus + baseScore,
 						hit: {
 							path: filePath,
@@ -841,13 +969,12 @@ export class XerjFileSearchService implements FileSearchService {
 						},
 					});
 				}
-			} else if (!kindFilter) {
+			} else if (!kindFilter && hasDefsLineForSymbol(src.defs, symbolLower)) {
+				// Only include a fallback file hit when `defs` confirms a definition exists (never plain body mentions).
 				const line =
 					positiveInt(rawHit.match_line) ?? positiveInt(src.line) ?? positiveInt(src.start_line) ?? passage.line;
-				const locKey = `${filePath}:${line ?? 0}:_file`;
-				if (seenLoc.has(locKey)) continue;
-				seenLoc.add(locKey);
-				candidates.push({
+				const locKey = `${filePath}:${line ?? 0}:_defs`;
+				upsertCandidate(locKey, {
 					rankKey: baseScore,
 					hit: {
 						path: filePath,
@@ -863,7 +990,9 @@ export class XerjFileSearchService implements FileSearchService {
 			}
 		}
 
-		candidates.sort((a, b) => b.rankKey - a.rankKey || a.hit.path.localeCompare(b.hit.path));
+		const candidates = Array.from(bestByLoc.values()).sort(
+			(a, b) => b.rankKey - a.rankKey || a.hit.path.localeCompare(b.hit.path),
+		);
 		const hits = candidates.slice(0, limit).map((c) => c.hit);
 		const notes = extractHints(outcome.response);
 
@@ -882,7 +1011,6 @@ export class XerjFileSearchService implements FileSearchService {
 		options?: { readonly limit?: number; readonly signal?: AbortSignal },
 	): Promise<FileIndexMapResult> {
 		const indexPattern = this.resolveIndex(scope);
-		const literalPrefix = this.resolveLiteralPrefix(indexPattern);
 		const limit = clampLimit(options?.limit, 25);
 		const cacheKey = `${indexPattern}:${limit}`;
 
@@ -896,8 +1024,6 @@ export class XerjFileSearchService implements FileSearchService {
 		const datasets: FileIndexDatasetSummary[] = [];
 		const notes: string[] = [];
 
-		// 1. Query XERJ's `autoindex-catalog` for dataset rows (`doc_kind: "dataset"` in rc.105+,
-		//    or legacy catalog rows carrying `index`/`index_name`), skipping per-file catalog entries.
 		const catalogOutcome = await this.searchIndex(
 			"autoindex-catalog",
 			{
@@ -929,12 +1055,7 @@ export class XerjFileSearchService implements FileSearchService {
 				],
 			},
 			options?.signal,
-		).catch((err) => {
-			if (err instanceof XerjRequestError && err.status === 404) {
-				return { missingIndex: true as const, response: {} as EsSearchResponse };
-			}
-			throw err;
-		});
+		);
 
 		if (!catalogOutcome.missingIndex) {
 			const seenIndices = new Set<string>();
@@ -945,7 +1066,7 @@ export class XerjFileSearchService implements FileSearchService {
 					(typeof src.index_name === "string" && src.index_name) ||
 					(typeof src.index === "string" && src.index) ||
 					"";
-				if (!idxName || !idxName.startsWith(literalPrefix) || seenIndices.has(idxName)) continue;
+				if (!matchesResolvedIndex(idxName, indexPattern) || seenIndices.has(idxName)) continue;
 				seenIndices.add(idxName);
 
 				const docCount =
@@ -983,9 +1104,9 @@ export class XerjFileSearchService implements FileSearchService {
 			}
 		}
 
-		// 2. Fall back to `/_cat/indices/<pattern>?format=json` when catalog is absent or empty for this scope.
 		if (datasets.length === 0) {
 			const encoded = encodeURIComponent(indexPattern);
+			const admittedEpoch = this.breakerEpoch;
 			try {
 				const rows = (await this.requestJson<Array<Record<string, unknown>>>(
 					"GET",
@@ -996,7 +1117,7 @@ export class XerjFileSearchService implements FileSearchService {
 				if (Array.isArray(rows)) {
 					for (const row of rows) {
 						const idx = typeof row.index === "string" ? row.index : "";
-						if (!idx || !idx.startsWith(literalPrefix)) continue;
+						if (!matchesResolvedIndex(idx, indexPattern)) continue;
 						const countRaw = row["docs.count"];
 						const docCount =
 							typeof countRaw === "number"
@@ -1012,7 +1133,8 @@ export class XerjFileSearchService implements FileSearchService {
 					}
 				}
 			} catch (err) {
-				if (err instanceof XerjRequestError && err.status === 404) {
+				if (err instanceof XerjRequestError && isConfirmedIndexNotFoundError(err)) {
+					this.recordSuccess(admittedEpoch);
 					notes.push(`No indices found matching "${indexPattern}".`);
 				} else {
 					throw err;
@@ -1036,45 +1158,76 @@ export class XerjFileSearchService implements FileSearchService {
 		return result;
 	}
 
+	/**
+	 * Single-flight health probe (`GET /`). The underlying HTTP probe runs under the client's own
+	 * timeout so one caller aborting its wait never fails concurrent callers awaiting the same probe.
+	 */
 	async healthCheck(signal?: AbortSignal): Promise<FileSearchHealth> {
+		if (signal?.aborted) {
+			return { ok: false, engine: this.engine, latencyMs: 0, error: "Health check aborted" };
+		}
 		if (this.cacheTtlMs > 0 && this.healthCache && this.now() - this.healthCache.at < this.cacheTtlMs) {
 			return this.healthCache.result;
 		}
-		if (this.inFlightHealth) return this.inFlightHealth;
+		if (!this.inFlightHealth) {
+			const run = (async (): Promise<FileSearchHealth> => {
+				const started = this.now();
+				try {
+					const banner = await this.requestJson<{ readonly version?: { readonly number?: string } }>(
+						"GET",
+						"/",
+						undefined,
+						undefined,
+						{ bypassCircuitBreaker: true },
+					);
+					const result: FileSearchHealth = {
+						ok: true,
+						engine: this.engine,
+						...(typeof banner?.version?.number === "string" ? { version: banner.version.number } : {}),
+						latencyMs: Math.max(0, this.now() - started),
+					};
+					this.healthCache = { at: this.now(), result };
+					return result;
+				} catch (error) {
+					return {
+						ok: false,
+						engine: this.engine,
+						latencyMs: Math.max(0, this.now() - started),
+						error: error instanceof Error ? error.message : String(error),
+					};
+				}
+			})();
+			this.inFlightHealth = run;
+			run.finally(() => {
+				if (this.inFlightHealth === run) {
+					this.inFlightHealth = undefined;
+				}
+			});
+		}
 
-		const run = (async (): Promise<FileSearchHealth> => {
-			const started = this.now();
-			try {
-				const banner = await this.requestJson<{ readonly version?: { readonly number?: string } }>(
-					"GET",
-					"/",
-					undefined,
-					signal,
-					{ bypassCircuitBreaker: true },
-				);
-				const result: FileSearchHealth = {
-					ok: true,
-					engine: this.engine,
-					...(typeof banner?.version?.number === "string" ? { version: banner.version.number } : {}),
-					latencyMs: Math.max(0, this.now() - started),
-				};
-				this.healthCache = { at: this.now(), result };
-				return result;
-			} catch (error) {
-				const result: FileSearchHealth = {
-					ok: false,
-					engine: this.engine,
-					latencyMs: Math.max(0, this.now() - started),
-					error: error instanceof Error ? error.message : String(error),
-				};
-				return result;
-			} finally {
-				this.inFlightHealth = undefined;
-			}
-		})();
+		try {
+			return await raceWithCallerAbort(this.inFlightHealth, signal);
+		} catch (error) {
+			return {
+				ok: false,
+				engine: this.engine,
+				latencyMs: 0,
+				error: error instanceof Error ? error.message : String(error),
+			};
+		}
+	}
 
-		this.inFlightHealth = run;
-		return run;
+	/**
+	 * Verifies that the search route itself (not only `GET /`) is reachable and authorized.
+	 * Used at startup when `XERJ_REQUIRED=true`. A confirmed `index_not_found_exception` counts as
+	 * healthy (the search engine answered validly for an empty prefix); proxy 404/401/403/5xx fail.
+	 */
+	async verifySearchCapability(signal?: AbortSignal): Promise<void> {
+		const probePattern = `${this.indexPrefix}-*`;
+		const outcome = await this.searchIndex(probePattern, { query: { match_all: {} }, size: 0 }, signal);
+		if (!outcome.missingIndex && (!outcome.response || typeof outcome.response !== "object")) {
+			throw new XerjRequestError("XERJ search probe returned an unexpected payload", { retryable: true });
+		}
 	}
 
 	private async searchIndex(
@@ -1083,11 +1236,14 @@ export class XerjFileSearchService implements FileSearchService {
 		signal?: AbortSignal,
 	): Promise<SearchOutcome> {
 		const encoded = encodeURIComponent(indexPattern);
+		const admittedEpoch = this.breakerEpoch;
 		try {
 			const response = await this.requestJson<EsSearchResponse>("POST", `/${encoded}/_search`, body, signal);
 			return { missingIndex: false, response };
 		} catch (error) {
-			if (error instanceof XerjRequestError && error.status !== undefined && isIndexNotFoundError(error.status, error.message)) {
+			if (error instanceof XerjRequestError && isConfirmedIndexNotFoundError(error)) {
+				// Confirmed ES/XERJ index_not_found_exception proves the backend is reachable and healthy.
+				this.recordSuccess(admittedEpoch);
 				return { missingIndex: true, response: {} };
 			}
 			throw error;
@@ -1101,11 +1257,13 @@ export class XerjFileSearchService implements FileSearchService {
 		signal?: AbortSignal,
 		opts?: { readonly bypassCircuitBreaker?: boolean },
 	): Promise<T> {
-		if (!opts?.bypassCircuitBreaker && this.circuitOpenUntil > this.now()) {
+		const nowMs = this.now();
+		if (!opts?.bypassCircuitBreaker && this.circuitOpenUntil > nowMs) {
 			throw new XerjRequestError("XERJ circuit breaker is open; search backend temporarily unavailable", {
 				retryable: true,
 			});
 		}
+		const admittedEpoch = this.breakerEpoch;
 
 		const controller = new AbortController();
 		const timer = setTimeout(
@@ -1133,42 +1291,58 @@ export class XerjFileSearchService implements FileSearchService {
 				},
 				...(body !== undefined ? { body: JSON.stringify(body) } : {}),
 				signal: controller.signal,
-				// Refuse redirects so credentialed requests can never bounce to another origin.
 				redirect: "error",
 			});
 
 			const text = await readBoundedText(res, this.maxResponseBytes);
 			if (!res.ok) {
+				const errorType = parseEsErrorType(text);
 				if (res.status >= 500 || res.status === 429) {
 					this.recordFailure();
 					throw new XerjRequestError(`XERJ HTTP ${res.status}: ${text.slice(0, 240) || res.statusText}`, {
 						status: res.status,
 						retryable: true,
+						...(errorType ? { errorType } : {}),
 					});
 				}
 				if (res.status === 401 || res.status === 403) {
 					throw new XerjRequestError(`XERJ authentication/authorization rejected (HTTP ${res.status})`, {
 						status: res.status,
 						retryable: false,
+						...(errorType ? { errorType } : {}),
 					});
+				}
+				// A 404 without an ES `index_not_found` error type indicates a missing route / proxy outage,
+				// so mark it retryable (triggering fallback) and record a failure.
+				const isMissingRoute404 = res.status === 404 && (!errorType || !/index_not_found/i.test(errorType)) && !/index_not_found/i.test(text);
+				if (isMissingRoute404) {
+					this.recordFailure();
 				}
 				throw new XerjRequestError(`XERJ HTTP ${res.status}: ${text.slice(0, 240) || res.statusText}`, {
 					status: res.status,
-					retryable: false,
+					retryable: isMissingRoute404,
+					...(errorType ? { errorType } : {}),
 				});
 			}
 
-			this.recordSuccess();
-			if (!text.trim()) return {} as T;
-			try {
-				return JSON.parse(text) as T;
-			} catch (error) {
-				throw new XerjRequestError("XERJ returned invalid JSON", { retryable: false, cause: error });
+			let parsed: T;
+			if (!text.trim()) {
+				parsed = {} as T;
+			} else {
+				try {
+					parsed = JSON.parse(text) as T;
+				} catch (error) {
+					this.recordFailure();
+					throw new XerjRequestError("XERJ returned invalid JSON", { retryable: true, cause: error });
+				}
 			}
+
+			this.recordSuccess(admittedEpoch);
+			return parsed;
 		} catch (error) {
 			if (signal?.aborted) throw error;
 			if (error instanceof XerjRequestError) {
-				if (error.retryable && error.status === undefined) {
+				if (error.retryable && error.status === undefined && !error.message.includes("invalid JSON")) {
 					this.recordFailure();
 				}
 				throw error;
@@ -1184,12 +1358,17 @@ export class XerjFileSearchService implements FileSearchService {
 		}
 	}
 
-	private recordSuccess(): void {
+	private recordSuccess(admittedEpoch: number): void {
+		// Never let an older in-flight request admitted before the breaker opened clear an active cooldown.
+		if (admittedEpoch !== this.breakerEpoch && this.circuitOpenUntil > this.now()) {
+			return;
+		}
 		this.consecutiveFailures = 0;
 		this.circuitOpenUntil = 0;
 	}
 
 	private recordFailure(): void {
+		this.breakerEpoch += 1;
 		this.consecutiveFailures += 1;
 		if (this.consecutiveFailures >= this.cbFailureThreshold) {
 			this.circuitOpenUntil = this.now() + this.cbCooldownMs;

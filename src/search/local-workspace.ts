@@ -1,4 +1,5 @@
 import fs from "node:fs";
+import fsp from "node:fs/promises";
 import path from "node:path";
 import type {
 	FileContentSearchOptions,
@@ -15,13 +16,18 @@ import type {
 import { normalizePathPrefix } from "./xerj-client.js";
 
 export interface LocalWorkspaceFileSearchOptions {
-	/** Root directory for single-workspace deployments. */
+	/**
+	 * Root directory for single-workspace deployments. For multi-tenant servers, prefer
+	 * `resolveWorkspaceRoot` so each tenant/workspace resolves to its own directory.
+	 */
 	readonly workspaceRoot?: string;
 	/** Optional multi-tenant mapper returning an explicit allowed root directory per scope (or undefined to deny). */
 	readonly resolveWorkspaceRoot?: (scope: FileSearchScope) => string | undefined;
-	/** Max files walked per query (default 4000). */
+	/** Max matched files collected per query (default 4000). */
 	readonly maxFiles?: number;
-	/** Max bytes read per text file (default 512 KiB). */
+	/** Max total filesystem entries visited per walk regardless of filter matches (default `max(maxFiles * 4, 16000)`). */
+	readonly maxVisitedEntries?: number;
+	/** Max bytes read per text file (default 512 KiB). Enforced during the read itself. */
 	readonly maxFileBytes?: number;
 	/** Extra directory names to skip alongside defaults. */
 	readonly ignoreDirs?: readonly string[];
@@ -89,9 +95,55 @@ const SYMBOL_PATTERNS: ReadonlyArray<{ readonly kind: string; readonly regex: Re
 	{ kind: "function", regex: /^\s*func\s+(?:\([^)]*\)\s*)?([A-Za-z_][A-Za-z0-9_]*)\s*\(/ },
 ];
 
-function globToRegex(pattern: string): RegExp {
-	const escaped = pattern.replace(/[.+^${}()|[\]\\]/g, "\\$&").replace(/\*/g, ".*").replace(/\?/g, ".");
-	return new RegExp(escaped, "i");
+const DEFAULT_SNIPPET_CHARS = 420;
+const MAX_GLOB_PATTERN_CHARS = 256;
+const YIELD_BATCH_SIZE = 64;
+const O_NOFOLLOW = typeof fs.constants.O_NOFOLLOW === "number" ? fs.constants.O_NOFOLLOW : 0;
+
+function yieldToEventLoop(): Promise<void> {
+	return new Promise((resolve) => setImmediate(resolve));
+}
+
+function clampSnippetChars(raw: number | undefined): number {
+	if (raw === undefined || !Number.isFinite(raw)) return DEFAULT_SNIPPET_CHARS;
+	return Math.max(1, Math.min(2000, Math.trunc(raw)));
+}
+
+/**
+ * Linear-time, ReDoS-free case-insensitive wildcard matcher supporting `*` and `?`.
+ * Matches `pattern` anywhere inside `text` (wrapping with `*...*` when not already anchored with `*`).
+ */
+export function matchGlob(pattern: string, text: string): boolean {
+	const bounded = pattern.slice(0, MAX_GLOB_PATTERN_CHARS).toLowerCase();
+	const target = text.toLowerCase();
+	if (!bounded) return true;
+	const p = `*${bounded.replace(/\*+/g, "*")}*`;
+
+	let pi = 0;
+	let ti = 0;
+	let starIdx = -1;
+	let matchIdx = 0;
+
+	while (ti < target.length) {
+		if (pi < p.length && (p[pi] === "?" || p[pi] === target[ti])) {
+			pi += 1;
+			ti += 1;
+		} else if (pi < p.length && p[pi] === "*") {
+			starIdx = pi;
+			matchIdx = ti;
+			pi += 1;
+		} else if (starIdx !== -1) {
+			pi = starIdx + 1;
+			matchIdx += 1;
+			ti = matchIdx;
+		} else {
+			return false;
+		}
+	}
+	while (pi < p.length && p[pi] === "*") {
+		pi += 1;
+	}
+	return pi === p.length;
 }
 
 function detectFormatAndLanguage(relPath: string): { format: string; language?: string } {
@@ -118,35 +170,60 @@ function extractSymbolsFromText(text: string): FileSymbolInfo[] {
 	return out;
 }
 
-function readSafeTextFile(absPath: string, rootReal: string, maxFileBytes: number): string | undefined {
+function isInsideRoot(realPath: string, rootReal: string): boolean {
+	return realPath === rootReal || realPath.startsWith(rootReal + path.sep);
+}
+
+/**
+ * Safely reads a regular text file inside `rootReal` without following symlinks and enforcing
+ * `maxFileBytes` *during* the read (reading at most `maxFileBytes + 1` bytes so a growing file
+ * can never exhaust memory).
+ */
+async function readSafeTextFile(absPath: string, rootReal: string, maxFileBytes: number): Promise<string | undefined> {
 	let real: string;
 	try {
-		real = fs.realpathSync(absPath);
+		const lst = await fsp.lstat(absPath);
+		if (lst.isSymbolicLink() || !lst.isFile() || lst.size > maxFileBytes) return undefined;
+		real = await fsp.realpath(absPath);
 	} catch {
 		return undefined;
 	}
-	if (real !== rootReal && !real.startsWith(rootReal + path.sep)) {
+	if (!isInsideRoot(real, rootReal)) {
 		return undefined;
 	}
-	let stat: fs.Stats;
+
+	let handle: fsp.FileHandle | undefined;
 	try {
-		stat = fs.statSync(real);
+		handle = await fsp.open(real, fs.constants.O_RDONLY | O_NOFOLLOW);
+		const st = await handle.stat();
+		if (!st.isFile() || st.size > maxFileBytes) return undefined;
+
+		const readCap = maxFileBytes + 1;
+		const buf = Buffer.allocUnsafe(Math.min(readCap, Math.max(4096, st.size + 1)));
+		let total = 0;
+		const chunks: Buffer[] = [];
+		for (;;) {
+			const remaining = readCap - total;
+			if (remaining <= 0) break;
+			const target = total === 0 && remaining <= buf.length ? buf : Buffer.allocUnsafe(Math.min(65_536, remaining));
+			const { bytesRead } = await handle.read(target, 0, Math.min(target.length, remaining), total);
+			if (bytesRead === 0) break;
+			total += bytesRead;
+			if (total > maxFileBytes) return undefined;
+			chunks.push(target.subarray(0, bytesRead));
+		}
+
+		const full = chunks.length === 1 ? chunks[0]! : Buffer.concat(chunks, total);
+		const probeLen = Math.min(full.length, 4096);
+		for (let i = 0; i < probeLen; i++) {
+			if (full[i] === 0) return undefined;
+		}
+		return full.toString("utf8");
 	} catch {
 		return undefined;
+	} finally {
+		await handle?.close().catch(() => undefined);
 	}
-	if (!stat.isFile() || stat.size > maxFileBytes) return undefined;
-	let buf: Buffer;
-	try {
-		buf = fs.readFileSync(real);
-	} catch {
-		return undefined;
-	}
-	// Skip binary files (NUL byte in first 4 KiB)
-	const probeLen = Math.min(buf.length, 4096);
-	for (let i = 0; i < probeLen; i++) {
-		if (buf[i] === 0) return undefined;
-	}
-	return buf.toString("utf8");
 }
 
 function tokenizeQuery(query: string): string[] {
@@ -160,16 +237,69 @@ function tokenizeQuery(query: string): string[] {
 	);
 }
 
+function truncateToCeiling(text: string, maxChars: number): string {
+	const trimmed = text.trim();
+	if (trimmed.length <= maxChars) return trimmed;
+	if (maxChars <= 1) return trimmed.slice(0, maxChars);
+	return `${trimmed.slice(0, maxChars - 1).trimEnd()}…`;
+}
+
 /**
- * Bounded, read-only local filesystem `FileSearchService` jailed strictly inside configured workspace root(s).
+ * Formats a snippet guaranteed to preserve the matched/definition anchor line inside `maxChars`,
+ * adding surrounding context lines only when space remains.
+ */
+function buildMatchCenteredSnippet(
+	lines: readonly string[],
+	anchorIdx: number,
+	queryLower: string,
+	maxChars: number,
+): string {
+	const rawAnchor = (lines[anchorIdx] ?? "").trim();
+	let anchor = rawAnchor;
+	if (anchor.length > maxChars) {
+		const hitPos = queryLower ? anchor.toLowerCase().indexOf(queryLower) : -1;
+		if (hitPos > 0 && maxChars > 4) {
+			const half = Math.floor((maxChars - 2) / 2);
+			const start = Math.max(0, Math.min(hitPos - Math.floor(half / 2), anchor.length - (maxChars - 2)));
+			const slice = anchor.slice(start, start + Math.max(1, maxChars - 2)).trim();
+			const prefix = start > 0 ? "…" : "";
+			const suffix = start + slice.length < anchor.length ? "…" : "";
+			anchor = truncateToCeiling(`${prefix}${slice}${suffix}`, maxChars);
+		} else {
+			anchor = truncateToCeiling(anchor, maxChars);
+		}
+		return anchor;
+	}
+
+	const picked: string[] = [anchor];
+	let used = anchor.length;
+
+	// Prefer adding lines after the match/declaration first, then one preceding line if room remains.
+	for (const offset of [1, 2, -1]) {
+		const idx = anchorIdx + offset;
+		if (idx < 0 || idx >= lines.length) continue;
+		const candidate = lines[idx]!.trim();
+		if (!candidate) continue;
+		if (used + 1 + candidate.length <= maxChars) {
+			if (offset < 0) picked.unshift(candidate);
+			else picked.push(candidate);
+			used += 1 + candidate.length;
+		}
+	}
+	return picked.join("\n");
+}
+
+/**
+ * Bounded, async, read-only local filesystem `FileSearchService` jailed strictly inside configured workspace root(s).
  *
- * Useful both as a graceful fallback when XERJ is offline and as a zero-daemon option for small local workspaces.
+ * Useful both as a graceful fallback when XERJ is offline and as a zero-daemon option for local workspaces.
  */
 export class LocalWorkspaceFileSearchService implements FileSearchService {
 	readonly engine = "local";
 	private readonly workspaceRoot?: string;
 	private readonly rootResolver?: (scope: FileSearchScope) => string | undefined;
 	private readonly maxFiles: number;
+	private readonly maxVisitedEntries: number;
 	private readonly maxFileBytes: number;
 	private readonly ignoreDirs: ReadonlySet<string>;
 
@@ -180,90 +310,138 @@ export class LocalWorkspaceFileSearchService implements FileSearchService {
 		this.workspaceRoot = options.workspaceRoot ? path.resolve(options.workspaceRoot) : undefined;
 		this.rootResolver = options.resolveWorkspaceRoot;
 		this.maxFiles = Math.max(10, options.maxFiles ?? 4000);
+		this.maxVisitedEntries = Math.max(this.maxFiles, options.maxVisitedEntries ?? Math.max(this.maxFiles * 4, 16_000));
 		this.maxFileBytes = Math.max(1024, options.maxFileBytes ?? 512 * 1024);
 		this.ignoreDirs = new Set([...DEFAULT_IGNORE_DIRS, ...(options.ignoreDirs ?? [])]);
 	}
 
-	private resolveRoot(scope: FileSearchScope): { root: string; rootReal: string } | undefined {
+	private async resolveRoot(scope: FileSearchScope): Promise<{ root: string; rootReal: string } | undefined> {
 		const raw = this.rootResolver ? this.rootResolver(scope) : this.workspaceRoot;
 		if (!raw) return undefined;
 		const resolved = path.resolve(raw);
-		if (!fs.existsSync(resolved)) return undefined;
-		return { root: resolved, rootReal: fs.realpathSync(resolved) };
+		try {
+			const st = await fsp.stat(resolved);
+			if (!st.isDirectory()) return undefined;
+			const rootReal = await fsp.realpath(resolved);
+			return { root: resolved, rootReal };
+		} catch {
+			return undefined;
+		}
 	}
 
-	private walkFiles(
+	/**
+	 * Safely walks files inside `rootReal` using async `fs.promises`:
+	 * - Validates each queued directory with `lstat` (refusing symlinks) + `realpath` inside `rootReal`
+	 *   immediately before opening it, preventing symlink replacement from enumerating outside the workspace.
+	 * - Bounds both visited entries (`maxVisitedEntries`) and accepted files (`maxFiles`).
+	 * - Yields periodically to the event loop and honors `AbortSignal`.
+	 */
+	private async walkFiles(
 		root: string,
 		rootReal: string,
 		filters: { readonly pathPrefix?: string; readonly extension?: string; readonly language?: string },
 		signal?: AbortSignal,
-	): Array<{ readonly relPath: string; readonly absPath: string; readonly format: string; readonly language?: string }> {
+	): Promise<{
+		readonly files: Array<{ readonly relPath: string; readonly absPath: string; readonly format: string; readonly language?: string }>;
+		readonly hitVisitCap: boolean;
+	}> {
 		const pathPrefix = normalizePathPrefix(filters.pathPrefix);
 		const extFilter = filters.extension?.trim().toLowerCase().replace(/^\.+/, "");
 		const langFilter = filters.language?.trim().toLowerCase();
 
 		const results: Array<{ relPath: string; absPath: string; format: string; language?: string }> = [];
-		const stack: string[] = [root];
+		const stack: string[] = [rootReal];
+		let visited = 0;
+		let hitVisitCap = false;
 
-		while (stack.length > 0 && results.length < this.maxFiles) {
+		while (stack.length > 0 && results.length < this.maxFiles && visited < this.maxVisitedEntries) {
 			if (signal?.aborted) break;
 			const dir = stack.pop()!;
-			let entries: fs.Dirent[];
+
+			// Re-verify the directory itself immediately before opening (blocks symlink swap TOCTOU).
+			let dirReal: string;
 			try {
-				entries = fs.readdirSync(dir, { withFileTypes: true });
+				const lst = await fsp.lstat(dir);
+				if (lst.isSymbolicLink() || !lst.isDirectory()) continue;
+				dirReal = await fsp.realpath(dir);
 			} catch {
 				continue;
 			}
-			entries.sort((a, b) => b.name.localeCompare(a.name));
-			for (const entry of entries) {
-				if (results.length >= this.maxFiles) break;
-				if (entry.isSymbolicLink()) continue;
-				const abs = path.join(dir, entry.name);
-				if (entry.isDirectory()) {
-					if (this.ignoreDirs.has(entry.name) || entry.name.startsWith(".")) continue;
-					stack.push(abs);
-					continue;
-				}
-				if (!entry.isFile()) continue;
-				const relPath = path.relative(root, abs).replace(/\\+/g, "/");
-				if (pathPrefix && !relPath.startsWith(pathPrefix)) continue;
-				const { format, language } = detectFormatAndLanguage(relPath);
-				if (extFilter && format !== extFilter) continue;
-				if (langFilter && language !== langFilter) continue;
+			if (!isInsideRoot(dirReal, rootReal)) continue;
 
-				// Double-check realpath boundary
-				let real: string;
-				try {
-					real = fs.realpathSync(abs);
-				} catch {
-					continue;
-				}
-				if (real !== rootReal && !real.startsWith(rootReal + path.sep)) continue;
+			let handle: fs.Dir | undefined;
+			try {
+				handle = await fsp.opendir(dirReal);
+				const childDirs: string[] = [];
+				for await (const entry of handle) {
+					if (signal?.aborted) break;
+					visited += 1;
+					if (visited > this.maxVisitedEntries) {
+						hitVisitCap = true;
+						break;
+					}
+					if (visited % YIELD_BATCH_SIZE === 0) {
+						await yieldToEventLoop();
+					}
+					if (results.length >= this.maxFiles) break;
+					if (entry.isSymbolicLink()) continue;
 
-				results.push({ relPath, absPath: abs, format, ...(language ? { language } : {}) });
+					const abs = path.join(dirReal, entry.name);
+					if (entry.isDirectory()) {
+						if (this.ignoreDirs.has(entry.name) || entry.name.startsWith(".")) continue;
+						// Prune subdirectories that cannot possibly match pathPrefix.
+						if (pathPrefix) {
+							const relDir = `${path.relative(rootReal, abs).replace(/\\+/g, "/")}/`;
+							if (!pathPrefix.startsWith(relDir) && !relDir.startsWith(pathPrefix)) continue;
+						}
+						childDirs.push(abs);
+						continue;
+					}
+					if (!entry.isFile()) continue;
+
+					const relPath = path.relative(rootReal, abs).replace(/\\+/g, "/");
+					if (pathPrefix && !relPath.startsWith(pathPrefix)) continue;
+					const { format, language } = detectFormatAndLanguage(relPath);
+					if (extFilter && format !== extFilter) continue;
+					if (langFilter && language !== langFilter) continue;
+
+					results.push({ relPath, absPath: abs, format, ...(language ? { language } : {}) });
+				}
+				childDirs.sort((a, b) => b.localeCompare(a));
+				for (const sub of childDirs) stack.push(sub);
+			} catch {
+				continue;
+			} finally {
+				await handle?.close().catch(() => undefined);
 			}
 		}
 
-		return results;
+		// Keep `root` reference meaningful if rootReal differs only by symlink/casing on Windows.
+		void root;
+		return { files: results, hitVisitCap };
 	}
 
 	async findFiles(scope: FileSearchScope, options: FileFindOptions): Promise<FileSearchResult> {
 		const started = Date.now();
-		const rootInfo = this.resolveRoot(scope);
+		if (options.signal?.aborted) {
+			return { hits: [], total: 0, engine: this.engine, mode: "lexical", notes: ["Search aborted."] };
+		}
+		const rootInfo = await this.resolveRoot(scope);
 		if (!rootInfo) {
 			return { hits: [], total: 0, engine: this.engine, mode: "lexical", notes: ["Workspace root not configured for this scope."] };
 		}
 
 		const limit = Math.max(1, Math.min(50, Math.trunc(options.limit ?? 15)));
-		const files = this.walkFiles(rootInfo.root, rootInfo.rootReal, options, options.signal);
+		const { files, hitVisitCap } = await this.walkFiles(rootInfo.root, rootInfo.rootReal, options, options.signal);
 		const queryText = options.query?.trim() ?? "";
 
 		const scored: FileMatchHit[] = [];
-		const regex = queryText ? globToRegex(queryText) : undefined;
 		const queryLower = queryText.toLowerCase();
 		const tokens = tokenizeQuery(queryText);
 
-		for (const f of files) {
+		for (let i = 0; i < files.length; i++) {
+			if (i % YIELD_BATCH_SIZE === 0 && options.signal?.aborted) break;
+			const f = files[i]!;
 			const base = path.basename(f.relPath);
 			let score = 1;
 			if (queryText) {
@@ -271,9 +449,9 @@ export class LocalWorkspaceFileSearchService implements FileSearchService {
 				const pathLower = f.relPath.toLowerCase();
 				if (baseLower === queryLower || pathLower === queryLower) {
 					score = 10;
-				} else if (regex?.test(base)) {
+				} else if (matchGlob(queryText, base)) {
 					score = 6;
-				} else if (regex?.test(f.relPath)) {
+				} else if (matchGlob(queryText, f.relPath)) {
 					score = 4;
 				} else if (tokens.length > 0 && tokens.every((t) => pathLower.includes(t))) {
 					score = 3;
@@ -291,18 +469,23 @@ export class LocalWorkspaceFileSearchService implements FileSearchService {
 		}
 
 		scored.sort((a, b) => b.score - a.score || a.path.localeCompare(b.path));
+		const notes = hitVisitCap ? [`Scan stopped at ${this.maxVisitedEntries} visited entries; narrow pathPrefix.`] : [];
 		return {
 			hits: scored.slice(0, limit),
 			total: scored.length,
 			tookMs: Date.now() - started,
 			engine: this.engine,
 			mode: "lexical",
+			...(notes.length > 0 ? { notes } : {}),
 		};
 	}
 
 	async searchContent(scope: FileSearchScope, options: FileContentSearchOptions): Promise<FileSearchResult> {
 		const started = Date.now();
-		const rootInfo = this.resolveRoot(scope);
+		if (options.signal?.aborted) {
+			return { hits: [], total: 0, engine: this.engine, mode: "lexical", notes: ["Search aborted."] };
+		}
+		const rootInfo = await this.resolveRoot(scope);
 		if (!rootInfo) {
 			return { hits: [], total: 0, engine: this.engine, mode: "lexical", notes: ["Workspace root not configured for this scope."] };
 		}
@@ -311,19 +494,24 @@ export class LocalWorkspaceFileSearchService implements FileSearchService {
 		if (!queryText) return this.findFiles(scope, options);
 
 		const limit = Math.max(1, Math.min(50, Math.trunc(options.limit ?? 8)));
-		const maxSnippetChars = Math.max(80, Math.min(2000, options.maxSnippetChars ?? 420));
-		const files = this.walkFiles(rootInfo.root, rootInfo.rootReal, options, options.signal);
+		const maxSnippetChars = clampSnippetChars(options.maxSnippetChars);
+		const { files, hitVisitCap } = await this.walkFiles(rootInfo.root, rootInfo.rootReal, options, options.signal);
 		const queryLower = queryText.toLowerCase();
 		const tokens = tokenizeQuery(queryText);
 		const notes: string[] = [];
 		if (options.mode && options.mode !== "lexical") {
 			notes.push(`Local workspace engine supports lexical search only (requested "${options.mode}").`);
 		}
+		if (hitVisitCap) {
+			notes.push(`Scan stopped at ${this.maxVisitedEntries} visited entries; narrow pathPrefix.`);
+		}
 
 		const hits: FileMatchHit[] = [];
-		for (const f of files) {
+		for (let fi = 0; fi < files.length; fi++) {
 			if (options.signal?.aborted) break;
-			const content = readSafeTextFile(f.absPath, rootInfo.rootReal, this.maxFileBytes);
+			if (fi > 0 && fi % 16 === 0) await yieldToEventLoop();
+			const f = files[fi]!;
+			const content = await readSafeTextFile(f.absPath, rootInfo.rootReal, this.maxFileBytes);
 			if (content === undefined) continue;
 
 			const lines = content.split(/\r?\n/);
@@ -354,7 +542,6 @@ export class LocalWorkspaceFileSearchService implements FileSearchService {
 				}
 			}
 
-			// Definition boost matching XERJ's definition-first heuristic
 			let defBoost = 0;
 			let defLine: number | undefined;
 			for (const sym of symbols) {
@@ -373,10 +560,7 @@ export class LocalWorkspaceFileSearchService implements FileSearchService {
 			if (totalScore <= 0 || (bestLineIdx < 0 && defLine === undefined)) continue;
 
 			const anchorIdx = defLine !== undefined && defBoost >= 4 ? defLine - 1 : Math.max(0, bestLineIdx);
-			const startIdx = Math.max(0, anchorIdx - 1);
-			const endIdx = Math.min(lines.length, anchorIdx + 3);
-			const rawSnippet = lines.slice(startIdx, endIdx).join("\n").trim();
-			const snippet = rawSnippet.length > maxSnippetChars ? `${rawSnippet.slice(0, maxSnippetChars - 1).trimEnd()}…` : rawSnippet;
+			const snippet = buildMatchCenteredSnippet(lines, anchorIdx, queryLower, maxSnippetChars);
 
 			hits.push({
 				path: f.relPath,
@@ -403,7 +587,10 @@ export class LocalWorkspaceFileSearchService implements FileSearchService {
 
 	async findSymbolDefinitions(scope: FileSearchScope, options: FileSymbolDefOptions): Promise<FileSearchResult> {
 		const started = Date.now();
-		const rootInfo = this.resolveRoot(scope);
+		if (options.signal?.aborted) {
+			return { hits: [], total: 0, engine: this.engine, mode: "lexical", notes: ["Search aborted."] };
+		}
+		const rootInfo = await this.resolveRoot(scope);
 		if (!rootInfo) {
 			return { hits: [], total: 0, engine: this.engine, mode: "lexical", notes: ["Workspace root not configured for this scope."] };
 		}
@@ -414,7 +601,7 @@ export class LocalWorkspaceFileSearchService implements FileSearchService {
 		const kindFilter = options.kind?.trim().toLowerCase();
 		const limit = Math.max(1, Math.min(50, Math.trunc(options.limit ?? 6)));
 
-		const files = this.walkFiles(
+		const { files, hitVisitCap } = await this.walkFiles(
 			rootInfo.root,
 			rootInfo.rootReal,
 			{ pathPrefix: options.pathPrefix, language: options.language },
@@ -422,9 +609,11 @@ export class LocalWorkspaceFileSearchService implements FileSearchService {
 		);
 
 		const hits: FileMatchHit[] = [];
-		for (const f of files) {
+		for (let fi = 0; fi < files.length; fi++) {
 			if (options.signal?.aborted) break;
-			const content = readSafeTextFile(f.absPath, rootInfo.rootReal, this.maxFileBytes);
+			if (fi > 0 && fi % 16 === 0) await yieldToEventLoop();
+			const f = files[fi]!;
+			const content = await readSafeTextFile(f.absPath, rootInfo.rootReal, this.maxFileBytes);
 			if (content === undefined) continue;
 			const lines = content.split(/\r?\n/);
 			const symbols = extractSymbolsFromText(content);
@@ -439,7 +628,7 @@ export class LocalWorkspaceFileSearchService implements FileSearchService {
 				else continue;
 
 				const lineIdx = Math.max(0, (sym.line ?? 1) - 1);
-				const snippet = lines.slice(lineIdx, Math.min(lines.length, lineIdx + 3)).join("\n").trim().slice(0, 320);
+				const snippet = buildMatchCenteredSnippet(lines, lineIdx, symbolLower, 320);
 				hits.push({
 					path: f.relPath,
 					title: path.basename(f.relPath),
@@ -454,21 +643,30 @@ export class LocalWorkspaceFileSearchService implements FileSearchService {
 		}
 
 		hits.sort((a, b) => b.score - a.score || a.path.localeCompare(b.path));
+		const notes = hitVisitCap ? [`Scan stopped at ${this.maxVisitedEntries} visited entries; narrow pathPrefix.`] : [];
 		return {
 			hits: hits.slice(0, limit),
 			total: hits.length,
 			tookMs: Date.now() - started,
 			engine: this.engine,
 			mode: "lexical",
+			...(notes.length > 0 ? { notes } : {}),
 		};
 	}
 
-	async getIndexMap(scope: FileSearchScope): Promise<FileIndexMapResult> {
-		const rootInfo = this.resolveRoot(scope);
+	async getIndexMap(
+		scope: FileSearchScope,
+		options?: { readonly limit?: number; readonly signal?: AbortSignal },
+	): Promise<FileIndexMapResult> {
+		if (options?.signal?.aborted) {
+			return { engine: this.engine, indexScope: "local-workspace", datasets: [], totalDocs: 0, notes: ["Aborted."] };
+		}
+		const rootInfo = await this.resolveRoot(scope);
 		if (!rootInfo) {
 			return { engine: this.engine, indexScope: "(unconfigured)", datasets: [], totalDocs: 0 };
 		}
-		const files = this.walkFiles(rootInfo.root, rootInfo.rootReal, {});
+		const limit = Math.max(1, Math.min(50, Math.trunc(options?.limit ?? 25)));
+		const { files, hitVisitCap } = await this.walkFiles(rootInfo.root, rootInfo.rootReal, {}, options?.signal);
 		const byLang = new Map<string, string[]>();
 		for (const f of files) {
 			const key = f.language ?? f.format;
@@ -478,6 +676,7 @@ export class LocalWorkspaceFileSearchService implements FileSearchService {
 		}
 		const datasets = Array.from(byLang.entries())
 			.sort((a, b) => b[1].length - a[1].length)
+			.slice(0, limit)
 			.map(([lang, paths]) => ({
 				index: `local:${lang}`,
 				dataset: lang,
@@ -485,16 +684,23 @@ export class LocalWorkspaceFileSearchService implements FileSearchService {
 				languages: [lang],
 				samplePaths: paths.slice(0, 4),
 			}));
+		const notes = hitVisitCap ? [`Scan stopped at ${this.maxVisitedEntries} visited entries.`] : [];
 		return {
 			engine: this.engine,
 			indexScope: "local-workspace",
 			datasets,
 			totalDocs: files.length,
+			...(notes.length > 0 ? { notes } : {}),
 		};
 	}
 
 	async healthCheck(): Promise<FileSearchHealth> {
-		const ok = this.workspaceRoot ? fs.existsSync(this.workspaceRoot) : true;
-		return { ok, engine: this.engine, latencyMs: 0 };
+		if (!this.workspaceRoot) return { ok: true, engine: this.engine, latencyMs: 0 };
+		try {
+			const st = await fsp.stat(this.workspaceRoot);
+			return { ok: st.isDirectory(), engine: this.engine, latencyMs: 0 };
+		} catch {
+			return { ok: false, engine: this.engine, latencyMs: 0 };
+		}
 	}
 }

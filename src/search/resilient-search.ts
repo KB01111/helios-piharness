@@ -8,12 +8,23 @@ import type {
 	FileSearchService,
 	FileSymbolDefOptions,
 } from "../contracts/app-capabilities.js";
+import { XerjRequestError } from "./xerj-client.js";
 
 export interface FallbackFileSearchOptions {
 	readonly primary: FileSearchService;
 	readonly fallback: FileSearchService;
-	/** Called when the primary engine fails and the request is served by the fallback engine. */
+	/** Called when the primary engine fails transiently and the request is served by the fallback engine. */
 	readonly onFallback?: (operation: string, error: unknown) => void;
+}
+
+function shouldFallback(error: unknown, signal?: AbortSignal): boolean {
+	if (signal?.aborted) return false;
+	// Non-retryable client/auth errors (e.g. 401/403 rejected API key or 400 contract error)
+	// must surface rather than silently serving fallback results.
+	if (error instanceof XerjRequestError && !error.retryable) {
+		return false;
+	}
+	return true;
 }
 
 /**
@@ -69,8 +80,8 @@ export class FallbackFileSearchService implements FileSearchService {
 				return await this.primary.getIndexMap(scope, options);
 			}
 		} catch (error) {
-			if (options?.signal?.aborted) throw error;
-			this.onFallback?.("getIndexMap", error);
+			if (!shouldFallback(error, options?.signal)) throw error;
+			this.notifyFallback("getIndexMap", error);
 		}
 		if (this.fallback.getIndexMap) {
 			const res = await this.fallback.getIndexMap(scope, options);
@@ -100,6 +111,14 @@ export class FallbackFileSearchService implements FileSearchService {
 		};
 	}
 
+	private notifyFallback(operation: string, error: unknown): void {
+		try {
+			this.onFallback?.(operation, error);
+		} catch {
+			// Diagnostic callback failures must never block fallback recovery.
+		}
+	}
+
 	private async withFallback(
 		op: string,
 		signal: AbortSignal | undefined,
@@ -109,8 +128,8 @@ export class FallbackFileSearchService implements FileSearchService {
 		try {
 			return await runPrimary();
 		} catch (error) {
-			if (signal?.aborted) throw error;
-			this.onFallback?.(op, error);
+			if (!shouldFallback(error, signal)) throw error;
+			this.notifyFallback(op, error);
 			const res = await runFallback();
 			return {
 				...res,

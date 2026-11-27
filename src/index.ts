@@ -295,8 +295,17 @@ import {
 } from "./tools/example-domain.tools.js";
 import { createPlanToolPack, PLAN_LIMITS, renderPlan, unfinishedSteps } from "./tools/plan.tools.js";
 import { createMemoryToolPack } from "./tools/memory.tools.js";
-import { createFileSearchToolPack, type FileSearchToolPackOptions } from "./tools/file-search.tools.js";
 import {
+	createFileSearchToolPack,
+	formatFileFindOutput,
+	formatFileIndexMapOutput,
+	formatFileSearchOutput,
+	formatFileSymbolDefOutput,
+	type FileSearchToolPackOptions,
+} from "./tools/file-search.tools.js";
+import {
+	formatXerjScopePrefix,
+	MAX_NODE_TIMER_MS,
 	normalizePathPrefix,
 	sanitizeXerjIndexSlug,
 	validateXerjBaseUrl,
@@ -307,6 +316,7 @@ import {
 } from "./search/xerj-client.js";
 import {
 	LocalWorkspaceFileSearchService,
+	matchGlob,
 	type LocalWorkspaceFileSearchOptions,
 } from "./search/local-workspace.js";
 import {
@@ -766,7 +776,11 @@ export async function bootstrapHarness(options: BootstrapHarnessOptions = {}): P
 				retention: false,
 				autoResume: false,
 				wakeScheduler: undefined,
-				capabilities: { skillsDir: capabilities.skillsDir, maxToolOutputBytes: capabilities.maxToolOutputBytes },
+				capabilities: {
+					skillsDir: capabilities.skillsDir,
+					maxToolOutputBytes: capabilities.maxToolOutputBytes,
+					...(capabilities.fileSearch ? { fileSearch: capabilities.fileSearch } : {}),
+				},
 				config: {
 					...config,
 					piDbPath: ":memory:",
@@ -1073,12 +1087,19 @@ export {
 	// Indexed File Search (XERJ / local workspace)
 	XerjFileSearchService,
 	XerjRequestError,
+	formatXerjScopePrefix,
+	MAX_NODE_TIMER_MS,
 	sanitizeXerjIndexSlug,
 	validateXerjBaseUrl,
 	normalizePathPrefix,
 	LocalWorkspaceFileSearchService,
+	matchGlob,
 	FallbackFileSearchService,
 	createFileSearchToolPack,
+	formatFileFindOutput,
+	formatFileSearchOutput,
+	formatFileSymbolDefOutput,
+	formatFileIndexMapOutput,
 	type XerjFileSearchOptions,
 	type XerjScopeMode,
 	type LocalWorkspaceFileSearchOptions,

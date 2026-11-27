@@ -217,15 +217,28 @@ async function connectReranker(
 
 /**
  * Connects optional indexed file search (`XERJ_URL` and/or `FILE_SEARCH_WORKSPACE_ROOT`).
- * When both are set, XERJ serves primary AST-aware search and local workspace acts as automatic fallback.
+ *
+ * Security invariant: a single static `FILE_SEARCH_WORKSPACE_ROOT` has no per-tenant directory boundary,
+ * so it is only attached when `XERJ_SCOPE_MODE=shared` (single-tenant / shared reference mode). In
+ * multi-tenant modes (`tenant` / `workspace`), embedders should inject `LocalWorkspaceFileSearchService`
+ * with `resolveWorkspaceRoot(scope)` programmatically rather than sharing one static directory across tenants.
  */
 async function connectFileSearch(
 	config: ReturnType<typeof loadConfig>,
 	logger: ReturnType<typeof createLogger>,
 ): Promise<FileSearchService | undefined> {
-	const local = config.fileSearchWorkspaceRoot
-		? new LocalWorkspaceFileSearchService({ workspaceRoot: config.fileSearchWorkspaceRoot })
-		: undefined;
+	let local: LocalWorkspaceFileSearchService | undefined;
+	if (config.fileSearchWorkspaceRoot) {
+		if (config.xerjScopeMode === "shared") {
+			local = new LocalWorkspaceFileSearchService({ workspaceRoot: config.fileSearchWorkspaceRoot });
+		} else {
+			logger.warn("file_search_local_root_skipped_multitenant", {
+				message:
+					"FILE_SEARCH_WORKSPACE_ROOT is ignored when XERJ_SCOPE_MODE is not 'shared' to prevent cross-tenant local file exposure. Set XERJ_SCOPE_MODE=shared for single-tenant use or supply a per-scope resolveWorkspaceRoot programmatically.",
+				scopeMode: config.xerjScopeMode,
+			});
+		}
+	}
 
 	if (!config.xerjUrl) {
 		if (config.xerjRequired) throw new Error("XERJ_REQUIRED needs XERJ_URL");
@@ -248,6 +261,10 @@ async function connectFileSearch(
 
 	const health = await xerj.healthCheck();
 	if (health.ok) {
+		if (config.xerjRequired) {
+			// Verify search routes themselves work (not just `GET /`, which a reverse proxy could answer).
+			await xerj.verifySearchCapability();
+		}
 		logger.info("file_search_connected", {
 			engine: xerj.engine,
 			scopeMode: config.xerjScopeMode,
