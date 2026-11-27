@@ -916,7 +916,7 @@ export class SqliteMemoryService implements MemoryService {
 	 * means "this answers the query", but a low score does not mean "this does not": keyword-free paraphrases and
 	 * the second hop of a multi-hop chain score ~0 just like genuine non-answers. So a confident reranker score
 	 * lifts a candidate by noisy-OR (`s + w * r * (1 - s)`, with `r` ramping from the reranker's measured
-	 * near-miss level to 0.5) and a low score never demotes anything. Recall, abstention and chain context therefore
+	 * near-miss level to 0.5, or to 1 if the threshold is at least 0.5) and a low score never demotes anything. Recall, abstention and chain context therefore
 	 * stay exactly as the fused ranking had them; only the ORDER among plausible candidates improves.
 	 * On reranker failure the fused order is returned unchanged.
 	 */
@@ -938,12 +938,15 @@ export class SqliteMemoryService implements MemoryService {
 		} catch {
 			return scored;
 		}
-		const floor = reranker.answerThreshold !== undefined && reranker.answerThreshold > 0 && reranker.answerThreshold < 0.5 ? reranker.answerThreshold : 0.1;
+		const threshold = reranker.answerThreshold;
+		const floor = threshold !== undefined && threshold > 0 && threshold < 1 ? threshold : 0.1;
+		const ceiling = floor < 0.5 ? 0.5 : 1;
 		const boosted = head.map((e, i) => {
 			const p = Math.max(0, Math.min(1, probs[i]!));
-			const t = Math.max(0, Math.min(1, (p - floor) / (0.5 - floor)));
+			const t = Math.max(0, Math.min(1, (p - floor) / (ceiling - floor)));
 			const r = t * t * (3 - 2 * t);
-			return { ...e, score: softCap(e.score + this.rerankWeight * r * (1 - e.score)), matchSignals: { ...e.matchSignals, rerank: p } };
+			const score = Math.max(e.score, softCap(e.score + this.rerankWeight * r * (1 - e.score)));
+			return { ...e, score, matchSignals: { ...e.matchSignals, rerank: p } };
 		});
 		return [...boosted, ...scored.slice(headSize)].sort(
 			(a, b) =>

@@ -217,6 +217,21 @@ describe("EmbeddingRouter", () => {
 		expect(health.backends.find((b) => b.id === "broken")?.ok).toBe(false);
 	});
 
+	it("can quarantine an unreachable backend for the benchmark while allowing server recovery by default", async () => {
+		const recovering = new FakeBackend("recovering");
+		const router = new EmbeddingRouter({ backends: [recovering, new FakeBackend("good")] });
+		recovering.fail = new Error("temporarily unreachable");
+		await router.selfTest({ quarantineOnError: true });
+		recovering.fail = undefined;
+		expect((await router.embed({ texts: ["benchmark query"] })).servedBy).toEqual(["good"]);
+
+		const serverRouter = new EmbeddingRouter({ backends: [recovering, new FakeBackend("good")] });
+		recovering.fail = new Error("temporarily unreachable");
+		await serverRouter.selfTest();
+		recovering.fail = undefined;
+		expect((await serverRouter.embed({ texts: ["server query"] })).servedBy).toEqual(["recovering"]);
+	});
+
 	it("keeps an explicitly configured calibration over the measured one", async () => {
 		const router = new EmbeddingRouter({ backends: [new FakeBackend("a")], calibration: { floor: 0.1, ceiling: 0.9 } });
 		await router.selfTest();

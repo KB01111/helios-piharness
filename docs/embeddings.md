@@ -122,12 +122,18 @@ at q8 and fp16, Qwen3-Reranker-0.6B, gte-reranker-modernbert, jina-turbo) on neu
 | second hop of a 2-hop chain (does not mention the query entity) | ~0.001 |
 | same-topic non-answers ("serial number of my espresso grinder") | ~0.000 |
 
+<!-- coderabbit-ai-generated:v1 -->
+
+<!-- coderabbit-ai-generated-section:v1:353a5991ca2f7e10b83a77a2ce3bb5f611c9cd80194644d3319db064b1e258e8 -->
+
 A high score reliably means "this answers the query"; a low score means nothing, because true paraphrases score as low
 as non-answers. Using the reranker as a gate would destroy semantic and multi-hop recall without fixing abstention.
 So the top 20 fused candidates (`RERANK_CANDIDATES`) are reranked. A confident score lifts a candidate by noisy-OR,
-ramping from the model's measured non-answer level (the self-test `answer_threshold`, 0.078 for bge-v2-m3) to 0.5. A
-low score never demotes or removes anything. Recall and abstention stay exactly as fused retrieval had them; only the
+ramping from the model's measured or configured `answer_threshold` (0.078 for bge-v2-m3) to 0.5. For thresholds of
+0.5 or higher, the ramp ends at 1. A low score never demotes or removes anything. Recall and abstention stay exactly as fused retrieval had them; only the
 order among plausible candidates improves.
+
+<!-- /coderabbit-ai-generated:v1 -->
 
 The reranker self-test checks what that role needs: non-answers (near-misses and unrelated text) must stay low and
 typical answers must clear them. A reranker that scores near-misses like answers (e.g. gte-modernbert at q8) is

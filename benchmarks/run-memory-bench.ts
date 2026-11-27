@@ -822,8 +822,12 @@ async function main(): Promise<void> {
 			embedder = helios;
 			console.error(`[bench] Connected to Helios embedding server at ${endpoint}: ${helios.model}`);
 			if (args.includes("--rerank")) {
-				reranker = await HttpReranker.connect({ baseUrl: endpoint, timeoutMs: 120_000 });
-				console.error(`[bench] Reranker: ${reranker.model} (answer threshold ${reranker.answerThreshold ?? "default"})`);
+				try {
+					reranker = await HttpReranker.connect({ baseUrl: endpoint, timeoutMs: 120_000 });
+					console.error(`[bench] Reranker: ${reranker.model} (answer threshold ${reranker.answerThreshold ?? "default"})`);
+				} catch (error) {
+					console.error(`[bench] Continuing without reranking: ${error instanceof Error ? error.message : String(error)}`);
+				}
 			}
 		} catch {
 			try {

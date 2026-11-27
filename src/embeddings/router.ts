@@ -153,8 +153,9 @@ export class EmbeddingRouter {
 	 * Runs the neutral-corpus quality self-test on every backend. Backends that fail are quarantined (skipped by
 	 * `embed`) when `enforce` is true. The first passing backend's measured calibration becomes the published one
 	 * unless a calibration was configured explicitly. Returns per-backend results (`error` when unreachable).
+	 * With enforcement and `quarantineOnError`, backends that cannot complete the test are also quarantined.
 	 */
-	async selfTest(options: { readonly enforce?: boolean } = {}): Promise<Array<{ id: string; result?: SelfTestResult; error?: string }>> {
+	async selfTest(options: { readonly enforce?: boolean; readonly quarantineOnError?: boolean } = {}): Promise<Array<{ id: string; result?: SelfTestResult; error?: string }>> {
 		const enforce = options.enforce ?? true;
 		const out: Array<{ id: string; result?: SelfTestResult; error?: string }> = [];
 		for (const backend of this.backends) {
@@ -178,8 +179,10 @@ export class EmbeddingRouter {
 				}
 				out.push({ id: backend.id, result });
 			} catch (error) {
-				// Unreachable at startup is not a quality verdict: leave it to the circuit breaker.
-				out.push({ id: backend.id, error: errorText(error) });
+				// By default an unreachable backend can recover through the circuit breaker.
+				const detail = errorText(error);
+				if (enforce && options.quarantineOnError) this.quarantine.set(backend.id, `self-test could not complete: ${detail}`);
+				out.push({ id: backend.id, error: detail });
 			}
 		}
 		if (!this.calibrationPinned) {

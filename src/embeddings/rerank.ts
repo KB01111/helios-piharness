@@ -115,12 +115,18 @@ export class OnnxRerankBackend implements RerankBackend {
 
 	async score(query: string, documents: readonly string[], signal?: AbortSignal): Promise<number[]> {
 		if (documents.length === 0) return [];
-		if (signal?.aborted) throw new EmbeddingError("TIMEOUT", `reranker ${this.id}: request aborted`);
+		const checkAborted = () => {
+			if (signal?.aborted) throw new EmbeddingError("TIMEOUT", `reranker ${this.id}: request aborted`);
+		};
+		checkAborted();
 		const run = async (): Promise<number[]> => {
+			checkAborted();
 			const { tokenizer, classifier } = await this.load();
+			checkAborted();
 			const order = documents.map((d, i) => ({ i, len: d.length })).sort((a, b) => a.len - b.len);
 			const out = new Array<number>(documents.length);
 			for (let start = 0; start < order.length; start += RERANK_MICRO_BATCH) {
+				checkAborted();
 				const slice = order.slice(start, start + RERANK_MICRO_BATCH);
 				const inputs = tokenizer(
 					slice.map(() => query),
