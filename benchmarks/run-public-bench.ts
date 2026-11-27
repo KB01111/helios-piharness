@@ -151,12 +151,18 @@ async function main(): Promise<void> {
 		const profile = arg("--in-process");
 		if (profile) {
 			const service = buildEmbeddingService(loadEmbedServerConfig({ ...process.env, EMBED_PROFILE: profile, EMBED_CACHE_SIZE: "200000" }));
-			embedder = new RouterEmbeddingProvider(service.router);
-			if (process.argv.includes("--rerank") && service.reranker) {
-				console.error("[bench] rerank self-test:", JSON.stringify(await service.reranker.selfTest()));
-				reranker = service.reranker;
-			}
 			close = () => service.close();
+			const quality = await service.router.selfTest({ quarantineOnError: true });
+			console.error("[bench] embedding self-test:", JSON.stringify(quality));
+			if (quality.some((entry) => entry.result?.passed)) {
+				embedder = new RouterEmbeddingProvider(service.router);
+				if (process.argv.includes("--rerank") && service.reranker) {
+					console.error("[bench] rerank self-test:", JSON.stringify(await service.reranker.selfTest()));
+					reranker = service.reranker;
+				}
+			} else {
+				console.error("[bench] No embedding backend passed the startup quality gate; running lexical only");
+			}
 		} else {
 			try {
 				embedder = await HttpEmbeddingProvider.connect({ baseUrl: endpoint, timeoutMs: 300_000 });

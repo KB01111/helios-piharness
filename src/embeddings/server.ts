@@ -99,8 +99,20 @@ export function createEmbedHttpServer(router: EmbeddingRouter, options: EmbedHtt
 		return next();
 	});
 
+	async function probeRerankerHealth(reranker: RerankService): ReturnType<RerankService["health"]> {
+		let timer: ReturnType<typeof setTimeout> | undefined;
+		const deadline = new Promise<Awaited<ReturnType<RerankService["health"]>>>((resolve) => {
+			timer = setTimeout(() => resolve({ ok: false, model: reranker.model, detail: "health probe timed out" }), 5_000);
+		});
+		try {
+			return await Promise.race([reranker.health(), deadline]);
+		} finally {
+			clearTimeout(timer);
+		}
+	}
+
 	app.get("/health", async (c) => {
-		const [health, rerankHealth] = await Promise.all([router.health(), reranker?.health()]);
+		const [health, rerankHealth] = await Promise.all([router.health(), reranker ? probeRerankerHealth(reranker) : undefined]);
 		return c.json(
 			{
 				status: health.ok ? (rerankHealth && !rerankHealth.ok ? "degraded" : "ok") : "unavailable",

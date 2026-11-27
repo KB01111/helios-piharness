@@ -321,9 +321,9 @@ export class HttpReranker implements Reranker {
 				...(options?.signal ? { signal: options.signal } : {}),
 				...(this.fetchImpl ? { fetchImpl: this.fetchImpl } : {}),
 			},
-		)) as { results?: Array<{ index?: unknown; relevance_score?: unknown }> };
+		)) as { results?: Array<{ index?: unknown; relevance_score?: unknown }>; data?: Array<{ index?: unknown; relevance_score?: unknown }> };
 		const scores = new Array<number>(documents.length).fill(Number.NaN);
-		for (const r of json.results ?? []) {
+		for (const r of json.results ?? json.data ?? []) {
 			if (typeof r.index === "number" && typeof r.relevance_score === "number" && r.index >= 0 && r.index < documents.length) {
 				scores[r.index] = r.relevance_score;
 			}

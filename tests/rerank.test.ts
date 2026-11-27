@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { loadConfig } from "../src/config.js";
 import type { Reranker } from "../src/contracts/app-capabilities.js";
 import { loadEmbedServerConfig } from "../src/embeddings/config.js";
@@ -119,6 +119,39 @@ describe("RerankService & self-test", () => {
 		}
 	});
 
+	it("skips canceled ONNX work queued, loading, or between inference batches", async () => {
+		const loading = new AbortController();
+		const queued = new AbortController();
+		const batching = new AbortController();
+		const loadStarted = Promise.withResolvers<void>();
+		const loadModel = Promise.withResolvers<TransformersRerankModule>();
+		const classifier = vi.fn(async () => {
+			batching.abort();
+			return { logits: { data: new Array<number>(8).fill(0), dims: [8, 1] } };
+		});
+		const backend = new OnnxRerankBackend({
+			loadTransformers: () => {
+				loadStarted.resolve();
+				return loadModel.promise;
+			},
+		});
+		const first = expect(backend.score("q", ["loading"], loading.signal)).rejects.toMatchObject({ code: "TIMEOUT" });
+		await loadStarted.promise;
+		const second = expect(backend.score("q", ["queued"], queued.signal)).rejects.toMatchObject({ code: "TIMEOUT" });
+		loading.abort();
+		queued.abort();
+		loadModel.resolve({
+			env: {},
+			AutoTokenizer: { from_pretrained: async () => () => ({}) },
+			AutoModelForSequenceClassification: { from_pretrained: async () => classifier },
+		});
+		await Promise.all([first, second]);
+		expect(classifier).not.toHaveBeenCalled();
+
+		await expect(backend.score("q", Array<string>(9).fill("doc"), batching.signal)).rejects.toMatchObject({ code: "TIMEOUT" });
+		expect(classifier).toHaveBeenCalledTimes(1);
+	});
+
 	it("HTTP backend parses Cohere/Jina `results` and Voyage `data` responses and clamps scores", async () => {
 		for (const field of ["results", "data"]) {
 			const fetchImpl = (async (_url: string | URL | Request, init?: RequestInit) => {
@@ -180,6 +213,41 @@ describe("rerank HTTP API & client", () => {
 		expect(cloud.helios).toBe(false);
 	});
 
+	it("HttpReranker accepts Voyage data, prefers results, and rejects missing scores", async () => {
+		const data = [{ index: 1, relevance_score: 0.8 }, { index: 0, relevance_score: 0.2 }];
+		let body: object = { data };
+		const fetchImpl: typeof fetch = async (input) => String(input).endsWith("/models") ? Response.json({ data: [] }) : Response.json(body);
+		const rr = await HttpReranker.connect({ baseUrl: "https://example.test/v1", model: "voyage", fetchImpl });
+		expect(await rr.rerank("q", ["a", "b"])).toEqual([0.2, 0.8]);
+		body = { data, results: [{ index: 0, relevance_score: 0.6 }, { index: 1, relevance_score: 0.3 }] };
+		expect(await rr.rerank("q", ["a", "b"])).toEqual([0.6, 0.3]);
+		body = { data: data.slice(0, 1) };
+		await expect(rr.rerank("q", ["a", "b"])).rejects.toMatchObject({ code: "UPSTREAM" });
+	});
+
+	it("reports degraded health when the reranker ignores its deadline", async () => {
+		vi.useFakeTimers();
+		try {
+			const backend = new FakeRerankBackend(() => 0);
+			vi.spyOn(backend, "health").mockImplementation(() => new Promise(() => {}));
+			const router = new EmbeddingRouter({ backends: [new TinyEmbedBackend()] });
+			const app = createEmbedHttpServer(router, { reranker: new RerankService({ backend }) });
+			const response = app.request("/health");
+			await vi.advanceTimersByTimeAsync(5_000);
+			const res = await response;
+			expect(res.status).toBe(200);
+			const health = await res.json();
+			expect(health).toMatchObject({
+				status: "degraded",
+				backends: [{ id: "a", ok: true }],
+				reranker: { ok: false, model: backend.model },
+			});
+			expect(health).not.toHaveProperty("reranker.detail");
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+
 	it("parses EMBED_RERANK config with profile defaults", () => {
 		expect(loadEmbedServerConfig({}).rerank).toMatchObject({ backend: "onnx", model: "onnx-community/bge-reranker-v2-m3-ONNX", dtype: "q8" });
 		expect(loadEmbedServerConfig({ EMBED_PROFILE: "openai" }).rerank.backend).toBe("off");
@@ -200,7 +268,7 @@ describe("rerank HTTP API & client", () => {
 describe("memory search with a reranker (positive evidence only)", () => {
 	async function seeded(reranker?: Reranker) {
 		const appDb = AppDatabase.open({ dbPath: ":memory:" });
-		const memory = new SqliteMemoryService(appDb, reranker ? { reranker } : {});
+		const memory = new SqliteMemoryService(appDb, { now: () => 1_000, reranker });
 		// Two lexical matches for "deploy pipeline"; the second is the real answer.
 		await memory.applyMemoryMutation("t", "u", { op: "ADD", key: "ops.deploy.pipeline", kind: "fact", content: "deploy pipeline deploy pipeline overview", confidence: 0.9 });
 		await memory.applyMemoryMutation("t", "u", { op: "ADD", key: "ops.release", kind: "fact", content: "The deploy pipeline runs canary releases at 10:00 UTC.", confidence: 0.9 });
@@ -228,13 +296,51 @@ describe("memory search with a reranker (positive evidence only)", () => {
 		appDb.close();
 	});
 
+	it("preserves the fused scores below a high threshold and still boosts a confident answer", async () => {
+		let probability = 0.7;
+		const { appDb, memory } = await seeded({
+			model: "high-threshold",
+			answerThreshold: 0.8,
+			rerank: async (_q, docs) => docs.map((d) => d.includes("canary") ? probability : 0),
+		});
+		try {
+			const before = await memory.search("t", "u", "deploy pipeline", { rerank: false });
+			const below = await memory.search("t", "u", "deploy pipeline");
+			expect(below.map((h) => h.score)).toEqual(before.map((h) => h.score));
+			probability = 1;
+			const above = await memory.search("t", "u", "deploy pipeline");
+			expect(above.find((h) => h.memory.key === "ops.release")!.score).toBeGreaterThan(before.find((h) => h.memory.key === "ops.release")!.score!);
+		} finally {
+			appDb.close();
+		}
+	});
+
+	it("keeps a strong fused score with zero rerank weight and records relevance", async () => {
+		const { appDb } = await seeded();
+		try {
+			const memory = new SqliteMemoryService(appDb, {
+				rerankWeight: 0,
+				now: () => 1_000,
+				reranker: { model: "fake", rerank: async (_q, docs) => docs.map(() => 1) },
+			});
+			await memory.pinMemory("t", "u", { key: "deploy.pipeline", content: "deploy pipeline", kind: "fact" });
+			const before = await memory.search("t", "u", "deploy pipeline", { rerank: false });
+			expect(before[0]!.score).toBeGreaterThan(0.85);
+			const after = await memory.search("t", "u", "deploy pipeline");
+			expect(after.map((h) => h.score)).toEqual(before.map((h) => h.score));
+			expect(after[0]?.matchSignals?.rerank).toBe(1);
+		} finally {
+			appDb.close();
+		}
+	});
+
 	it("never demotes on low scores and falls back to the fused order when the reranker fails", async () => {
 		const low = await seeded({ model: "low", rerank: async (_q, docs) => docs.map(() => 0) });
 		const plain = await seeded();
 		const a = await low.memory.search("t", "u", "deploy pipeline");
 		const b = await plain.memory.search("t", "u", "deploy pipeline");
 		expect(a.map((h) => h.memory.key)).toEqual(b.map((h) => h.memory.key));
-		a.forEach((h, i) => expect(h.score).toBeCloseTo(b[i]?.score ?? Number.NaN, 6)); // no demotion (seeding clocks differ by microseconds)
+		a.forEach((h, i) => expect(h.score).toBeCloseTo(b[i]?.score ?? Number.NaN, 6)); // no demotion
 
 		const broken = await seeded({
 			model: "broken",
