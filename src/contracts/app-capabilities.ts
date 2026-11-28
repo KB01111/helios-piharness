@@ -408,11 +408,132 @@ export interface FastModelClient {
 	): Promise<{ readonly rawText: string; readonly parsed: T | null }>;
 }
 
+/** Search mode for indexed file/code content retrieval. */
+export type FileSearchMode = "lexical" | "semantic" | "hybrid";
+
+/**
+ * Runtime-bound scope for file search. Always derived from `ConversationMetaDoc` / `TenantContext`,
+ * never from LLM tool arguments.
+ */
+export interface FileSearchScope {
+	readonly tenantId: string;
+	readonly userId: string;
+	readonly workspaceId?: string;
+}
+
+export interface FileSymbolInfo {
+	readonly name: string;
+	readonly kind?: string;
+	readonly line?: number;
+}
+
+export interface FileMatchHit {
+	readonly path: string;
+	readonly title?: string;
+	readonly language?: string;
+	readonly format?: string;
+	readonly dataset?: string;
+	readonly score: number;
+	/** 1-based line number of the best matching passage or symbol definition when available. */
+	readonly line?: number;
+	/** Compact matched passage or excerpt (never an unbounded whole file). */
+	readonly snippet?: string;
+	readonly symbols?: readonly FileSymbolInfo[];
+	readonly symbolCount?: number;
+	/** Additional paths carrying byte-identical content when deduplicated by the engine (e.g. XERJ `ax_paths`). */
+	readonly duplicatePaths?: readonly string[];
+}
+
+export interface FileSearchResult {
+	readonly hits: readonly FileMatchHit[];
+	readonly total: number;
+	readonly tookMs?: number;
+	readonly engine: string;
+	readonly mode: FileSearchMode;
+	/** Non-fatal engine notices (e.g. staleness hints, semantic->lexical fallback, or backup engine note). */
+	readonly notes?: readonly string[];
+}
+
+export interface FileFindOptions {
+	/** Filename, path fragment, wildcard pattern (e.g. `*budget*`), or keywords. */
+	readonly query?: string;
+	/** File extension without leading dot (e.g. `"ts"`, `"md"`, `"rs"`). */
+	readonly extension?: string;
+	/** Source language filter (e.g. `"typescript"`, `"rust"`, `"python"`). */
+	readonly language?: string;
+	/** Relative directory prefix within the indexed workspace (e.g. `"src/memory/"`). */
+	readonly pathPrefix?: string;
+	readonly limit?: number;
+	readonly signal?: AbortSignal;
+}
+
+export interface FileContentSearchOptions {
+	readonly query: string;
+	readonly mode?: FileSearchMode;
+	readonly pathPrefix?: string;
+	readonly extension?: string;
+	readonly language?: string;
+	readonly limit?: number;
+	/** Max characters kept per hit snippet (default 420). */
+	readonly maxSnippetChars?: number;
+	readonly signal?: AbortSignal;
+}
+
+export interface FileSymbolDefOptions {
+	readonly symbol: string;
+	readonly kind?: string;
+	readonly language?: string;
+	readonly pathPrefix?: string;
+	readonly limit?: number;
+	readonly signal?: AbortSignal;
+}
+
+export interface FileIndexDatasetSummary {
+	readonly index: string;
+	readonly dataset?: string;
+	readonly docCount?: number;
+	readonly languages?: readonly string[];
+	readonly samplePaths?: readonly string[];
+}
+
+export interface FileIndexMapResult {
+	readonly engine: string;
+	readonly indexScope: string;
+	readonly datasets: readonly FileIndexDatasetSummary[];
+	readonly totalDocs?: number;
+	readonly notes?: readonly string[];
+}
+
+export interface FileSearchHealth {
+	readonly ok: boolean;
+	readonly engine: string;
+	readonly version?: string;
+	readonly latencyMs?: number;
+	readonly error?: string;
+}
+
+/**
+ * Optional, injected indexed file & code search service (e.g. `XerjFileSearchService` or
+ * `LocalWorkspaceFileSearchService`). Keeps search engine internals outside the core harness.
+ */
+export interface FileSearchService {
+	readonly engine: string;
+	findFiles(scope: FileSearchScope, options: FileFindOptions): Promise<FileSearchResult>;
+	searchContent(scope: FileSearchScope, options: FileContentSearchOptions): Promise<FileSearchResult>;
+	findSymbolDefinitions(scope: FileSearchScope, options: FileSymbolDefOptions): Promise<FileSearchResult>;
+	getIndexMap?(
+		scope: FileSearchScope,
+		options?: { readonly limit?: number; readonly signal?: AbortSignal },
+	): Promise<FileIndexMapResult>;
+	healthCheck?(signal?: AbortSignal): Promise<FileSearchHealth>;
+}
+
 export interface AppCapabilities {
 	readonly memory: MemoryService;
 	readonly artifacts: ArtifactStore;
 	readonly telemetry: TelemetryStore;
 	readonly fastModel?: FastModelClient;
+	readonly fileSearch?: FileSearchService;
 	readonly skillsDir: string;
 	readonly maxToolOutputBytes: number;
 	readonly staleSkillDays: number;

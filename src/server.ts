@@ -1,10 +1,16 @@
 import type { Server } from "node:http";
 import { serve, type ServerType } from "@hono/node-server";
 import { loadConfig } from "./config.js";
-import type { EmbeddingProvider, Reranker } from "./contracts/app-capabilities.js";
+import type { EmbeddingProvider, FileSearchService, Reranker } from "./contracts/app-capabilities.js";
 import { HttpEmbeddingProvider, HttpReranker } from "./embeddings/provider.js";
 import { createHealthChecker, createReadinessHandler } from "./health.js";
-import { bootstrapHarness, type BootstrappedHarness } from "./index.js";
+import {
+	bootstrapHarness,
+	FallbackFileSearchService,
+	LocalWorkspaceFileSearchService,
+	XerjFileSearchService,
+	type BootstrappedHarness,
+} from "./index.js";
 import { createLogger, serializeError } from "./logger.js";
 import { assertProductionModelSafety } from "./runtime/resilience.js";
 import { authFromEnv } from "./transport/auth.js";
@@ -88,10 +94,12 @@ async function main(): Promise<void> {
 
 	const embeddingProvider = await connectEmbeddings(config, logger);
 	const reranker = await connectReranker(config, logger, embeddingProvider);
+	const fileSearch = await connectFileSearch(config, logger);
 	bootstrapping = bootstrapHarness({
 		config,
 		...(embeddingProvider ? { embeddingProvider } : {}),
 		...(reranker ? { reranker } : {}),
+		...(fileSearch ? { fileSearch } : {}),
 	});
 	runtime = await bootstrapping;
 	if (shutdownStarted) {
@@ -205,6 +213,95 @@ async function connectReranker(
 		log("reranker_unavailable", { error: serializeError(error) });
 		return undefined;
 	}
+}
+
+/**
+ * Connects optional indexed file search (`XERJ_URL` and/or `FILE_SEARCH_WORKSPACE_ROOT`).
+ *
+ * Security invariant: a single static `FILE_SEARCH_WORKSPACE_ROOT` has no per-tenant directory boundary,
+ * so it is only attached when `XERJ_SCOPE_MODE=shared` (single-tenant / shared reference mode). In
+ * multi-tenant modes (`tenant` / `workspace`), embedders should inject `LocalWorkspaceFileSearchService`
+ * with `resolveWorkspaceRoot(scope)` programmatically rather than sharing one static directory across tenants.
+ */
+async function connectFileSearch(
+	config: ReturnType<typeof loadConfig>,
+	logger: ReturnType<typeof createLogger>,
+): Promise<FileSearchService | undefined> {
+	let local: LocalWorkspaceFileSearchService | undefined;
+	if (config.fileSearchWorkspaceRoot) {
+		if (config.xerjScopeMode === "shared") {
+			local = new LocalWorkspaceFileSearchService({ workspaceRoot: config.fileSearchWorkspaceRoot });
+		} else {
+			logger.warn("file_search_local_root_skipped_multitenant", {
+				message:
+					"FILE_SEARCH_WORKSPACE_ROOT is ignored when XERJ_SCOPE_MODE is not 'shared' to prevent cross-tenant local file exposure. Set XERJ_SCOPE_MODE=shared for single-tenant use or supply a per-scope resolveWorkspaceRoot programmatically.",
+				scopeMode: config.xerjScopeMode,
+			});
+		}
+	}
+
+	if (!config.xerjUrl) {
+		if (config.xerjRequired) throw new Error("XERJ_REQUIRED needs XERJ_URL");
+		if (local) {
+			logger.info("file_search_connected", {
+				engine: local.engine,
+				deferred: config.fileSearchDeferred,
+			});
+		}
+		return local;
+	}
+
+	const xerj = new XerjFileSearchService({
+		baseUrl: config.xerjUrl,
+		...(config.xerjApiKey ? { apiKey: config.xerjApiKey } : {}),
+		indexPrefix: config.xerjIndexPrefix,
+		scopeMode: config.xerjScopeMode,
+		timeoutMs: config.xerjTimeoutMs,
+	});
+
+	const health = await xerj.healthCheck();
+	if (health.ok) {
+		if (config.xerjRequired) {
+			// Verify search routes themselves work (not just `GET /`, which a reverse proxy could answer).
+			await xerj.verifySearchCapability();
+		}
+		logger.info("file_search_connected", {
+			engine: xerj.engine,
+			scopeMode: config.xerjScopeMode,
+			indexPrefix: config.xerjIndexPrefix,
+			...(health.version ? { version: health.version } : {}),
+			...(health.latencyMs !== undefined ? { latencyMs: health.latencyMs } : {}),
+			fallback: local ? local.engine : "none",
+			deferred: config.fileSearchDeferred,
+		});
+	} else {
+		if (config.xerjRequired) {
+			throw new Error(`XERJ_REQUIRED is set but XERJ node is unreachable: ${health.error ?? "unknown error"}`);
+		}
+		logger.warn("file_search_xerj_unavailable", {
+			message: local
+				? "XERJ unreachable at startup; falling back to local workspace search until XERJ recovers"
+				: "XERJ unreachable at startup; file search tool calls will retry after circuit-breaker cooldown",
+			scopeMode: config.xerjScopeMode,
+			error: health.error,
+		});
+	}
+
+	if (local) {
+		return new FallbackFileSearchService({
+			primary: xerj,
+			fallback: local,
+			onFallback: (operation, error) => {
+				logger.warn("file_search_fallback", {
+					operation,
+					primary: xerj.engine,
+					fallback: local.engine,
+					error: serializeError(error),
+				});
+			},
+		});
+	}
+	return xerj;
 }
 
 main().catch((error: unknown) => {

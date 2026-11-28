@@ -30,7 +30,7 @@ Extensions are installed in `bootstrapHarness()` (`src/index.ts`) in strict prec
 | 10 | `codemode` | `codemode` | QuickJS/WASM sandbox whose nested `tools.*` calls traverse every hook above |
 | 11 | `answer-verifier` | `GenerationTask: onYield` | Durable fast-model answer verification against tool results & unfinished plan steps |
 
-Toggleable ToolPacks: `memory`, `artifact`, `example-domain`, `planning`, `subagents`.
+Toggleable ToolPacks: `memory`, `artifact`, `example-domain`, `planning`, `subagents`, and `file-search` *(registered when `XERJ_URL`, `FILE_SEARCH_WORKSPACE_ROOT`, or `bootstrapHarness({ fileSearch })` is configured; see [`docs/file-search.md`](file-search.md))*.
 
 ---
 

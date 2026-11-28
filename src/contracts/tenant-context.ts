@@ -18,6 +18,7 @@ export const DEFAULT_PERMISSIONS = [
 	"memory:write",
 	"artifacts:read",
 	"skills:read",
+	"files:read",
 	"domain:read",
 	"domain:write",
 	"domain:approve_request",

@@ -6,6 +6,18 @@ import type {
 	ArtifactStore,
 	EmbeddingProvider,
 	FastModelClient,
+	FileContentSearchOptions,
+	FileFindOptions,
+	FileIndexDatasetSummary,
+	FileIndexMapResult,
+	FileMatchHit,
+	FileSearchHealth,
+	FileSearchMode,
+	FileSearchResult,
+	FileSearchScope,
+	FileSearchService,
+	FileSymbolDefOptions,
+	FileSymbolInfo,
 	Reranker,
 	FrictionSignal,
 	FrictionSignalKind,
@@ -283,6 +295,34 @@ import {
 } from "./tools/example-domain.tools.js";
 import { createPlanToolPack, PLAN_LIMITS, renderPlan, unfinishedSteps } from "./tools/plan.tools.js";
 import { createMemoryToolPack } from "./tools/memory.tools.js";
+import {
+	createFileSearchToolPack,
+	formatFileFindOutput,
+	formatFileIndexMapOutput,
+	formatFileSearchOutput,
+	formatFileSymbolDefOutput,
+	type FileSearchToolPackOptions,
+} from "./tools/file-search.tools.js";
+import {
+	formatXerjScopePrefix,
+	MAX_NODE_TIMER_MS,
+	normalizePathPrefix,
+	sanitizeXerjIndexSlug,
+	validateXerjBaseUrl,
+	XerjFileSearchService,
+	XerjRequestError,
+	type XerjFileSearchOptions,
+	type XerjScopeMode,
+} from "./search/xerj-client.js";
+import {
+	LocalWorkspaceFileSearchService,
+	matchGlob,
+	type LocalWorkspaceFileSearchOptions,
+} from "./search/local-workspace.js";
+import {
+	FallbackFileSearchService,
+	type FallbackFileSearchOptions,
+} from "./search/resilient-search.js";
 import { createHttpServer } from "./transport/http-server.js";
 
 export interface BootstrapHarnessOptions {
@@ -309,6 +349,8 @@ export interface BootstrapHarnessOptions {
 	readonly embeddingProvider?: EmbeddingProvider;
 	/** Optional cross-encoder reranker for memory search (positive evidence on the top fused candidates). */
 	readonly reranker?: Reranker;
+	/** Optional indexed file/code search engine (e.g. `XerjFileSearchService` or `LocalWorkspaceFileSearchService`). */
+	readonly fileSearch?: FileSearchService;
 	readonly domainStore?: DomainStore;
 	readonly wakeScheduler?: WakeScheduler;
 	readonly now?: () => number;
@@ -448,12 +490,14 @@ export async function bootstrapHarness(options: BootstrapHarnessOptions = {}): P
 			now,
 		});
 	const telemetry = options.capabilities?.telemetry ?? new SqliteTelemetryStore(appDb, { now });
+	const fileSearch = options.capabilities?.fileSearch ?? options.fileSearch;
 
 	const capabilities: AppCapabilities = {
 		memory,
 		artifacts,
 		telemetry,
 		fastModel: options.capabilities?.fastModel ?? catalog.fastModelClient,
+		...(fileSearch ? { fileSearch } : {}),
 		skillsDir: options.capabilities?.skillsDir ?? config.skillsDir,
 		maxToolOutputBytes: options.capabilities?.maxToolOutputBytes ?? config.maxToolOutputBytes,
 		staleSkillDays: options.capabilities?.staleSkillDays ?? config.staleSkillDays,
@@ -582,6 +626,12 @@ export async function bootstrapHarness(options: BootstrapHarnessOptions = {}): P
 	registryManager.registerToolPack(artifactPack, { enabled: true });
 	registryManager.registerToolPack(domainBundle.pack, { enabled: true });
 	registryManager.registerToolPack(createPlanToolPack(), { enabled: true });
+	if (capabilities.fileSearch) {
+		registryManager.registerToolPack(createFileSearchToolPack(capabilities.fileSearch), {
+			enabled: true,
+			deferred: config.fileSearchDeferred,
+		});
+	}
 	if (config.subagentsEnabled) {
 		const advisorClient =
 			options.advisorClient ??
@@ -726,7 +776,11 @@ export async function bootstrapHarness(options: BootstrapHarnessOptions = {}): P
 				retention: false,
 				autoResume: false,
 				wakeScheduler: undefined,
-				capabilities: { skillsDir: capabilities.skillsDir, maxToolOutputBytes: capabilities.maxToolOutputBytes },
+				capabilities: {
+					skillsDir: capabilities.skillsDir,
+					maxToolOutputBytes: capabilities.maxToolOutputBytes,
+					...(capabilities.fileSearch ? { fileSearch: capabilities.fileSearch } : {}),
+				},
 				config: {
 					...config,
 					piDbPath: ":memory:",
@@ -875,6 +929,18 @@ export {
 	type ArtifactReadResult,
 	type ArtifactStore,
 	type FastModelClient,
+	type FileContentSearchOptions,
+	type FileFindOptions,
+	type FileIndexDatasetSummary,
+	type FileIndexMapResult,
+	type FileMatchHit,
+	type FileSearchHealth,
+	type FileSearchMode,
+	type FileSearchResult,
+	type FileSearchScope,
+	type FileSearchService,
+	type FileSymbolDefOptions,
+	type FileSymbolInfo,
 	type FrictionSignal,
 	type FrictionSignalKind,
 	type LongTermMemory,
@@ -1018,6 +1084,27 @@ export {
 	PLAN_LIMITS,
 	renderPlan,
 	unfinishedSteps,
+	// Indexed File Search (XERJ / local workspace)
+	XerjFileSearchService,
+	XerjRequestError,
+	formatXerjScopePrefix,
+	MAX_NODE_TIMER_MS,
+	sanitizeXerjIndexSlug,
+	validateXerjBaseUrl,
+	normalizePathPrefix,
+	LocalWorkspaceFileSearchService,
+	matchGlob,
+	FallbackFileSearchService,
+	createFileSearchToolPack,
+	formatFileFindOutput,
+	formatFileSearchOutput,
+	formatFileSymbolDefOutput,
+	formatFileIndexMapOutput,
+	type XerjFileSearchOptions,
+	type XerjScopeMode,
+	type LocalWorkspaceFileSearchOptions,
+	type FallbackFileSearchOptions,
+	type FileSearchToolPackOptions,
 	// Evals & gated self-improvement
 	ReplayEvalRunner,
 	loadEvalSet,

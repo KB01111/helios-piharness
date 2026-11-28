@@ -2,6 +2,7 @@ import path from "node:path";
 import type { ModelSpec } from "./contracts/harness-port.js";
 import { DEFAULT_RETENTION_INTERVAL_MS, DEFAULT_RETENTION_POLICY } from "./runtime/retention.js";
 import { parseMcpServersEnv, type McpServerConfig } from "./mcp/mcp-client.js";
+import { MAX_NODE_TIMER_MS, type XerjScopeMode } from "./search/xerj-client.js";
 
 export interface AppConfig {
 	readonly port: number;
@@ -169,6 +170,26 @@ export interface AppConfig {
 	readonly rerankModel: string | undefined;
 	/** RERANK_CANDIDATES: fused candidates reranked per memory search (default 20). */
 	readonly rerankCandidates: number;
+	// ── Indexed File Search (XERJ / local workspace) ──
+	/** XERJ_URL: XERJ Elasticsearch-compatible REST URL (e.g. `http://127.0.0.1:9200`). Unset = disabled. */
+	readonly xerjUrl: string | undefined;
+	/** XERJ_API_KEY: optional API key (`<data_dir>/admin.key`) sent as `Authorization: ApiKey <key>`. Never logged. */
+	readonly xerjApiKey: string | undefined;
+	/** XERJ_INDEX_PREFIX: autoindex prefix (default `"ax"`, matching `xerj autoindex`). */
+	readonly xerjIndexPrefix: string;
+	/** XERJ_SCOPE_MODE: `"tenant"` (default, multi-tenant isolated), `"workspace"`, or `"shared"`. */
+	readonly xerjScopeMode: XerjScopeMode;
+	/** XERJ_TIMEOUT_MS: per-request HTTP timeout in milliseconds (default 10000). */
+	readonly xerjTimeoutMs: number;
+	/** XERJ_REQUIRED: abort startup when `XERJ_URL` is unreachable instead of degrading/falling back (default false). */
+	readonly xerjRequired: boolean;
+	/**
+	 * FILE_SEARCH_WORKSPACE_ROOT: optional local workspace root for `LocalWorkspaceFileSearchService`
+	 * (used standalone when `XERJ_URL` is unset, or as an automatic fallback when XERJ is unavailable).
+	 */
+	readonly fileSearchWorkspaceRoot: string | undefined;
+	/** FILE_SEARCH_DEFERRED: register `file-search` tools as `deferred: true` for BM25 `tool_search` discovery (default false). */
+	readonly fileSearchDeferred: boolean;
 }
 
 export function parseModelSpec(raw: string, fallback: ModelSpec): ModelSpec {
@@ -331,7 +352,32 @@ export function loadConfig(env: Readonly<Record<string, string | undefined>> = p
 		rerankApiKey: env.RERANK_API_KEY?.trim() || undefined,
 		rerankModel: env.RERANK_MODEL?.trim() || undefined,
 		rerankCandidates: Math.min(128, parsePositiveInt(env.RERANK_CANDIDATES, 20)),
+		xerjUrl: env.XERJ_URL?.trim() || undefined,
+		xerjApiKey: env.XERJ_API_KEY?.trim() || undefined,
+		xerjIndexPrefix: env.XERJ_INDEX_PREFIX?.trim() || "ax",
+		xerjScopeMode: parseXerjScopeMode(env.XERJ_SCOPE_MODE),
+		xerjTimeoutMs: parseTimerInt(env.XERJ_TIMEOUT_MS, 10_000),
+		xerjRequired: parseBoolean(env.XERJ_REQUIRED, false),
+		fileSearchWorkspaceRoot: env.FILE_SEARCH_WORKSPACE_ROOT?.trim()
+			? path.resolve(env.FILE_SEARCH_WORKSPACE_ROOT.trim())
+			: undefined,
+		fileSearchDeferred: parseBoolean(env.FILE_SEARCH_DEFERRED, false),
 	};
+}
+
+function parseXerjScopeMode(raw: string | undefined): XerjScopeMode {
+	const normalized = raw?.trim().toLowerCase();
+	if (normalized === "tenant" || normalized === "workspace" || normalized === "shared") {
+		return normalized;
+	}
+	return "tenant";
+}
+
+/** Positive integer within Node.js's 32-bit signed `setTimeout` ceiling (out-of-range values fall back to default). */
+function parseTimerInt(raw: string | undefined, fallback: number): number {
+	if (raw === undefined || raw.trim() === "") return fallback;
+	const parsed = Number.parseInt(raw, 10);
+	return Number.isFinite(parsed) && parsed > 0 && parsed <= MAX_NODE_TIMER_MS ? parsed : fallback;
 }
 
 function parseStringList(raw: string | undefined): string[] {
